@@ -83,8 +83,13 @@ from .routes_nav_items import router as nav_items_router
 from .routes_nodes import _upsert_nodes_from_config
 from .routes_nodes import router as nodes_router
 from .routes_notifier_dnd import router as notifier_dnd_router
-from .routes_personal import router as personal_router
-from .routes_personal import run_work_kanban_automation_idle_loop
+from .routes_personal import (
+    _close_work_processor_http_clients,
+    run_work_kanban_automation_idle_loop,
+)
+from .routes_personal import (
+    router as personal_router,
+)
 from .routes_personal_prompts import router as personal_prompts_router
 from .routes_pfsense_dns import router as pfsense_dns_router
 from .routes_pim_email import router as pim_email_router
@@ -324,6 +329,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await _cancel_background_task(kanban_automation_idle_task, "kanban_automation_idle_worker")
     await _cancel_background_task(timing_lag_task, "timing_event_loop_lag_sampler")
     await _cancel_background_task(timing_disk_task, "timing_disk_log_writer")
+    await _close_work_processor_http_clients()
     await stop_seekdb_sync_loop()
     await stop_drain_loop()
 

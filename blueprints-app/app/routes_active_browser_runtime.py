@@ -2332,6 +2332,14 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
         "automation_processing_policy_local_gate": _clean_string(
             kanban.get("automation_processing_policy_local_gate"), "", 160
         ),
+        "model_settings_visible": bool(kanban.get("model_settings_visible")),
+        "model_settings_surface": _clean_string(kanban.get("model_settings_surface"), "", 48),
+        "model_settings_route_count": _clean_browser_page_int(
+            kanban.get("model_settings_route_count"), maximum=100
+        ),
+        "model_settings_dirty_count": _clean_browser_page_int(
+            kanban.get("model_settings_dirty_count"), maximum=2
+        ),
         "error": _clean_string(kanban.get("error"), "", 180),
     }
 

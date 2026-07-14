@@ -7502,6 +7502,40 @@ def test_work_preprocessing_readiness_contract_endpoint():
     )
 
 
+def test_work_automation_file_backed_contract_routes_use_measured_sync_boundary(monkeypatch):
+    calls = []
+
+    async def run_sync(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return {"worker": func.__name__}
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", run_sync)
+
+    results = [
+        asyncio.run(routes_personal.get_work_review_processor_output_contract()),
+        asyncio.run(routes_personal.get_work_review_processor_processing_policy()),
+        asyncio.run(routes_personal.get_work_automation_idle_worker_contract()),
+        asyncio.run(routes_personal.get_work_review_processor_metadata_contract()),
+        asyncio.run(routes_personal.get_work_preprocessing_readiness_contract()),
+    ]
+
+    assert [call[0] for call in calls] == [
+        routes_personal._work_review_processor_output_contract,
+        routes_personal._work_review_processing_policy,
+        routes_personal._work_automation_idle_worker_contract,
+        routes_personal._work_review_processing_metadata_contract,
+        routes_personal._work_preprocessing_readiness_contract,
+    ]
+    assert all(call[1:] == ((), {}) for call in calls)
+    assert all(result["ok"] is True for result in results)
+    assert results[1]["policy"] == {"worker": "_work_review_processing_policy"}
+    assert all(
+        result["contract"] == {"worker": calls[index][0].__name__}
+        for index, result in enumerate(results)
+        if index != 1
+    )
+
+
 def test_work_proposal_surfaces_contract_endpoint():
     result = asyncio.run(routes_personal.get_work_proposal_surfaces_contract())
     contract = result["contract"]
@@ -8451,7 +8485,7 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
             decision["decision_id"] for decision in context["evidence"]["recent_decisions"]
         }
         assert "scheduling reason for this preprocessing pass" in messages[1]["content"]
-        assert "not as an automatic failure" in messages[0]["content"]
+        assert "scheduling reason, not a failure" in messages[0]["content"]
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
             "run_id": run_id,
@@ -8464,6 +8498,12 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
                 "uncertainty": "",
                 "blocking_codes": ["missing_proof"],
                 "recommended_next_actions": ["Add proof."],
+                "selected_guidance_ids": ["permission-and-ownership-guards"],
+                "guidance_rationales": {
+                    "permission-and-ownership-guards": (
+                        "The proof artifact is written by a privileged helper into an xarta-owned tree."
+                    )
+                },
                 "decomposition_items": [
                     {
                         "title": "Add proof.",
@@ -8471,6 +8511,7 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
                         "state_id": "todo",
                         "priority_id": "medium",
                         "proof_path": "Proof artifact exists.",
+                        "guidance_ids": ["permission-and-ownership-guards"],
                     }
                 ],
                 "affected_refs": ["xarta-kanban:item:work-preprocess-ai-child"],
@@ -8534,6 +8575,15 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
     assert decision["decision_type"] == "preprocessing_decomposition"
     assert decision["status"] == "accepted"
     assert decision["title"] == "Preprocessing child"
+    decision_metadata = json.loads(decision["metadata_json"])
+    assert decision_metadata["engineering_guidance"]["selected_guidance_ids"] == [
+        "permission-and-ownership-guards"
+    ]
+    assert (
+        decision_metadata["readiness_marker"]["engineering_guidance"]
+        == (decision_metadata["engineering_guidance"])
+    )
+    assert "permission-and-ownership-guards" in child["body_excerpt"]
 
 
 def test_work_preprocessing_decomposition_child_ids_retry_collisions_and_reuse_siblings(
@@ -9262,6 +9312,273 @@ def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
     assert metadata["llm_payload"]["ready"] is False
 
 
+def test_work_preprocessing_duplicate_outcome_needs_no_invented_children(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    for item_id, parent_id, title, state_id in (
+        ("work-duplicate-root", None, "Duplicate root", "doing"),
+        ("work-canonical-owner", "work-duplicate-root", "Canonical owner", "done"),
+        ("work-duplicate-leaf", "work-duplicate-root", "Duplicate leaf", "todo"),
+    ):
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    parent_item_id=parent_id,
+                    title=title,
+                    body=f"{title} body and proof scope.",
+                    state_id=state_id,
+                    actor="codex-test",
+                    source_surface="pytest",
+                )
+            )
+        )
+
+    async def duplicate_completion(*, messages, run_id, processor_kind=""):
+        return {
+            "model_alias": "TEST-KANBAN-DUPLICATE",
+            "run_id": run_id,
+            "content_excerpt": "{}",
+            "payload": {
+                "ready": False,
+                "outcome_type": "duplicate",
+                "canonical_item_ref": "xarta-kanban:item:work-canonical-owner",
+                "title": "Duplicate leaf",
+                "summary": "The canonical completed card already owns this work.",
+                "rationale": "No new implementation or decomposition is required.",
+                "confidence": "high",
+                "uncertainty": "",
+                "blocking_codes": [],
+                "recommended_next_actions": [],
+                "decomposition_items": [],
+                "affected_refs": ["xarta-kanban:item:work-canonical-owner"],
+                "proof_refs": ["kanban_items:work-canonical-owner"],
+            },
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        duplicate_completion,
+    )
+    tick = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            item_id="work-duplicate-root",
+            max_scan_items=20,
+            max_process_items=1,
+            holder_id="codex-test",
+        )
+    )
+    processed = tick["processed_markers"][0]
+    assert processed["ok"] is True
+    assert processed["status"] == "processed"
+    assert processed["outcome_type"] == "duplicate"
+    assert processed["canonical_item_ref"] == "xarta-kanban:item:work-canonical-owner"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_items WHERE parent_item_id='work-duplicate-leaf'"
+        ).fetchone()["count"]
+        == 0
+    )
+    decision = conn.execute(
+        "SELECT * FROM kanban_review_decisions WHERE item_id='work-duplicate-leaf'"
+    ).fetchone()
+    assert decision["decision_type"] == "preprocessing_duplicate"
+    assert decision["status"] == "accepted"
+    decision_metadata = json.loads(decision["metadata_json"])
+    assert decision_metadata["canonical_item_ref"] == ("xarta-kanban:item:work-canonical-owner")
+    hints = asyncio.run(routes_personal.get_work_item_agent_hints("work-duplicate-leaf"))
+    readiness = hints["agent_hints"]["metadata"]["context_readiness_marker"]
+    assert readiness["preprocessing_outcome"] == "duplicate"
+
+
+def test_work_done_rich_document_updates_do_not_requeue_without_explicit_reprocess(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-done-proof-update",
+                title="Done proof update",
+                body="Completed implementation whose final proof is being recorded.",
+                state_id="done",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-done-feedback-capture",
+                title="Done feedback capture",
+                body="Completed implementation receiving final operator feedback.",
+                state_id="done",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item_agent_session(
+            "work-done-feedback-capture",
+            routes_personal.WorkAgentSessionCreateRequest(
+                session_id="kanban-agent-session-done-feedback",
+                agent_id="codex",
+                node_id="test-node",
+                worktree_path="/root/xarta-node",
+                repo_full_name="xarta/xarta-node",
+                branch="main",
+                status="done",
+                summary="Completed implementation feedback proof",
+                actor="codex-test",
+                source_surface="pytest-session",
+            ),
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_detail_document(
+            "work-done-proof-update",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Final implementation proof added after completion.",
+                actor="codex-test",
+                source_surface="pytest",
+            ),
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-done-proof-update",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Final review proof; no new unresolved requirement.",
+                actor="codex-test",
+                source_surface="pytest",
+            ),
+        )
+    )
+    review_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-done-proof-update",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    preprocessing_scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-done-proof-update",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    assert review_scan["queued_count"] == 0
+    assert preprocessing_scan["queued_count"] == 0
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_review_processor_markers "
+            "WHERE item_id='work-done-proof-update'"
+        ).fetchone()["count"]
+        == 0
+    )
+
+    captured_without_reprocess = asyncio.run(
+        routes_personal.append_work_item_review_feedback(
+            "work-done-feedback-capture",
+            routes_personal.WorkReviewFeedbackCaptureRequest(
+                feedback_id="kanban-feedback-done-proof-only",
+                feedback="Final proof is accepted; there is no unresolved requirement.",
+                session_id="kanban-agent-session-done-feedback",
+                outcome_summary="Accepted and implemented.",
+                actor="codex-test",
+                source_surface="pytest",
+            ),
+        )
+    )
+    assert captured_without_reprocess["review_processor"]["action"] == (
+        "skipped_completed_no_reprocess"
+    )
+    assert captured_without_reprocess["review_processor"]["queued"] is False
+    assert "Final proof is accepted" in captured_without_reprocess["review_document"]["body"]
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_review_processor_markers "
+            "WHERE item_id='work-done-feedback-capture'"
+        ).fetchone()["count"]
+        == 0
+    )
+
+    captured_with_reprocess = asyncio.run(
+        routes_personal.append_work_item_review_feedback(
+            "work-done-feedback-capture",
+            routes_personal.WorkReviewFeedbackCaptureRequest(
+                feedback_id="kanban-feedback-done-unresolved",
+                feedback="A new unresolved requirement was explicitly identified.",
+                session_id="kanban-agent-session-done-feedback",
+                reprocess_completed=True,
+                actor="codex-test",
+                source_surface="pytest",
+            ),
+        )
+    )
+    assert captured_with_reprocess["review_processor"]["action"] == "queued"
+    assert captured_with_reprocess["review_processor"]["queued"] is True
+    assert (
+        captured_with_reprocess["review_processor"]["marker"]["metadata"]["reprocess_completed"]
+        is True
+    )
+
+    explicit_review_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-done-proof-update",
+                actor="codex-test",
+                source_surface="pytest",
+                reprocess_completed=True,
+            )
+        )
+    )
+    assert explicit_review_scan["queued_count"] == 1
+
+
+def test_work_review_feedback_capture_delegates_whole_boundary_off_event_loop(monkeypatch):
+    calls = []
+
+    async def run_sync(func, *args):
+        calls.append((func, args))
+        return {"ok": True, "item_id": args[0]}
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", run_sync)
+    request = routes_personal.WorkReviewFeedbackCaptureRequest(
+        feedback="Final accepted proof.",
+        session_id="kanban-agent-session-off-loop",
+    )
+    result = asyncio.run(
+        routes_personal.append_work_item_review_feedback("work-off-loop-feedback", request)
+    )
+    assert result == {"ok": True, "item_id": "work-off-loop-feedback"}
+    assert calls == [
+        (
+            routes_personal._append_work_item_review_feedback_sync,
+            ("work-off-loop-feedback", request),
+        )
+    ]
+
+
 def test_work_automation_missing_profile_api_key_is_retryable_failure(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -9605,7 +9922,6 @@ def test_work_preprocessing_idle_scan_resolves_stale_self_marker_blocker_only(
             )
         )
     )
-
     item_row = conn.execute(
         "SELECT * FROM kanban_items WHERE item_id='work-preprocess-stale-marker-blocker'"
     ).fetchone()
@@ -10119,6 +10435,24 @@ def test_work_preprocessing_idle_scan_skips_topic_container_without_marker(monke
             )
         )
     )
+    conn.execute(
+        """
+        UPDATE kanban_items
+        SET provenance_json=?
+        WHERE item_id='work-preprocess-topic-container'
+        """,
+        (
+            json.dumps(
+                {
+                    "preprocessing": {
+                        "classification": "topic_container",
+                        "eligible": False,
+                    }
+                }
+            ),
+        ),
+    )
+    conn.commit()
 
     item_row = conn.execute(
         "SELECT * FROM kanban_items WHERE item_id='work-preprocess-topic-container'"
@@ -12532,6 +12866,688 @@ def test_browser_links_projection_records_source_unavailable_status(monkeypatch,
         "SELECT * FROM personal_sources WHERE source_id='browser-links'"
     ).fetchone()
     assert source["status"] == "source_unavailable"
+
+
+def _processor_registry_for_test(_processor_kind, *, probe=True):
+    return [
+        {
+            "route_id": route_id,
+            "label": routes_personal.KANBAN_PROCESSOR_MODEL_REGISTRY[route_id]["label"],
+            "description": "pytest allowlisted route",
+            "available": True,
+            "availability_state": "available",
+            "availability_classification": (
+                "available_subscription_model"
+                if route_id.startswith("chatgpt-")
+                else "available_private_local_model"
+            ),
+        }
+        for route_id in routes_personal.KANBAN_PROCESSOR_ROUTE_IDS
+    ]
+
+
+def _processor_model_definitions_for_test(_processor_kind):
+    return {
+        route_id: {
+            **routes_personal.KANBAN_PROCESSOR_MODEL_REGISTRY[route_id],
+            "route_id": route_id,
+            "provider": "test-subscription-provider",
+            "model": f"test-{route_id}",
+            "catalog_model_id": f"test-{route_id}",
+        }
+        for route_id in routes_personal.KANBAN_PROCESSOR_ROUTE_IDS
+    }
+
+
+def test_work_processor_public_registry_separates_private_route_configuration() -> None:
+    assert all(
+        not {"provider", "model", "catalog_model_id"}.intersection(definition)
+        for definition in routes_personal.KANBAN_PROCESSOR_MODEL_REGISTRY.values()
+    )
+    definitions = routes_personal._work_processor_model_definitions(
+        "preprocessing",
+        profile_config={
+            "xarta_kanban_model_routes": {
+                route_id: {
+                    "provider": "provider-from-private-config",
+                    "model": f"model-from-private-config-{route_id}",
+                }
+                for route_id in routes_personal.KANBAN_PROCESSOR_ROUTE_IDS
+            }
+        },
+    )
+    assert definitions["chatgpt-5-6-sol"]["label"] == "ChatGPT 5.6 Sol"
+    assert definitions["chatgpt-5-6-sol"]["provider"] == "provider-from-private-config"
+    assert definitions["private-local-thinking"]["model"].endswith("private-local-thinking")
+
+
+def test_work_processor_routing_settings_persist_reset_and_reject_stale_writes(monkeypatch):
+    conn = _make_conn()
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(conn))
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_processor_registry_snapshot",
+        _processor_registry_for_test,
+    )
+
+    initial = routes_personal._get_work_processor_routing_settings_sync(probe=False)
+    preprocessing = initial["settings"]["preprocessing"]
+    review = initial["settings"]["review"]
+    assert preprocessing["route_ids"] == list(routes_personal.KANBAN_PROCESSOR_ROUTE_IDS)
+    assert review["processor_kind"] == "review"
+    reversed_ids = list(reversed(preprocessing["route_ids"]))
+
+    saved = routes_personal._update_work_processor_routing_settings_sync(
+        "preprocessing",
+        routes_personal.WorkProcessorRoutingSettingsUpdateRequest(
+            route_ids=reversed_ids,
+            expected_revision=preprocessing["revision"],
+            actor="codex-test",
+            source_surface="pytest",
+            request_id="processor-routing-save",
+        ),
+    )
+    assert saved["settings"]["route_ids"] == reversed_ids
+    assert saved["settings"]["stored"] is True
+    assert saved["settings"]["revision"] != preprocessing["revision"]
+    assert routes_personal._get_work_processor_routing_settings_sync(False)["settings"]["review"][
+        "route_ids"
+    ] == list(routes_personal.KANBAN_PROCESSOR_ROUTE_IDS)
+
+    with pytest.raises(routes_personal.HTTPException) as stale:
+        routes_personal._update_work_processor_routing_settings_sync(
+            "preprocessing",
+            routes_personal.WorkProcessorRoutingSettingsUpdateRequest(
+                route_ids=list(routes_personal.KANBAN_PROCESSOR_ROUTE_IDS),
+                expected_revision=preprocessing["revision"],
+            ),
+        )
+    assert stale.value.status_code == 409
+    assert stale.value.detail["error"] == "stale_processor_routing_settings"
+    assert stale.value.detail["current"]["route_ids"] == reversed_ids
+
+    reset = routes_personal._update_work_processor_routing_settings_sync(
+        "preprocessing",
+        routes_personal.WorkProcessorRoutingSettingsUpdateRequest(
+            expected_revision=saved["settings"]["revision"],
+            reset=True,
+        ),
+    )
+    assert reset["settings"]["route_ids"] == list(routes_personal.KANBAN_PROCESSOR_ROUTE_IDS)
+    assert reset["audit"]["action"] == "reset_processor_model_priority"
+
+    with pytest.raises(Exception):
+        routes_personal.WorkProcessorRoutingSettingsUpdateRequest(
+            expected_revision=reset["settings"]["revision"],
+            provider="operator-controlled-provider",
+            model="operator-controlled-model",
+            endpoint="https://untrusted.example",
+        )
+
+
+def test_work_processor_model_failover_is_bounded_and_records_attempts(monkeypatch):
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_processor_profile_route",
+        lambda kind: {
+            "profile": f"hermes-kanban-{kind}",
+            "api_base": "http://127.0.0.1:9999",
+            "api_key_file": "/tmp/not-read-by-test",
+            "fallback_provider": "",
+            "fallback_model": "",
+        },
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_processor_profile_drift",
+        lambda kind: {"ok": True, "problems": []},
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_idle_worker_config",
+        lambda: {"local_ai_max_tokens": 1200},
+    )
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(_make_conn()))
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_processor_model_definitions",
+        _processor_model_definitions_for_test,
+    )
+    routes = _processor_registry_for_test("preprocessing")[:2]
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_processor_routing_snapshot",
+        lambda conn, kind, probe=True: {
+            "revision": "sha256:routing-test",
+            "routes": routes,
+        },
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_processor_prompt_variant",
+        lambda kind, route_id, messages: (
+            messages,
+            {
+                "request_sha256": f"sha256:{route_id}",
+                "selection": "model_variant",
+                "route_id": route_id,
+            },
+        ),
+    )
+    calls = []
+
+    def complete(**kwargs):
+        calls.append(kwargs)
+        if kwargs["route_id"] == "chatgpt-5-6-sol":
+            raise ConnectionError("subscription route temporarily unavailable")
+        return {
+            "model": "gateway-profile",
+            "choices": [{"message": {"content": '{"ready": true}'}}],
+        }
+
+    monkeypatch.setattr(routes_personal, "_work_automation_profile_completion_sync", complete)
+    result = asyncio.run(
+        routes_personal._work_automation_processor_profile_json_completion(
+            messages=[{"role": "user", "content": "bounded failover proof"}],
+            run_id="pytest-route-failover",
+            processor_kind="preprocessing",
+        )
+    )
+    assert [call["route_id"] for call in calls] == [
+        "chatgpt-5-6-sol",
+        "chatgpt-5-6-terra",
+    ]
+    assert calls[0]["idempotency_key"] != calls[1]["idempotency_key"]
+    assert result["chosen_route_id"] == "chatgpt-5-6-terra"
+    assert result["final_outcome"] == "completed"
+    assert result["fallback_reason"] == "chatgpt-5-6-sol:transport_unavailable"
+    assert [attempt["outcome"] for attempt in result["model_attempts"]] == [
+        "failed",
+        "chosen",
+    ]
+
+
+def test_work_processor_all_unavailable_retains_retryable_attempt_evidence(monkeypatch):
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_processor_profile_route",
+        lambda kind: {
+            "profile": f"hermes-kanban-{kind}",
+            "api_base": "http://127.0.0.1:9999",
+            "api_key_file": "/tmp/not-read-by-test",
+            "fallback_provider": "",
+            "fallback_model": "",
+        },
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_processor_profile_drift",
+        lambda kind: {"ok": True, "problems": []},
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_idle_worker_config",
+        lambda: {"local_ai_max_tokens": 1200},
+    )
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(_make_conn()))
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_processor_model_definitions",
+        _processor_model_definitions_for_test,
+    )
+    unavailable = _processor_registry_for_test("review")[:3]
+    for route in unavailable:
+        route.update(
+            available=False,
+            availability_state="unavailable",
+            availability_classification="model_not_in_subscription_cache",
+        )
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_processor_routing_snapshot",
+        lambda conn, kind, probe=True: {"revision": "sha256:all-down", "routes": unavailable},
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_processor_prompt_variant",
+        lambda kind, route_id, messages: (
+            messages,
+            {"request_sha256": f"sha256:{route_id}", "route_id": route_id},
+        ),
+    )
+
+    with pytest.raises(routes_personal.WorkProcessorRoutesExhausted) as exhausted:
+        asyncio.run(
+            routes_personal._work_automation_processor_profile_json_completion(
+                messages=[{"role": "user", "content": "all unavailable proof"}],
+                run_id="pytest-all-unavailable",
+                processor_kind="review",
+            )
+        )
+    assert len(exhausted.value.attempts) == 3
+    assert {attempt["outcome"] for attempt in exhausted.value.attempts} == {"unavailable"}
+    assert all(attempt["latency_ms"] == 0 for attempt in exhausted.value.attempts)
+
+
+def test_work_processor_prompt_variant_selects_model_files_and_generic_fallback(
+    monkeypatch, tmp_path
+):
+    prompt_root = tmp_path / "prompts"
+    profile_root = tmp_path / "config/profiles"
+    variant = prompt_root / "kanban-model-variants/preprocessing/chatgpt-5-6-sol"
+    variant.mkdir(parents=True)
+    (variant / "soul.md").write_text("Sol-specific SOUL", encoding="utf-8")
+    (variant / "system.md").write_text("Sol-specific system contract", encoding="utf-8")
+    generic = prompt_root / "kanban-preprocessing-system.md"
+    generic.write_text("Generic preprocessing contract", encoding="utf-8")
+    profile = profile_root / "hermes-kanban-preprocessor"
+    profile.mkdir(parents=True)
+    (profile / "SOUL.md").write_text("Generic processor SOUL", encoding="utf-8")
+    monkeypatch.setattr(
+        routes_personal, "KANBAN_PROCESSOR_MODEL_PROMPT_ROOT", prompt_root / "kanban-model-variants"
+    )
+    monkeypatch.setattr(routes_personal, "PREPROCESSING_SYSTEM_PROMPT_PATH", generic)
+    monkeypatch.setattr(routes_personal, "HERMES_LOCAL_STACK_ROOT", tmp_path)
+
+    selected, evidence = routes_personal._work_processor_prompt_variant(
+        "preprocessing",
+        "chatgpt-5-6-sol",
+        [{"role": "user", "content": "prompt variant proof"}],
+    )
+    assert selected[0]["role"] == "system"
+    assert "Sol-specific SOUL" in selected[0]["content"]
+    assert "Sol-specific system contract" in selected[0]["content"]
+    assert evidence["selection"] == "model_variant"
+    assert evidence["soul_prompt_id"] == "kanban-preprocessing-chatgpt-5-6-sol-soul"
+    assert evidence["request_sha256"].startswith("sha256:")
+
+    fallback, fallback_evidence = routes_personal._work_processor_prompt_variant(
+        "preprocessing",
+        "chatgpt-5-6-terra",
+        [{"role": "user", "content": "generic fallback proof"}],
+    )
+    assert "Generic preprocessing contract" in fallback[0]["content"]
+    assert fallback_evidence["selection"] == "generic_fallback"
+
+
+def test_private_no_think_preprocessing_prompt_forbids_skill_and_tool_access() -> None:
+    path = (
+        routes_personal.KANBAN_PROCESSOR_MODEL_PROMPT_ROOT
+        / "preprocessing/private-local-no-think/system.md"
+    )
+    prompt = path.read_text(encoding="utf-8")
+    assert "Do not call tools, read files, browse skills" in prompt
+    assert "exact ID only" in prompt
+    assert prompt.rstrip().endswith("/no_think")
+
+
+def test_work_preprocessing_prompt_is_domain_neutral(monkeypatch):
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda item: {"item_id": item["item_id"], "title": "Unrelated service work"},
+    )
+    messages = routes_personal._work_preprocessing_local_ai_messages(
+        item={
+            "item_id": "work-unrelated-service",
+            "body_excerpt": "Add a bounded cache to an unrelated service.",
+        },
+        source={},
+        detail_document={},
+        review_document={},
+        discussions=[],
+        recent_commits=[],
+        recent_decisions=[],
+        ancestor_context={},
+        marker={"marker_id": "marker-domain-neutral"},
+    )
+    payload = json.loads(messages[1]["content"])
+    rules = " ".join(payload["hard_rules"])
+    full_prompt = "\n".join(message["content"] for message in messages)
+    assert "typed named ordered collections that execute as one target" in rules
+    assert "Task-specific regression fixtures" in rules
+    assert "PIM" not in full_prompt
+    assert "zero-path recovery" not in full_prompt
+    assert "one retained schedule" not in full_prompt
+    assert "GPT-5.6 Sol or Terra" in rules
+
+
+def test_work_preprocessing_prompt_keeps_regression_fixture_in_scoped_evidence_only(
+    monkeypatch,
+):
+    correction = (
+        "For this PIM Email Scheduler card only: preserve a general scheduler, "
+        "one typed named ordered rule-set target executed atomically, separate "
+        "zero-path recovery, operator UI, coverage/fencing proof, and an explicit "
+        "production-configuration question."
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda item: {"item_id": item["item_id"], "title": "Scheduler regression"},
+    )
+    messages = routes_personal._work_preprocessing_local_ai_messages(
+        item={"item_id": "kanban-002305ddba25", "body_excerpt": "Scheduler work"},
+        source={},
+        detail_document={},
+        review_document={"body": correction},
+        discussions=[],
+        recent_commits=[],
+        recent_decisions=[],
+        ancestor_context={},
+        marker={"marker_id": "marker-scheduler-regression"},
+    )
+    payload = json.loads(messages[1]["content"])
+    rules = " ".join(payload["hard_rules"])
+    assert payload["documents"]["review_excerpt"] == correction
+    assert "PIM Email Scheduler" not in messages[0]["content"]
+    assert "zero-path recovery" not in rules
+
+
+def test_work_processor_message_builders_do_not_read_prompt_files(monkeypatch):
+    monkeypatch.setattr(
+        routes_personal,
+        "_load_work_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected file read")),
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda item: {"item_id": item["item_id"], "title": "Prompt boundary"},
+    )
+    preprocessing = routes_personal._work_preprocessing_local_ai_messages(
+        item={"item_id": "work-prompt-boundary", "body_excerpt": "Prompt boundary"},
+        source={},
+        detail_document={},
+        review_document={},
+        discussions=[],
+        recent_commits=[],
+        recent_decisions=[],
+        ancestor_context={},
+        marker={"marker_id": "marker-prompt-boundary"},
+    )
+    review = routes_personal._work_review_processor_local_ai_messages(
+        item={"item_id": "work-prompt-boundary"},
+        review_document={},
+        marker={"marker_id": "marker-review-prompt-boundary"},
+    )
+    assert preprocessing[0]["content"] == routes_personal.PREPROCESSING_SYSTEM_PROMPT
+    assert review[0]["content"] == routes_personal.REVIEW_PROCESSOR_SYSTEM_PROMPT
+
+
+def test_work_preprocessing_prompt_supplies_bounded_engineering_guidance(monkeypatch):
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda item: {"item_id": item["item_id"], "title": "Async route work"},
+    )
+    messages = routes_personal._work_preprocessing_local_ai_messages(
+        item={"item_id": "work-guidance-prompt", "body_excerpt": "Change an async route."},
+        source={},
+        detail_document={},
+        review_document={},
+        discussions=[],
+        recent_commits=[],
+        recent_decisions=[],
+        ancestor_context={},
+        marker={"marker_id": "marker-guidance-prompt"},
+    )
+    payload = json.loads(messages[1]["content"])
+    catalog = payload["engineering_guidance_catalog"]
+    assert catalog["direct_skill_tools_required"] is False
+    assert {entry["guidance_id"] for entry in catalog["entries"]} == {
+        "blueprints-event-loop-isolation",
+        "database-connection-lifecycle",
+        "long-lived-http-clients",
+        "permission-and-ownership-guards",
+    }
+    assert "selected_guidance_ids" in payload["required_output"]
+    assert any("must not browse arbitrary skills" in rule for rule in payload["hard_rules"])
+
+
+def test_work_preprocessing_guidance_selection_rejects_unknown_and_dedupes() -> None:
+    selection = routes_personal._work_preprocessing_guidance_selection(
+        {
+            "selected_guidance_ids": [
+                "long-lived-http-clients",
+                "invented-general-best-practice",
+                "long-lived-http-clients",
+                "blueprints-event-loop-isolation",
+            ],
+            "guidance_rationales": {
+                "long-lived-http-clients": "This leaf probes the same gateway repeatedly.",
+                "blueprints-event-loop-isolation": "The probe starts in an async route.",
+            },
+        }
+    )
+    assert selection["selected_guidance_ids"] == [
+        "long-lived-http-clients",
+        "blueprints-event-loop-isolation",
+    ]
+    assert selection["rejected_unknown_ids"] == ["invented-general-best-practice"]
+    assert [entry["guidance_id"] for entry in selection["selections"]] == selection[
+        "selected_guidance_ids"
+    ]
+    assert all(entry["source_refs"] for entry in selection["selections"])
+
+
+def test_work_preprocessing_decomposition_guidance_is_allowlisted_and_child_scoped() -> None:
+    items = routes_personal._work_preprocessing_normalise_decomposition_items(
+        {
+            "decomposition_items": [
+                {
+                    "title": "Move route work off the event loop",
+                    "body": "Repair the async request boundary.",
+                    "guidance_ids": [
+                        "blueprints-event-loop-isolation",
+                        "unknown-guidance",
+                    ],
+                },
+                {
+                    "title": "Update the operator copy",
+                    "body": "Explain the visible outcome.",
+                    "guidance_ids": [],
+                },
+            ]
+        },
+        parent_item={
+            "item_id": "work-guidance-parent",
+            "priority_id": "high",
+            "tags_json": '["kanban"]',
+        },
+    )
+    assert items[0]["guidance_ids"] == ["blueprints-event-loop-isolation"]
+    assert "whole blocking SQLite" in items[0]["body"]
+    assert "unknown-guidance" not in items[0]["body"]
+    assert items[1]["guidance_ids"] == []
+    assert "Applicable implementation patterns" not in items[1]["body"]
+
+
+def test_work_processor_request_planning_runs_through_measured_sync_boundary(monkeypatch):
+    route_id = "chatgpt-5-6-sol"
+    calls = []
+
+    async def run_sync(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return {
+            "config": {"local_ai_max_tokens": 800},
+            "processor_kind": "preprocessing",
+            "route": {
+                "profile": "hermes-kanban-preprocessor",
+                "api_base": "http://127.0.0.1:8649",
+                "api_key_file": "/tmp/not-read-by-test",
+                "fallback_provider": "",
+                "fallback_model": "",
+            },
+            "routing": {
+                "revision": "sha256:request-plan",
+                "routes": [
+                    {
+                        "route_id": route_id,
+                        "available": True,
+                        "availability_state": "available",
+                        "availability_classification": "available_subscription_model",
+                    }
+                ],
+            },
+            "route_definitions": {
+                route_id: _processor_model_definitions_for_test("preprocessing")[route_id]
+            },
+            "prompt_variants": {
+                route_id: (
+                    [{"role": "user", "content": "planned away from event loop"}],
+                    {"request_sha256": "sha256:planned", "route_id": route_id},
+                )
+            },
+        }
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", run_sync)
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_profile_completion_sync",
+        lambda **kwargs: {
+            "model": "hermes-kanban-preprocessor",
+            "choices": [{"message": {"content": '{"ready": true}'}}],
+        },
+    )
+    result = asyncio.run(
+        routes_personal._work_automation_processor_profile_json_completion(
+            messages=[{"role": "user", "content": "request plan proof"}],
+            run_id="pytest-request-plan",
+            processor_kind="preprocessing",
+        )
+    )
+    assert calls[0][0] is routes_personal._work_automation_processor_request_plan_sync
+    assert result["chosen_route_id"] == route_id
+
+
+def test_work_processor_http_client_is_reused_per_origin_and_closed() -> None:
+    asyncio.run(routes_personal._close_work_processor_http_clients())
+    first = routes_personal._work_processor_http_client("http://processor-a.invalid/health")
+    second = routes_personal._work_processor_http_client(
+        "http://processor-a.invalid/v1/chat/completions"
+    )
+    other = routes_personal._work_processor_http_client("http://processor-b.invalid/health")
+    assert first is second
+    assert other is not first
+    asyncio.run(routes_personal._close_work_processor_http_clients())
+    assert first.is_closed
+    assert other.is_closed
+    assert routes_personal._WORK_PROCESSOR_HTTP_CLIENTS == {}
+
+
+def test_work_normalized_context_manifest_filters_resolved_blockers_and_tracks_deltas(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-manifest-blockers",
+                title="Normalized manifest blocker proof",
+                body="Only current blockers belong in readiness.",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    conn.executemany(
+        """
+        INSERT INTO kanban_blockers (
+            blocker_id, item_id, title, body_excerpt, status, blocked_by_ref,
+            provenance_json
+        ) VALUES (?, 'work-manifest-blockers', ?, '', ?, '', '{}')
+        """,
+        [
+            ("blocker-resolved", "Historical resolved blocker", "resolved"),
+            ("blocker-open", "Current open blocker", "open"),
+        ],
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-manifest-blockers'"
+    ).fetchone()
+    first = routes_personal._work_preprocessing_context_source(conn, row)
+    manifest = first["context_manifest"]
+    assert manifest["schema"] == "xarta.kanban.normalized_context_manifest.v1"
+    assert first["document_source_hash"] == manifest["fingerprint"]
+    assert first["counts"]["blocker_count"] == 1
+    assert [entry["ref"] for entry in manifest["components"]["blocker"]] == [
+        "kanban_blockers:blocker-open"
+    ]
+
+    marker = {
+        "schema": "xarta.kanban.context_readiness_marker.v1",
+        "item_id": "work-manifest-blockers",
+        "context_hash": manifest["fingerprint"],
+        "counts": first["counts"],
+        "source_refs": first["source_refs"],
+        "context_manifest": manifest,
+    }
+    conn.execute(
+        """
+        INSERT INTO kanban_agent_hints (
+            hint_id, item_id, required_skills_json, metadata_json
+        ) VALUES ('hint-work-manifest-blockers', ?, '[]', ?)
+        """,
+        ("work-manifest-blockers", json.dumps({"context_readiness_marker": marker})),
+    )
+    conn.execute("UPDATE kanban_blockers SET status='resolved' WHERE blocker_id='blocker-open'")
+    conn.commit()
+    second = routes_personal._work_preprocessing_context_source(conn, row)
+    assert second["reason"] == "readiness_marker_stale"
+    assert second["manifest_delta"]["changed_components"] == ["blocker"]
+    assert second["manifest_delta"]["delta_only"] is True
+
+
+def test_work_automation_status_compact_bounds_refresh_payload(monkeypatch):
+    payload = {
+        "ok": True,
+        "generated_at": "2026-07-13T00:00:00Z",
+        "item": {"item_id": "work-compact"},
+        "provider_mode": {"active": "required-hermes-kanban-llm"},
+        "idle_worker": {"enabled": True},
+        "automation_exclusions": {
+            "count": 30,
+            "recent_items": [{"item_id": f"excluded-{index}"} for index in range(30)],
+        },
+        "review_processor": {
+            "status": "decision-ledger-ready",
+            "queue_length": 30,
+            "review_markers": [
+                {"marker_id": f"review-{index}", "source_hash": f"sha256:{index}"}
+                for index in range(30)
+            ],
+        },
+        "preprocessing": {
+            "status": "queued",
+            "queue_length": 30,
+            "markers": [{"marker_id": f"pre-{index}"} for index in range(30)],
+        },
+        "decisions": {
+            "count": 30,
+            "by_status": {"recorded": 30},
+            "recent": [{"decision_id": f"decision-{index}"} for index in range(30)],
+        },
+        "commit_link_health": {"ok": True},
+        "output_contract": {"huge": "x" * 10000},
+        "failures": {"recent_events": [{"huge": "y" * 10000}]},
+    }
+    compact = routes_personal._compact_work_automation_status_response(payload)
+    assert compact["schema"] == "xarta.kanban.automation_status.compact.v1"
+    assert len(compact["review_processor"]["recent_markers"]) == 5
+    assert len(compact["preprocessing"]["recent_markers"]) == 5
+    assert len(compact["decisions"]["recent"]) == 5
+    assert len(compact["automation_exclusions"]["recent_items"]) == 5
+    assert "output_contract" not in compact
+    assert "failures" not in compact
+    assert len(json.dumps(compact)) < 10000
 
 
 def test_personal_automation_signatures_and_skip_gate(monkeypatch, tmp_path):

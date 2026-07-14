@@ -1,3 +1,4 @@
+import stat
 import sys
 from pathlib import Path
 
@@ -50,6 +51,8 @@ def test_list_and_get_prompt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
 
 def test_apply_prompt_writes_tracked_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     prompt_path, _spec = configure_registry(monkeypatch, tmp_path)
+    prompt_path.chmod(0o640)
+    before = prompt_path.stat()
 
     result = prompts.apply_prompt(
         "test-prompt",
@@ -60,6 +63,45 @@ def test_apply_prompt_writes_tracked_file(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert result["changed"] is True
     assert result["actions"] == []
     assert prompt_path.read_text(encoding="utf-8") == "updated prompt\n"
+    after = prompt_path.stat()
+    assert stat.S_IMODE(after.st_mode) == 0o640
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+
+
+def test_apply_prompt_recreates_owned_parent_with_safe_file_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "stack" / "config"
+    root.mkdir(parents=True)
+    owner = root.stat()
+    prompt_path = root / "prompts" / "variants" / "new-prompt.md"
+    spec = prompts.PromptSpec(
+        prompt_id="new-prompt",
+        label="New Prompt",
+        surface="kanban",
+        group="Tests",
+        description="New prompt used by tests.",
+        path=prompt_path,
+    )
+    monkeypatch.setattr(prompts, "ALLOWED_PROMPT_ROOTS", (root,))
+    monkeypatch.setattr(prompts, "PROMPT_REGISTRY", {"new-prompt": spec})
+
+    result = prompts.apply_prompt(
+        "new-prompt",
+        prompts.PromptApplyRequest(content="new prompt\n", restart=False),
+    )
+
+    assert result["ok"] is True
+    assert stat.S_IMODE(prompt_path.stat().st_mode) == 0o644
+    assert (prompt_path.stat().st_uid, prompt_path.stat().st_gid) == (
+        owner.st_uid,
+        owner.st_gid,
+    )
+    assert all(
+        (path.stat().st_uid, path.stat().st_gid) == (owner.st_uid, owner.st_gid)
+        for path in (root / "prompts", root / "prompts" / "variants")
+    )
 
 
 def test_hermes_profile_apply_runs_installer_and_restart(
@@ -134,6 +176,24 @@ def test_kanban_prompt_registry_includes_processor_runtime_sources() -> None:
     }.issubset(prompts.PROMPT_REGISTRY)
     assert prompts.PROMPT_REGISTRY["kanban-preprocessing-system"].apply_strategy == "write-file"
     assert prompts.PROMPT_REGISTRY["kanban-review-processor-system"].apply_strategy == "write-file"
+    variants = [
+        spec
+        for spec in prompts.PROMPT_REGISTRY.values()
+        if spec.model_route_id and spec.processor_kind and spec.prompt_role
+    ]
+    assert len(variants) == 24
+    assert {spec.processor_kind for spec in variants} == {"preprocessing", "review"}
+    assert {spec.prompt_role for spec in variants} == {"soul", "system"}
+    assert {spec.model_route_id for spec in variants} == set(
+        prompts.KANBAN_PROCESSOR_PROMPT_ROUTE_LABELS
+    )
+    assert all(spec.apply_strategy == "write-file" for spec in variants)
+    sol = prompts.PROMPT_REGISTRY["kanban-preprocessing-chatgpt-5-6-sol-system"]
+    summary = prompts._prompt_summary(sol)
+    assert summary["label"] == "Preprocessor · ChatGPT 5.6 Sol · system prompt"
+    assert summary["processor_kind"] == "preprocessing"
+    assert summary["model_route_id"] == "chatgpt-5-6-sol"
+    assert summary["prompt_role"] == "system"
 
 
 def test_unknown_prompt_returns_404(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

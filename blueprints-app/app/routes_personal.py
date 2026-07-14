@@ -13,6 +13,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -25,9 +26,10 @@ from typing import Annotated, Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import httpx
 import yaml
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from starlette.responses import FileResponse
 
 from . import config as cfg
@@ -148,8 +150,167 @@ KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
 KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_LOCAL_AI_MODEL"
 KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE = "required-hermes-kanban-llm"
 KANBAN_AUTOMATION_PROFILE_ENGINE = "hermes-profile-openai-compatible-json"
-KANBAN_PROFILE_FALLBACK_PROVIDER_DEFAULT = "configured-local-litellm"
-KANBAN_PROFILE_FALLBACK_MODEL_DEFAULT = "PRIMARY-LOCAL-PRIVATE-NO-PROTECTION"
+KANBAN_PROCESSOR_ROUTING_REGISTRY_SCHEMA = "xarta.kanban.processor_model_registry.v1"
+KANBAN_PROCESSOR_ROUTING_SETTINGS_SCHEMA = "xarta.kanban.processor_model_priorities.v1"
+KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA = "xarta.kanban.processor_model_attempts.v1"
+KANBAN_PREPROCESSING_GUIDANCE_CATALOG_SCHEMA = (
+    "xarta.kanban.preprocessing.engineering_guidance_catalog.v1"
+)
+KANBAN_PREPROCESSING_GUIDANCE_SELECTION_SCHEMA = (
+    "xarta.kanban.preprocessing.engineering_guidance_selection.v1"
+)
+KANBAN_PROCESSOR_ROUTE_HEADER = "X-Xarta-Kanban-Model-Route"
+KANBAN_PROCESSOR_ROUTE_IDS: tuple[str, ...] = (
+    "chatgpt-5-6-sol",
+    "chatgpt-5-6-terra",
+    "chatgpt-5-6-luna",
+    "chatgpt-5-5",
+    "private-local-no-think",
+    "private-local-thinking",
+)
+KANBAN_PROCESSOR_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
+    "chatgpt-5-6-sol": {
+        "label": "ChatGPT 5.6 Sol",
+        "description": "Frontier subscription model for complex professional work.",
+        "availability_kind": "codex_subscription_cache",
+    },
+    "chatgpt-5-6-terra": {
+        "label": "ChatGPT 5.6 Terra",
+        "description": "Balanced subscription model for capable everyday work.",
+        "availability_kind": "codex_subscription_cache",
+    },
+    "chatgpt-5-6-luna": {
+        "label": "ChatGPT 5.6 Luna",
+        "description": "Cost-efficient subscription model for high-volume work.",
+        "availability_kind": "codex_subscription_cache",
+    },
+    "chatgpt-5-5": {
+        "label": "ChatGPT 5.5",
+        "description": "Previous subscription frontier model.",
+        "availability_kind": "codex_subscription_cache",
+    },
+    "private-local-no-think": {
+        "label": "Private local LiteLLM — no think",
+        "description": "Private no-think, no-protection, no-orientation route.",
+        "availability_kind": "local_litellm",
+    },
+    "private-local-thinking": {
+        "label": "Private local LiteLLM — thinking",
+        "description": "Private thinking route with no protection layer.",
+        "availability_kind": "local_litellm",
+    },
+}
+KANBAN_PREPROCESSING_GUIDANCE_CATALOG: tuple[dict[str, Any], ...] = (
+    {
+        "guidance_id": "blueprints-event-loop-isolation",
+        "label": "Blueprints event-loop isolation",
+        "applies_when": (
+            "The deliverable changes an async Blueprints route, background worker, "
+            "browser-polling path, or request-time file/database/subprocess work."
+        ),
+        "do_not_apply_when": (
+            "The work is not on a Blueprints async/request path or has no blocking I/O boundary."
+        ),
+        "card_guidance": (
+            "Move the whole blocking SQLite, file, subprocess, or synchronous client boundary "
+            "into a measured sync helper invoked through timing.to_thread or the local "
+            "_run_*_sync_work wrapper. Do not wrap only the final statement."
+        ),
+        "proof_guidance": (
+            "Compare the real target workload with health/auth sentinels and classify handler, "
+            "event-loop lag, thread queue/run, DB wait, response-send, and browser time."
+        ),
+        "source_refs": [
+            "/root/xarta-node/.claude/skills/blueprints/SKILL.md",
+            "/root/xarta-node/.xarta/.claude/skills/blueprints-personal/SKILL.md",
+            "/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/README.md",
+        ],
+    },
+    {
+        "guidance_id": "database-connection-lifecycle",
+        "label": "Database connection lifecycle",
+        "applies_when": (
+            "The deliverable adds or changes SQLite/Postgres access, a stack proxy, polling, "
+            "worker claims/reports, or sync-to-async database calls."
+        ),
+        "do_not_apply_when": "The deliverable has no database access or connection ownership.",
+        "card_guidance": (
+            "Reuse the established database adapter and bounded long-lived pool for that store. "
+            "Do not add per-request asyncpg.connect calls, throwaway event loops, or a generic "
+            "SQLite pool that violates the existing thread/transaction ownership contract."
+        ),
+        "proof_guidance": (
+            "Check pool bounds and ownership, pg_stat_activity or equivalent connection churn, "
+            "transaction scope, and focused positive/negative concurrency tests."
+        ),
+        "source_refs": [
+            "/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/README.md",
+            "/root/xarta-node/.xarta/.claude/skills/browser-links/SKILL.md",
+        ],
+    },
+    {
+        "guidance_id": "long-lived-http-clients",
+        "label": "Long-lived bounded HTTP clients",
+        "applies_when": (
+            "The deliverable performs recurring requests to the same upstream from a route, "
+            "poller, worker, health probe, or failover loop."
+        ),
+        "do_not_apply_when": (
+            "The request is a rare one-shot operation where retained client state adds no value."
+        ),
+        "card_guidance": (
+            "Prefer one lifecycle-owned client per traffic class or upstream with bounded "
+            "connection/keepalive limits, explicit timeouts, shutdown cleanup, and no secret "
+            "or endpoint authority from browser input."
+        ),
+        "proof_guidance": (
+            "Prove connection reuse and bounded failure behavior without adding continual polling "
+            "or hiding upstream failure behind stale semantic results."
+        ),
+        "source_refs": [
+            "/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/README.md",
+            "/root/xarta-node/blueprints-app/app/routes_pim_email.py",
+        ],
+    },
+    {
+        "guidance_id": "permission-and-ownership-guards",
+        "label": "Permission and ownership guards",
+        "applies_when": (
+            "A root service, agent, container, or setup script may create or rewrite files in an "
+            "xarta-owned repository, mounted host path, secret directory, or shared runtime tree."
+        ),
+        "do_not_apply_when": "The deliverable performs no privileged or cross-owner file writes.",
+        "card_guidance": (
+            "Reuse or extend the narrow existing permission guard and hand ownership back to the "
+            "reference owner immediately. Do not grant blanket root/sudo/tool access."
+        ),
+        "proof_guidance": (
+            "Run the relevant permission/owner-drift guard and record modes/owners without "
+            "printing credential contents."
+        ),
+        "source_refs": [
+            "/root/xarta-node/.xarta/.claude/skills/repo-permissions-guard/SKILL.md",
+            "/xarta-node/.lone-wolf/stacks/hermes-local/.claude/skills/dockge-stack-hermes-local/SKILL.md",
+        ],
+    },
+)
+_WORK_PROCESSOR_HTTP_CLIENTS: dict[str, httpx.Client] = {}
+_WORK_PROCESSOR_HTTP_CLIENT_LOCK = threading.Lock()
+KANBAN_PROCESSOR_ROUTING_SETTING_KEYS = {
+    "preprocessing": "personal.kanban.processor_models.preprocessing",
+    "review": "personal.kanban.processor_models.review",
+}
+CODEX_MODELS_CACHE_PATH = Path(
+    os.environ.get("BLUEPRINTS_CODEX_MODELS_CACHE", "/root/.codex/models_cache.json")
+)
+HERMES_CODEX_AUTH_SYNC_HEALTH_PATH = Path(
+    os.environ.get(
+        "BLUEPRINTS_HERMES_CODEX_AUTH_SYNC_HEALTH",
+        "/xarta-node/.lone-wolf/stacks/hermes-local/data/health/hermes-codex-profile-auth-sync.json",
+    )
+)
+KANBAN_PROFILE_FALLBACK_PROVIDER_DEFAULT = ""
+KANBAN_PROFILE_FALLBACK_MODEL_DEFAULT = ""
 HERMES_LOCAL_STACK_ROOT = Path(
     os.environ.get("BLUEPRINTS_HERMES_LOCAL_STACK", "/xarta-node/.lone-wolf/stacks/hermes-local")
 )
@@ -905,6 +1066,7 @@ class WorkReviewFeedbackCaptureRequest(BaseModel):
     proof_refs: list[str] = []
     outcome_ref: str | None = None
     outcome_summary: str | None = None
+    reprocess_completed: bool = False
     metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
@@ -1000,6 +1162,7 @@ class WorkReviewProcessorIdleScanRequest(BaseModel):
     item_id: str | None = None
     max_items: int = 100
     include_empty: bool = False
+    reprocess_completed: bool = False
     metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
@@ -1026,6 +1189,18 @@ class WorkAutomationIdleTickRequest(BaseModel):
     marker_timeout_seconds: int | None = None
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-automation-status"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkProcessorRoutingSettingsUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    route_ids: list[str] | None = None
+    expected_revision: str
+    reset: bool = False
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-settings"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -1617,6 +1792,276 @@ def _work_automation_processor_profile_drift(processor_kind: str) -> dict[str, A
         },
         "problems": problems,
         "warnings": warnings,
+    }
+
+
+def _read_json_object_file(path: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _work_processor_kind(value: str) -> str:
+    clean = _clean_short_text(value, "", limit=80).lower().replace("-", "_")
+    if clean == "review_processor":
+        clean = "review"
+    if clean not in KANBAN_PROCESSOR_ROUTING_SETTING_KEYS:
+        raise HTTPException(404, f"unsupported Kanban processor kind: {clean or value}")
+    return clean
+
+
+def _work_processor_routing_default(processor_kind: str) -> dict[str, Any]:
+    return {
+        "schema": KANBAN_PROCESSOR_ROUTING_SETTINGS_SCHEMA,
+        "version": 1,
+        "processor_kind": processor_kind,
+        "route_ids": list(KANBAN_PROCESSOR_ROUTE_IDS),
+        "write_token": "server-default-v1",
+        "updated_at": "",
+        "updated_by": "server-default",
+        "source_surface": "server-default",
+    }
+
+
+def _work_processor_routing_stored(conn: Any, processor_kind: str) -> dict[str, Any]:
+    key = KANBAN_PROCESSOR_ROUTING_SETTING_KEYS[processor_kind]
+    raw = get_setting(conn, key, "") or ""
+    try:
+        loaded = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        loaded = {}
+    payload = loaded if isinstance(loaded, dict) else {}
+    route_ids = payload.get("route_ids")
+    valid_order = bool(
+        isinstance(route_ids, list)
+        and len(route_ids) == len(KANBAN_PROCESSOR_ROUTE_IDS)
+        and len(set(route_ids)) == len(route_ids)
+        and set(route_ids) == set(KANBAN_PROCESSOR_ROUTE_IDS)
+    )
+    if payload.get("schema") != KANBAN_PROCESSOR_ROUTING_SETTINGS_SCHEMA or not valid_order:
+        payload = _work_processor_routing_default(processor_kind)
+    normalized = {
+        **_work_processor_routing_default(processor_kind),
+        **payload,
+        "processor_kind": processor_kind,
+        "route_ids": list(payload.get("route_ids") or KANBAN_PROCESSOR_ROUTE_IDS),
+    }
+    normalized["revision"] = _hash_json_payload(normalized)
+    normalized["stored"] = bool(raw and valid_order)
+    return normalized
+
+
+def _work_processor_http_client(url: str) -> httpx.Client:
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Kanban processor upstream URL is invalid")
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    with _WORK_PROCESSOR_HTTP_CLIENT_LOCK:
+        client = _WORK_PROCESSOR_HTTP_CLIENTS.get(origin)
+        if client is None or client.is_closed:
+            client = httpx.Client(
+                base_url=origin,
+                timeout=None,
+                limits=httpx.Limits(
+                    max_connections=8,
+                    max_keepalive_connections=4,
+                    keepalive_expiry=60.0,
+                ),
+                trust_env=False,
+                follow_redirects=False,
+            )
+            _WORK_PROCESSOR_HTTP_CLIENTS[origin] = client
+        return client
+
+
+async def _close_work_processor_http_clients() -> None:
+    with _WORK_PROCESSOR_HTTP_CLIENT_LOCK:
+        clients = list(_WORK_PROCESSOR_HTTP_CLIENTS.values())
+        _WORK_PROCESSOR_HTTP_CLIENTS.clear()
+    if clients:
+        await asyncio.gather(
+            *(
+                timing.to_thread(
+                    "personal.kanban_processor_http_client_close",
+                    client.close,
+                )
+                for client in clients
+            )
+        )
+
+
+def _work_processor_gateway_available(route: dict[str, Any]) -> tuple[bool, str]:
+    if not route.get("api_key_present"):
+        return False, "gateway_api_key_missing"
+    try:
+        url = f"{route['api_base']}/health"
+        response = _work_processor_http_client(url).get(url, timeout=2.0)
+        if response.status_code != 200:
+            return False, f"gateway_http_{response.status_code}"
+    except Exception as exc:
+        return False, f"gateway_unavailable:{type(exc).__name__}"
+    return True, "gateway_healthy"
+
+
+def _work_processor_model_definitions(
+    processor_kind: str,
+    *,
+    profile_config: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve opaque routes only through the private Hermes profile config."""
+    if profile_config is None:
+        profile = str(_work_automation_processor_profile_spec(processor_kind)["profile"])
+        _config_path, profile_config = _work_automation_processor_profile_config(profile)
+    configured_routes = (
+        profile_config.get("xarta_kanban_model_routes") if isinstance(profile_config, dict) else {}
+    )
+    configured_routes = configured_routes if isinstance(configured_routes, dict) else {}
+    definitions: dict[str, dict[str, Any]] = {}
+    for route_id in KANBAN_PROCESSOR_ROUTE_IDS:
+        public = KANBAN_PROCESSOR_MODEL_REGISTRY[route_id]
+        configured = configured_routes.get(route_id)
+        configured = configured if isinstance(configured, dict) else {}
+        model = _clean_short_text(configured.get("model"), "", limit=220)
+        definitions[route_id] = {
+            **public,
+            "route_id": route_id,
+            "provider": _clean_short_text(configured.get("provider"), "", limit=180),
+            "model": model,
+            "catalog_model_id": model,
+        }
+    return definitions
+
+
+def _work_processor_local_litellm_available() -> tuple[bool, str]:
+    configured_health = _clean_short_text(
+        os.environ.get("BLUEPRINTS_KANBAN_LOCAL_LITELLM_HEALTH", ""),
+        "",
+        limit=320,
+    )
+    if not configured_health:
+        base_url = _clean_short_text(os.environ.get("LITELLM_BASE_URL", ""), "", limit=280)
+        configured_health = f"{base_url.rstrip('/')}/health/liveliness" if base_url else ""
+    if not configured_health:
+        return False, "litellm_health_not_configured"
+    try:
+        url = configured_health
+        response = _work_processor_http_client(url).get(url, timeout=2.0)
+        if response.status_code != 200:
+            return False, f"litellm_http_{response.status_code}"
+    except Exception as exc:
+        return False, f"litellm_unavailable:{type(exc).__name__}"
+    return True, "litellm_healthy"
+
+
+def _work_processor_registry_snapshot(
+    processor_kind: str,
+    *,
+    probe: bool = True,
+) -> list[dict[str, Any]]:
+    profile_route = _work_automation_processor_profile_route(processor_kind)
+    gateway_ok, gateway_reason = (
+        _work_processor_gateway_available(profile_route)
+        if probe
+        else (bool(profile_route.get("api_key_present")), "probe_not_requested")
+    )
+    codex_cache = _read_json_object_file(CODEX_MODELS_CACHE_PATH)
+    codex_models = {
+        str(model.get("slug") or "")
+        for model in (codex_cache.get("models") or [])
+        if isinstance(model, dict)
+    }
+    auth_sync = _read_json_object_file(HERMES_CODEX_AUTH_SYNC_HEALTH_PATH)
+    auth_ok = bool(auth_sync.get("ok"))
+    local_ok, local_reason = (
+        _work_processor_local_litellm_available() if probe else (True, "probe_not_requested")
+    )
+    _config_path, profile_config = _work_automation_processor_profile_config(
+        profile_route["profile"]
+    )
+    definitions = _work_processor_model_definitions(
+        processor_kind,
+        profile_config=profile_config,
+    )
+    custom_providers = profile_config.get("custom_providers") or []
+    configured_local_models: dict[str, set[str]] = {}
+    for provider in custom_providers if isinstance(custom_providers, list) else []:
+        if not isinstance(provider, dict):
+            continue
+        provider_name = _clean_short_text(provider.get("name"), "", limit=180)
+        if not provider_name:
+            continue
+        configured_local_models.setdefault(provider_name, set()).update(
+            str(model_id) for model_id in (provider.get("models") or {}).keys()
+        )
+
+    entries: list[dict[str, Any]] = []
+    for route_id in KANBAN_PROCESSOR_ROUTE_IDS:
+        definition = definitions[route_id]
+        route_configured = bool(definition["provider"] and definition["model"])
+        if definition["availability_kind"] == "codex_subscription_cache":
+            available = bool(
+                route_configured and gateway_ok and auth_ok and definition["model"] in codex_models
+            )
+            if not route_configured:
+                classification = "model_route_not_configured"
+            elif not gateway_ok:
+                classification = gateway_reason
+            elif not auth_ok:
+                classification = "codex_auth_sync_not_current"
+            elif definition["model"] not in codex_models:
+                classification = "model_not_in_subscription_cache"
+            else:
+                classification = "available_subscription_model"
+        else:
+            provider_name = definition["provider"].removeprefix("custom:")
+            configured = bool(
+                route_configured
+                and definition["model"] in configured_local_models.get(provider_name, set())
+            )
+            available = bool(gateway_ok and local_ok and configured)
+            if not route_configured:
+                classification = "model_route_not_configured"
+            elif not gateway_ok:
+                classification = gateway_reason
+            elif not configured:
+                classification = "local_model_not_configured"
+            elif not local_ok:
+                classification = local_reason
+            else:
+                classification = "available_private_local_model"
+        entries.append(
+            {
+                "route_id": route_id,
+                "label": definition["label"],
+                "description": definition["description"],
+                "available": available,
+                "availability_state": "available" if available else "unavailable",
+                "availability_classification": classification,
+            }
+        )
+    return entries
+
+
+def _work_processor_routing_snapshot(
+    conn: Any,
+    processor_kind: str,
+    *,
+    probe: bool = True,
+) -> dict[str, Any]:
+    settings = _work_processor_routing_stored(conn, processor_kind)
+    registry = _work_processor_registry_snapshot(processor_kind, probe=probe)
+    registry_by_id = {entry["route_id"]: entry for entry in registry}
+    return {
+        "schema": KANBAN_PROCESSOR_ROUTING_SETTINGS_SCHEMA,
+        "processor_kind": processor_kind,
+        "revision": settings["revision"],
+        "stored": settings["stored"],
+        "updated_at": settings["updated_at"],
+        "updated_by": settings["updated_by"],
+        "route_ids": settings["route_ids"],
+        "routes": [registry_by_id[route_id] for route_id in settings["route_ids"]],
     }
 
 
@@ -2651,6 +3096,7 @@ def _work_review_feedback_entry(
             "feedback_id": feedback_id,
             "captured_at": now,
             "attribution": attribution,
+            "reprocess_completed": bool(body.reprocess_completed),
         }
     )
     return {
@@ -2670,6 +3116,7 @@ def _work_review_feedback_entry(
         "feedback_hash": feedback_hash,
         "feedback_excerpt": _body_excerpt(clean_feedback, limit=500),
         "feedback": clean_feedback,
+        "reprocess_completed": bool(body.reprocess_completed),
         "metadata": dict(body.metadata or {}),
     }
 
@@ -2762,6 +3209,7 @@ def _preprocessing_source_ref(
         "document_type": document_type,
         "updated_at": _clean_short_text(updated_at, "", limit=80),
         "body_length": len(str(body or "")),
+        "content_sha256": _sha256_text(str(body or "")),
         "image_count": 0,
         "file_ref": dict(file_ref or {}),
     }
@@ -2978,7 +3426,7 @@ def _work_preprocessing_ancestor_context(
             SELECT * FROM kanban_review_decisions
             WHERE item_id=?
             ORDER BY updated_at DESC, created_at DESC, decision_id
-            LIMIT 5
+            LIMIT 2
             """,
             (ancestor_id,),
         ).fetchall()
@@ -2988,17 +3436,23 @@ def _work_preprocessing_ancestor_context(
                 "canonical_item_ref": f"xarta-kanban:item:{ancestor_id}",
                 "item": _work_preprocessing_item_summary(ancestor),
                 "documents": {
+                    "body_ref": f"kanban_items:{ancestor_id}:body",
+                    "body_sha256": _sha256_text(str(ancestor["body_excerpt"] or "")),
                     "body_excerpt": _body_excerpt(
                         str(ancestor["body_excerpt"] or ""),
-                        limit=5000,
+                        limit=1200 if index == 1 else 400,
                     ),
+                    "detail_ref": f"kanban_items:{ancestor_id}:detail",
+                    "detail_sha256": _sha256_text(str(detail.get("body") or "")),
                     "detail_excerpt": _body_excerpt(
                         str(detail.get("body") or ""),
-                        limit=8000,
+                        limit=2000 if index == 1 else 800,
                     ),
+                    "review_ref": f"kanban_items:{ancestor_id}:review",
+                    "review_sha256": _sha256_text(str(review.get("body") or "")),
                     "review_excerpt": _body_excerpt(
                         str(review.get("body") or ""),
-                        limit=8000,
+                        limit=2000 if index == 1 else 800,
                     ),
                 },
                 "recent_decisions": [
@@ -3019,9 +3473,18 @@ def _work_preprocessing_ancestor_context(
             }
         )
     return {
-        "schema": "xarta.kanban.preprocessing.ancestor_context.v1",
+        "schema": "xarta.kanban.preprocessing.ancestor_context.v2",
         "item_id": item_row["item_id"],
         "ancestor_count": len(ancestors),
+        "bounds": {
+            "parent_body_chars": 1200,
+            "parent_detail_chars": 2000,
+            "parent_review_chars": 2000,
+            "other_body_chars": 400,
+            "other_detail_chars": 800,
+            "other_review_chars": 800,
+            "decisions_per_ancestor": 2,
+        },
         "ancestors": ancestors,
     }
 
@@ -3080,83 +3543,268 @@ def _work_preprocessing_source_classification(
     detail: dict[str, Any],
     review: dict[str, Any],
 ) -> dict[str, Any]:
-    discussion_rows = conn.execute(
-        """
-        SELECT body_excerpt FROM kanban_discussions
-        WHERE item_id=? AND status!='archived'
-        ORDER BY updated_at DESC, created_at DESC, discussion_id
-        LIMIT 6
-        """,
+    # Classification is an acceptance/control decision. Card prose, document
+    # text, discussion words, titles and filenames are semantic evidence for an
+    # LLM, never deterministic control fields.
+    provenance = _json_value(item_row["provenance_json"], {})
+    hints_row = conn.execute(
+        "SELECT metadata_json FROM kanban_agent_hints WHERE item_id=?",
         (item_row["item_id"],),
-    ).fetchall()
-    context_text = "\n".join(
-        [
-            str(item_row["body_excerpt"] or ""),
-            str(detail.get("body") or ""),
-            str(review.get("body") or ""),
-            *[str(row["body_excerpt"] or "") for row in discussion_rows],
-        ]
+    ).fetchone()
+    hints_metadata = _json_value(hints_row["metadata_json"], {}) if hints_row else {}
+    structured_sources = [
+        provenance.get("preprocessing"),
+        provenance.get("acceptance"),
+        hints_metadata.get("preprocessing"),
+        hints_metadata.get("acceptance"),
+    ]
+    structured = next(
+        (dict(value) for value in structured_sources if isinstance(value, dict)),
+        {},
+    )
+    explicit_classification = _clean_short_text(
+        str(structured.get("classification") or structured.get("work_shape") or ""),
+        "",
+        limit=80,
     ).lower()
-    title_text = str(item_row["title"] or "").lower()
-    topic_terms = (
-        "topic ancestor",
-        "holding area",
-        "holding-area",
-        "category card",
-        "umbrella",
-        "organize related",
-        "collect related",
-        "topic/container",
-        "broad topic",
+    explicit_eligible = structured.get("eligible")
+    classification = (
+        explicit_classification
+        if explicit_classification in {"concrete_request", "topic_container"}
+        else "concrete_request"
     )
-    concrete_terms = (
-        "proof path",
-        "acceptance",
-        "implement",
-        "fix ",
-        "add ",
-        "test ",
-        "api",
-        "ui",
-        "commit",
-        "deliverable",
-        "regression",
-        "bug",
-    )
-    topic_hits = [term for term in topic_terms if term in context_text]
-    concrete_hits = [term for term in concrete_terms if term in context_text]
-    title_topic_hint = any(term in title_text for term in ("topic", "ancestor", "holding"))
-    classification = "concrete_request"
-    eligible = True
-    reason = "concrete_context"
-    if topic_hits and not concrete_hits:
-        classification = "topic_container"
+    eligible = bool(explicit_eligible) if isinstance(explicit_eligible, bool) else True
+    if classification == "topic_container" and not isinstance(explicit_eligible, bool):
         eligible = False
-        reason = "topic_context_without_concrete_proof"
-    elif topic_hits and concrete_hits:
-        classification = "ambiguous_mixed"
-        eligible = False
-        reason = "mixed_topic_and_concrete_context"
-    elif title_topic_hint and not concrete_hits and item_row["state_id"] != "todo":
-        classification = "topic_container"
-        eligible = False
-        reason = "title_topic_hint_with_non_todo_lane_and_no_concrete_context"
-    elif item_row["state_id"] == "backlog" and not concrete_hits:
-        classification = "topic_container"
-        eligible = False
-        reason = "backlog_without_concrete_context"
+    reason = "explicit_structured_classification" if structured else "default_concrete_request"
     return {
         "schema": "xarta.kanban.preprocessing.source_classification.v1",
         "classification": classification,
         "eligible": eligible,
         "reason": reason,
         "evidence": {
-            "topic_context_terms": topic_hits[:8],
-            "concrete_context_terms": concrete_hits[:8],
-            "title_topic_hint": title_topic_hint,
+            "source": "structured_metadata" if structured else "safe_default",
+            "explicit_classification": explicit_classification,
+            "explicit_eligible": explicit_eligible if isinstance(explicit_eligible, bool) else None,
+            "lexical_controls_used": False,
             "state_id": item_row["state_id"],
         },
     }
+
+
+def _work_preprocessing_context_manifest(
+    conn: Any,
+    item_row: Any,
+    *,
+    detail: dict[str, Any],
+    review: dict[str, Any],
+    source_refs: list[dict[str, Any]],
+    counts: dict[str, int],
+) -> dict[str, Any]:
+    """Build one bounded, versioned manifest of durable Kanban context refs."""
+    item_id = str(item_row["item_id"])
+    discussions = [
+        {
+            "ref": f"kanban_discussions:{row['discussion_id']}",
+            "updated_at": row["updated_at"],
+            "hash": _sha256_text(str(row["body_excerpt"] or "")),
+        }
+        for row in conn.execute(
+            """
+            SELECT discussion_id, body_excerpt, updated_at
+            FROM kanban_discussions
+            WHERE item_id=? AND status!='archived'
+            ORDER BY updated_at DESC, created_at DESC, discussion_id
+            LIMIT 12
+            """,
+            (item_id,),
+        ).fetchall()
+    ]
+    decisions = [
+        {
+            "ref": f"kanban_review_decisions:{row['decision_id']}",
+            "status": row["status"],
+            "updated_at": row["updated_at"],
+            "hash": _hash_json_payload(
+                {
+                    "decision_type": row["decision_type"],
+                    "summary": row["summary"],
+                    "status": row["status"],
+                    "proof_refs": _json_value(row["proof_refs_json"], []),
+                }
+            ),
+        }
+        for row in conn.execute(
+            """
+            SELECT * FROM kanban_review_decisions
+            WHERE item_id=?
+            ORDER BY updated_at DESC, created_at DESC, decision_id
+            LIMIT 12
+            """,
+            (item_id,),
+        ).fetchall()
+    ]
+    links = [
+        {
+            "ref": f"kanban_item_links:{row['link_id']}",
+            "source_ref": f"kanban_items:{row['source_item_id']}",
+            "target_ref": f"kanban_items:{row['target_item_id']}",
+            "link_type": row["link_type"],
+            "updated_at": row["updated_at"],
+        }
+        for row in conn.execute(
+            """
+            SELECT * FROM kanban_item_links
+            WHERE source_item_id=? OR target_item_id=?
+            ORDER BY updated_at DESC, link_id
+            LIMIT 12
+            """,
+            (item_id, item_id),
+        ).fetchall()
+    ]
+    blockers = [
+        {
+            "ref": f"kanban_blockers:{row['blocker_id']}",
+            "status": row["status"],
+            "updated_at": row["updated_at"],
+            "hash": _hash_json_payload(
+                {
+                    "title": row["title"],
+                    "body_excerpt": row["body_excerpt"],
+                    "blocked_by_ref": row["blocked_by_ref"],
+                    "status": row["status"],
+                }
+            ),
+        }
+        for row in conn.execute(
+            """
+            SELECT * FROM kanban_blockers
+            WHERE item_id=? AND status NOT IN ('resolved', 'closed', 'done')
+              AND COALESCE(json_extract(provenance_json, '$.schema'), '') != ?
+            ORDER BY updated_at DESC, blocker_id
+            LIMIT 12
+            """,
+            (item_id, KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA),
+        ).fetchall()
+    ]
+    commits = [
+        {
+            "ref": f"kanban_item_commits:{row['commit_link_id']}",
+            "commit_ref": f"git_commit:{row['repo_full_name']}@{row['sha']}",
+            "updated_at": row["updated_at"],
+        }
+        for row in conn.execute(
+            """
+            SELECT * FROM kanban_item_commits
+            WHERE item_id=?
+            ORDER BY COALESCE(NULLIF(committed_at, ''), updated_at) DESC,
+                     updated_at DESC, commit_link_id
+            LIMIT 12
+            """,
+            (item_id,),
+        ).fetchall()
+    ]
+    descendants = [
+        {
+            "ref": f"kanban_items:{row['item_id']}",
+            "parent_ref": f"kanban_items:{row['parent_item_id']}",
+            "state_id": row["state_id"],
+            "status": row["status"],
+            "updated_at": row["updated_at"],
+            "title_hash": _sha256_text(str(row["title"] or "")),
+        }
+        for row in conn.execute(
+            """
+            WITH RECURSIVE descendants(item_id) AS (
+                SELECT item_id FROM kanban_items WHERE parent_item_id=? AND status!='archived'
+                UNION ALL
+                SELECT child.item_id FROM kanban_items child
+                JOIN descendants parent ON child.parent_item_id=parent.item_id
+                WHERE child.status!='archived'
+            )
+            SELECT item_id, parent_item_id, title, state_id, status, updated_at
+            FROM kanban_items WHERE item_id IN (SELECT item_id FROM descendants)
+            ORDER BY updated_at DESC, item_id
+            LIMIT 24
+            """,
+            (item_id,),
+        ).fetchall()
+    ]
+    document_components = {
+        "item": {
+            "refs": [f"kanban_items:{item_id}"],
+            "state_id": item_row["state_id"],
+            "status": item_row["status"],
+            "priority_id": item_row["priority_id"],
+            "title_hash": _sha256_text(str(item_row["title"] or "")),
+            "updated_at": item_row["updated_at"],
+        },
+        "body": {
+            "refs": [f"kanban_items:{item_id}:body"],
+            "hash": _sha256_text(str(item_row["body_excerpt"] or "")),
+        },
+        "detail": {
+            "refs": [f"kanban_items:{item_id}:detail"],
+            "hash": _sha256_text(str(detail.get("body") or "")),
+        },
+        "review": {
+            "refs": [f"kanban_items:{item_id}:review"],
+            "hash": _sha256_text(str(review.get("body") or "")),
+        },
+    }
+    collection_components = {
+        "discussion": discussions,
+        "decision": decisions,
+        "link": links,
+        "blocker": blockers,
+        "commit": commits,
+        "descendant": descendants,
+        "proof": {
+            "refs": list(
+                dict.fromkeys(
+                    [entry["commit_ref"] for entry in commits]
+                    + [
+                        str(ref)
+                        for row in conn.execute(
+                            """
+                            SELECT proof_refs_json FROM kanban_review_decisions
+                            WHERE item_id=? ORDER BY updated_at DESC LIMIT 12
+                            """,
+                            (item_id,),
+                        ).fetchall()
+                        for ref in _json_value(row["proof_refs_json"], [])
+                        if str(ref)
+                    ]
+                )
+            )[:24]
+        },
+    }
+    components: dict[str, Any] = {**document_components, **collection_components}
+    component_hashes = {
+        name: _hash_json_payload(value) for name, value in sorted(components.items())
+    }
+    manifest = {
+        "schema": "xarta.kanban.normalized_context_manifest.v1",
+        "version": 1,
+        "item_id": item_id,
+        "canonical_item_ref": f"xarta-kanban:item:{item_id}",
+        "bounds": {
+            "discussions": 12,
+            "decisions": 12,
+            "links": 12,
+            "blockers": 12,
+            "commits": 12,
+            "descendants": 24,
+            "proof_refs": 24,
+        },
+        "counts": dict(counts),
+        "source_refs": source_refs,
+        "components": components,
+        "component_hashes": component_hashes,
+    }
+    manifest["fingerprint"] = _hash_json_payload(manifest)
+    manifest["manifest_ref"] = f"kanban_items:{item_id}:context_manifest:{manifest['fingerprint']}"
+    return manifest
 
 
 def _work_preprocessing_context_source(
@@ -3252,6 +3900,27 @@ def _work_preprocessing_context_source(
             "todo_count": len(_json_value(item_row["related_task_ids_json"], [])),
         }
     )
+    context_manifest = _work_preprocessing_context_manifest(
+        conn,
+        item_row,
+        detail=detail,
+        review=review,
+        source_refs=source_refs,
+        counts=source_counts,
+    )
+    previous_manifest = (
+        marker.get("context_manifest") if isinstance(marker.get("context_manifest"), dict) else {}
+    )
+    previous_component_hashes = (
+        previous_manifest.get("component_hashes")
+        if isinstance(previous_manifest.get("component_hashes"), dict)
+        else {}
+    )
+    manifest_delta_components = [
+        name
+        for name, fingerprint in context_manifest["component_hashes"].items()
+        if previous_component_hashes.get(name) != fingerprint
+    ]
     marker_refs = {
         str(ref.get("name") or ""): ref
         for ref in marker.get("source_refs", [])
@@ -3266,11 +3935,16 @@ def _work_preprocessing_context_source(
         if marker_ref is None:
             new_refs.append(name)
             continue
-        if (
-            str(marker_ref.get("updated_at") or "") != source_ref["updated_at"]
-            or int(marker_ref.get("body_length") or 0) != source_ref["body_length"]
-            or int(marker_ref.get("image_count") or 0) != source_ref["image_count"]
-        ):
+        marker_content_hash = str(marker_ref.get("content_sha256") or "")
+        content_changed = (
+            marker_content_hash != source_ref["content_sha256"]
+            if marker_content_hash
+            else (
+                str(marker_ref.get("updated_at") or "") != source_ref["updated_at"]
+                or int(marker_ref.get("body_length") or 0) != source_ref["body_length"]
+            )
+        )
+        if content_changed or int(marker_ref.get("image_count") or 0) != source_ref["image_count"]:
             changed_refs.append(name)
     source_ref_names = {ref["name"] for ref in source_refs}
     missing_refs = [name for name in marker_refs if name not in source_ref_names]
@@ -3280,13 +3954,19 @@ def _work_preprocessing_context_source(
     ]
     marker_schema = str(marker.get("schema") or "")
     marker_item_id = str(marker.get("item_id") or "")
+    marker_context_hash = str(marker.get("context_hash") or "")
+    context_fingerprint_drift = bool(
+        previous_manifest
+        and marker_context_hash
+        and marker_context_hash != context_manifest["fingerprint"]
+    )
     if not marker:
         reason = "missing_readiness_marker"
     elif marker_schema != "xarta.kanban.context_readiness_marker.v1":
         reason = "invalid_readiness_marker_schema"
     elif marker_item_id != item_id:
         reason = "readiness_marker_item_mismatch"
-    elif changed_refs or new_refs or missing_refs or count_drift:
+    elif context_fingerprint_drift or changed_refs or new_refs or missing_refs or count_drift:
         reason = "readiness_marker_stale"
     else:
         reason = "ready"
@@ -3318,11 +3998,23 @@ def _work_preprocessing_context_source(
             "new_source_refs": new_refs,
             "missing_source_refs": missing_refs,
             "count_drift": count_drift,
+            "context_fingerprint_drift": context_fingerprint_drift,
         },
         "classification": classification,
+        "context_manifest": context_manifest,
+        "manifest_delta": {
+            "schema": "xarta.kanban.normalized_context_manifest.delta.v1",
+            "previous_fingerprint": previous_manifest.get("fingerprint") or "",
+            "current_fingerprint": context_manifest["fingerprint"],
+            "changed_components": manifest_delta_components,
+            "delta_only": bool(previous_manifest and len(manifest_delta_components) == 1),
+        },
         "reason": reason,
     }
-    source_hash = _hash_json_payload(source_payload)
+    # One canonical fingerprint is shared by preprocessing, readiness and
+    # completion checks. Marker metadata and scheduling reasons must not feed
+    # back into the fingerprint and require an artificial echo update.
+    source_hash = context_manifest["fingerprint"]
     return {
         **source_payload,
         "document_ref": f"kanban_items:{item_id}:context_readiness",
@@ -9585,6 +10277,15 @@ def _work_status_for_state(state_row: Any) -> str:
     return "open"
 
 
+def _work_item_is_completed(row: Any) -> bool:
+    return str(row["state_id"] or "") == "done" or str(row["status"] or "") in {
+        "done",
+        "closed",
+        "resolved",
+        "promoted",
+    }
+
+
 def _work_item_or_404(conn: Any, item_id: str) -> Any:
     row = conn.execute("SELECT * FROM kanban_items WHERE item_id=?", (item_id,)).fetchone()
     if not row:
@@ -12152,6 +12853,130 @@ def _get_kanban_preferences_sync() -> dict[str, Any]:
         return {"ok": True, "preferences": _kanban_preferences(conn)}
 
 
+@router.get("/kanban/automation/model-routing/settings")
+async def get_work_processor_routing_settings(
+    probe: Annotated[bool, Query()] = True,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_processor_routing_settings_sync, probe)
+
+
+def _get_work_processor_routing_settings_sync(probe: bool = True) -> dict[str, Any]:
+    with _sqlite_get_conn() as conn:
+        settings = {
+            processor_kind: _work_processor_routing_snapshot(
+                conn,
+                processor_kind,
+                probe=probe,
+            )
+            for processor_kind in ("preprocessing", "review")
+        }
+    return {
+        "ok": True,
+        "schema": KANBAN_PROCESSOR_ROUTING_REGISTRY_SCHEMA,
+        "version": 1,
+        "allowed_route_ids": list(KANBAN_PROCESSOR_ROUTE_IDS),
+        "settings": settings,
+        "input_contract": {
+            "accepted_fields": ["route_ids", "expected_revision", "reset"],
+            "route_ids_are_opaque_server_allowlist_keys": True,
+            "arbitrary_provider_input_allowed": False,
+            "arbitrary_model_input_allowed": False,
+            "endpoint_input_allowed": False,
+            "credential_input_allowed": False,
+        },
+    }
+
+
+@router.put("/kanban/automation/model-routing/settings/{processor_kind}")
+async def update_work_processor_routing_settings(
+    processor_kind: str,
+    body: WorkProcessorRoutingSettingsUpdateRequest,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _update_work_processor_routing_settings_sync,
+        processor_kind,
+        body,
+    )
+
+
+def _update_work_processor_routing_settings_sync(
+    processor_kind: str,
+    body: WorkProcessorRoutingSettingsUpdateRequest,
+) -> dict[str, Any]:
+    clean_kind = _work_processor_kind(processor_kind)
+    meta = _work_request_meta(body)
+    expected_revision = _clean_short_text(body.expected_revision, "", limit=180)
+    if not expected_revision:
+        raise HTTPException(422, "expected_revision is required")
+    route_ids = list(KANBAN_PROCESSOR_ROUTE_IDS) if body.reset else list(body.route_ids or [])
+    if (
+        len(route_ids) != len(KANBAN_PROCESSOR_ROUTE_IDS)
+        or len(set(route_ids)) != len(route_ids)
+        or set(route_ids) != set(KANBAN_PROCESSOR_ROUTE_IDS)
+    ):
+        raise HTTPException(
+            422,
+            {
+                "error": "invalid_processor_route_order",
+                "message": "route_ids must be one exact permutation of the server allowlist",
+                "allowed_route_ids": list(KANBAN_PROCESSOR_ROUTE_IDS),
+            },
+        )
+    now = _utc_now_iso()
+    key = KANBAN_PROCESSOR_ROUTING_SETTING_KEYS[clean_kind]
+    with _sqlite_get_conn() as conn:
+        current = _work_processor_routing_stored(conn, clean_kind)
+        if expected_revision != current["revision"]:
+            raise HTTPException(
+                409,
+                {
+                    "error": "stale_processor_routing_settings",
+                    "message": "The model priority list changed after this editor loaded.",
+                    "current": _work_processor_routing_snapshot(
+                        conn,
+                        clean_kind,
+                        probe=False,
+                    ),
+                },
+            )
+        stored = {
+            "schema": KANBAN_PROCESSOR_ROUTING_SETTINGS_SCHEMA,
+            "version": 1,
+            "processor_kind": clean_kind,
+            "route_ids": route_ids,
+            "write_token": uuid.uuid4().hex,
+            "updated_at": now,
+            "updated_by": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "request_id": meta["request_id"],
+        }
+        set_setting(
+            conn,
+            key,
+            json.dumps(stored, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+            f"Kanban {clean_kind} processor model priority allowlist",
+        )
+        gen = increment_gen(conn, "kanban-processor-routing-settings")
+        row = conn.execute("SELECT * FROM settings WHERE key=?", (key,)).fetchone()
+        if row is not None:
+            enqueue_for_all_peers(conn, "UPDATE", "settings", key, dict(row), gen)
+        snapshot = _work_processor_routing_snapshot(conn, clean_kind, probe=False)
+    return {
+        "ok": True,
+        "schema": KANBAN_PROCESSOR_ROUTING_SETTINGS_SCHEMA,
+        "settings": snapshot,
+        "audit": {
+            "action": "reset_processor_model_priority"
+            if body.reset
+            else "save_processor_model_priority",
+            "actor": meta["actor"],
+            "source_surface": meta["source_surface"],
+            "request_id": meta["request_id"],
+            "updated_at": now,
+        },
+    }
+
+
 @router.put("/kanban/preferences")
 async def update_kanban_preferences(body: WorkPreferencesUpdateRequest) -> dict[str, Any]:
     meta = _work_request_meta(body)
@@ -12977,6 +13802,12 @@ def _update_work_item_review_document_sync(
 async def append_work_item_review_feedback(
     item_id: str, body: WorkReviewFeedbackCaptureRequest
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_append_work_item_review_feedback_sync, item_id, body)
+
+
+def _append_work_item_review_feedback_sync(
+    item_id: str, body: WorkReviewFeedbackCaptureRequest
+) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
@@ -13016,21 +13847,34 @@ async def append_work_item_review_feedback(
             now=now,
             metadata_extra=feedback_metadata,
         )
-        review_marker_schedule = _schedule_work_review_processor_marker_for_document(
-            conn,
-            item_id=clean_item_id,
-            document=document,
-            meta=meta,
-            now=now,
-            reason="operator_feedback_captured",
-            metadata={
-                "trigger": "operator_feedback_capture",
-                "feedback_id": entry["feedback_id"],
-                "feedback_hash": entry["feedback_hash"],
-                "capture_source": entry["capture_source"],
-                "session_id": entry["session_id"],
-            },
-        )
+        reprocess_completed = bool(body.reprocess_completed)
+        if _work_item_is_completed(item) and not reprocess_completed:
+            review_marker_schedule = {
+                "action": "skipped_completed_no_reprocess",
+                "queued": False,
+                "marker_row": conn.execute(
+                    "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+                    (_review_processor_marker_id(clean_item_id),),
+                ).fetchone(),
+                "document_source": _review_document_source(document),
+            }
+        else:
+            review_marker_schedule = _schedule_work_review_processor_marker_for_document(
+                conn,
+                item_id=clean_item_id,
+                document=document,
+                meta=meta,
+                now=now,
+                reason="operator_feedback_captured",
+                metadata={
+                    "trigger": "operator_feedback_capture",
+                    "feedback_id": entry["feedback_id"],
+                    "feedback_hash": entry["feedback_hash"],
+                    "capture_source": entry["capture_source"],
+                    "session_id": entry["session_id"],
+                    "reprocess_completed": reprocess_completed,
+                },
+            )
         image_associations = _associate_rich_doc_images_for_document(
             domain="kanban",
             markdown=clean_body,
@@ -13073,6 +13917,7 @@ async def append_work_item_review_feedback(
                 "rich_doc_image_count": len(image_associations.get("images", [])),
                 "review_processor_marker_action": review_marker_schedule["action"],
                 "review_processor_marker_queued": bool(review_marker_schedule["queued"]),
+                "reprocess_completed": reprocess_completed,
                 "review_processor_marker_id": (
                     review_marker_schedule["marker_row"]["marker_id"]
                     if review_marker_schedule.get("marker_row") is not None
@@ -15387,6 +16232,53 @@ def _sha256_text(content: str) -> str:
     return "sha256:" + hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
 
 
+class WorkProcessorRoutesExhausted(RuntimeError):
+    def __init__(self, processor_kind: str, attempts: list[dict[str, Any]]) -> None:
+        self.processor_kind = processor_kind
+        self.attempts = attempts
+        classifications = [
+            str(
+                attempt.get("error_classification")
+                or attempt.get("availability_classification")
+                or ""
+            )
+            for attempt in attempts
+        ]
+        super().__init__(
+            f"all configured {processor_kind} model routes failed: "
+            + ",".join(value for value in classifications if value)
+        )
+
+
+def _work_processor_route_error_class(exc: Exception) -> str:
+    text = str(exc).lower()
+    if (
+        isinstance(exc, (TimeoutError, httpx.TimeoutException))
+        or "timed out" in text
+        or "timeout" in text
+    ):
+        return "timeout"
+    if "http 401" in text or "unauthorized" in text or "auth" in text:
+        return "authentication"
+    if "http 403" in text or "forbidden" in text:
+        return "authorization"
+    if "http 404" in text or "model_not_found" in text or "model not found" in text:
+        return "model_unavailable"
+    if "http 429" in text or "rate limit" in text or "quota" in text:
+        return "rate_limited"
+    if "invalid json" in text or "json object" in text or "did not include choices" in text:
+        return "invalid_response"
+    if (
+        isinstance(
+            exc,
+            (urllib.error.URLError, ConnectionError, httpx.TransportError),
+        )
+        or "unavailable" in text
+    ):
+        return "transport_unavailable"
+    return "provider_error"
+
+
 async def _work_automation_local_ai_json_completion(
     *,
     messages: list[dict[str, str]],
@@ -15403,49 +16295,84 @@ async def _work_automation_local_ai_json_completion(
 def _work_automation_profile_completion_sync(
     *,
     route: dict[str, Any],
+    route_id: str,
     messages: list[dict[str, str]],
     max_tokens: int,
     timeout_seconds: int,
+    idempotency_key: str,
 ) -> dict[str, Any]:
     api_key = _read_env_file_value(Path(route["api_key_file"]), "API_SERVER_KEY")
     if not api_key:
         raise ValueError(
             f"{route['profile']} API_SERVER_KEY is required in {route['api_key_file']}"
         )
-    request_body = json.dumps(
-        {
-            "model": route["profile"],
-            "messages": messages,
-            "temperature": 0,
-            "max_tokens": max_tokens,
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        f"{route['api_base']}/v1/chat/completions",
-        data=request_body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    url = f"{route['api_base']}/v1/chat/completions"
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        raise RuntimeError(
-            f"{route['profile']} profile API returned HTTP {exc.code}: {_body_excerpt(body, limit=800)}"
-        ) from exc
-    except urllib.error.URLError as exc:
+        response = _work_processor_http_client(url).post(
+            url,
+            json={
+                "model": route["profile"],
+                "messages": messages,
+                "temperature": 0,
+                "max_tokens": max_tokens,
+            },
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                KANBAN_PROCESSOR_ROUTE_HEADER: route_id,
+                "Idempotency-Key": idempotency_key,
+            },
+            timeout=float(timeout_seconds),
+        )
+    except httpx.TransportError as exc:
         raise RuntimeError(f"{route['profile']} profile API unavailable: {exc}") from exc
+    if response.status_code < 200 or response.status_code >= 300:
+        raise RuntimeError(
+            f"{route['profile']} profile API returned HTTP {response.status_code}: "
+            f"{_body_excerpt(response.text, limit=800)}"
+        )
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        parsed = response.json()
+    except (ValueError, json.JSONDecodeError) as exc:
         raise ValueError(f"{route['profile']} profile API returned invalid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise ValueError(f"{route['profile']} profile API response root was not an object")
     return parsed
+
+
+def _work_automation_processor_request_plan_sync(
+    *,
+    messages: list[dict[str, str]],
+    processor_kind: str,
+) -> dict[str, Any]:
+    """Prepare all file, health-probe, and SQLite inputs away from the ASGI loop."""
+    config = _work_automation_idle_worker_config()
+    clean_kind = _work_processor_kind(processor_kind)
+    route = _work_automation_processor_profile_route(clean_kind)
+    drift = _work_automation_processor_profile_drift(clean_kind)
+    if not drift["ok"]:
+        raise ValueError(
+            f"{route['profile']} auth/config drift blocks processor route: "
+            + ",".join(drift["problems"])
+        )
+    with _sqlite_get_conn() as conn:
+        routing = _work_processor_routing_snapshot(conn, clean_kind, probe=True)
+    route_definitions = _work_processor_model_definitions(clean_kind)
+    prompt_variants = {
+        str(public_route["route_id"]): _work_processor_prompt_variant(
+            clean_kind,
+            str(public_route["route_id"]),
+            messages,
+        )
+        for public_route in routing["routes"]
+    }
+    return {
+        "config": config,
+        "processor_kind": clean_kind,
+        "route": route,
+        "routing": routing,
+        "route_definitions": route_definitions,
+        "prompt_variants": prompt_variants,
+    }
 
 
 async def _work_automation_processor_profile_json_completion(
@@ -15454,49 +16381,116 @@ async def _work_automation_processor_profile_json_completion(
     run_id: str,
     processor_kind: str,
 ) -> dict[str, Any]:
-    config = _work_automation_idle_worker_config()
-    route = _work_automation_processor_profile_route(processor_kind)
-    drift = _work_automation_processor_profile_drift(processor_kind)
-    if not drift["ok"]:
-        raise ValueError(
-            f"{route['profile']} auth/config drift blocks processor route: "
-            + ",".join(drift["problems"])
-        )
-    response = await asyncio.to_thread(
-        _work_automation_profile_completion_sync,
-        route=route,
+    request_plan = await _run_personal_sync_work(
+        _work_automation_processor_request_plan_sync,
         messages=messages,
-        max_tokens=config["local_ai_max_tokens"],
-        timeout_seconds=_env_int(
-            "BLUEPRINTS_KANBAN_AUTOMATION_PROFILE_TIMEOUT_SECONDS",
-            1800,
-            minimum=30,
-            maximum=3600,
-        ),
+        processor_kind=processor_kind,
     )
-    choices = response.get("choices") if isinstance(response, dict) else None
-    if not isinstance(choices, list) or not choices:
-        raise ValueError(f"{route['profile']} profile response did not include choices")
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    content = message.get("content") if isinstance(message, dict) else ""
-    parsed = _local_ai_json_object(str(content or ""))
-    prompt_content = messages[0].get("content", "") if messages else ""
-    return {
-        "provider_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
-        "processor_engine": KANBAN_AUTOMATION_PROFILE_ENGINE,
-        "profile": route["profile"],
-        "primary_provider": route["primary_provider"],
-        "primary_model": route["primary_model"],
-        "fallback_provider": route["fallback_provider"],
-        "fallback_model": route["fallback_model"],
-        "model_alias": route["model_alias"],
-        "run_id": run_id,
-        "api_base": route["api_base"],
-        "response_model": _clean_short_text(str(response.get("model") or ""), "", limit=180),
-        "prompt_sha256": _sha256_text(prompt_content),
-        "content_excerpt": _body_excerpt(str(content or ""), limit=4000),
-        "payload": parsed,
-    }
+    config = request_plan["config"]
+    clean_kind = request_plan["processor_kind"]
+    route = request_plan["route"]
+    routing = request_plan["routing"]
+    route_definitions = request_plan["route_definitions"]
+    attempts: list[dict[str, Any]] = []
+    previous_failure = ""
+    timeout_seconds = _env_int(
+        "BLUEPRINTS_KANBAN_AUTOMATION_PROFILE_TIMEOUT_SECONDS",
+        1800,
+        minimum=30,
+        maximum=3600,
+    )
+    for attempt_number, public_route in enumerate(routing["routes"], start=1):
+        route_id = public_route["route_id"]
+        definition = route_definitions[route_id]
+        attempt_messages, prompt_variant = request_plan["prompt_variants"][route_id]
+        prompt_sha256 = prompt_variant["request_sha256"]
+        attempt: dict[str, Any] = {
+            "attempt_number": attempt_number,
+            "route_id": route_id,
+            "label": definition["label"],
+            "provider": definition["provider"],
+            "model": definition["model"],
+            "catalog_model_id": definition["catalog_model_id"],
+            "availability_state": public_route["availability_state"],
+            "availability_classification": public_route["availability_classification"],
+            "fallback_reason": previous_failure,
+            "latency_ms": 0,
+            "outcome": "not_attempted",
+            "error_classification": "",
+            "error": "",
+            "prompt_variant": prompt_variant,
+        }
+        if not public_route["available"]:
+            attempt["outcome"] = "unavailable"
+            attempt["error_classification"] = public_route["availability_classification"]
+            previous_failure = f"{route_id}:{public_route['availability_classification']}"
+            attempts.append(attempt)
+            continue
+        started = time.perf_counter()
+        try:
+            idempotency_key = _hash_json_payload(
+                {
+                    "schema": KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
+                    "processor_kind": clean_kind,
+                    "run_id": run_id,
+                    "route_id": route_id,
+                    "prompt_sha256": prompt_sha256,
+                }
+            )
+            response = await timing.to_thread(
+                "personal.kanban_processor_profile_completion",
+                _work_automation_profile_completion_sync,
+                route=route,
+                route_id=route_id,
+                messages=attempt_messages,
+                max_tokens=config["local_ai_max_tokens"],
+                timeout_seconds=timeout_seconds,
+                idempotency_key=idempotency_key,
+            )
+            choices = response.get("choices") if isinstance(response, dict) else None
+            if not isinstance(choices, list) or not choices:
+                raise ValueError(f"{route['profile']} profile response did not include choices")
+            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            content = message.get("content") if isinstance(message, dict) else ""
+            parsed = _local_ai_json_object(str(content or ""))
+        except Exception as exc:
+            attempt["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            attempt["outcome"] = "failed"
+            attempt["error_classification"] = _work_processor_route_error_class(exc)
+            attempt["error"] = _body_excerpt(str(exc), limit=800)
+            previous_failure = f"{route_id}:{attempt['error_classification']}"
+            attempts.append(attempt)
+            continue
+        attempt["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        attempt["outcome"] = "chosen"
+        attempts.append(attempt)
+        return {
+            "provider_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+            "processor_engine": KANBAN_AUTOMATION_PROFILE_ENGINE,
+            "profile": route["profile"],
+            "primary_provider": definition["provider"],
+            "primary_model": definition["model"],
+            "fallback_provider": route["fallback_provider"],
+            "fallback_model": route["fallback_model"],
+            "model_alias": f"{route['profile']}:{definition['provider']}/{definition['model']}",
+            "run_id": run_id,
+            "api_base": route["api_base"],
+            "response_model": _clean_short_text(str(response.get("model") or ""), "", limit=180),
+            "prompt_sha256": prompt_sha256,
+            "prompt_variant": prompt_variant,
+            "content_excerpt": _body_excerpt(str(content or ""), limit=4000),
+            "payload": parsed,
+            "routing_schema": KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
+            "routing_revision": routing["revision"],
+            "model_attempts": attempts,
+            "chosen_route_id": route_id,
+            "chosen_model": definition["model"],
+            "chosen_provider": definition["provider"],
+            "latency_ms": attempt["latency_ms"],
+            "fallback_reason": attempt["fallback_reason"],
+            "final_outcome": "completed",
+        }
+    raise WorkProcessorRoutesExhausted(clean_kind, attempts)
 
 
 def _work_automation_processor_ai_defaults(
@@ -15521,6 +16515,22 @@ def _work_automation_processor_ai_defaults(
     }
     merged.update(ai if isinstance(ai, dict) else {})
     return merged
+
+
+def _work_automation_ai_routing_evidence(ai: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": ai.get("routing_schema") or KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
+        "routing_revision": ai.get("routing_revision") or "",
+        "attempts": list(ai.get("model_attempts") or []),
+        "chosen_route_id": ai.get("chosen_route_id") or "",
+        "chosen_provider": ai.get("chosen_provider") or ai.get("primary_provider") or "",
+        "chosen_model": ai.get("chosen_model") or ai.get("primary_model") or "",
+        "latency_ms": ai.get("latency_ms") or 0,
+        "fallback_reason": ai.get("fallback_reason") or "",
+        "source_hash": ai.get("prompt_sha256") or "",
+        "prompt_variant": dict(ai.get("prompt_variant") or {}),
+        "final_outcome": ai.get("final_outcome") or "",
+    }
 
 
 def _local_ai_required_text(
@@ -15557,6 +16567,62 @@ def _local_ai_ref_list(payload: dict[str, Any], key: str) -> list[str]:
     return refs[:40]
 
 
+def _work_preprocessing_guidance_catalog_payload() -> dict[str, Any]:
+    return {
+        "schema": KANBAN_PREPROCESSING_GUIDANCE_CATALOG_SCHEMA,
+        "selection_owner": "preprocessing_model",
+        "selection_rule": (
+            "Select only patterns materially applicable to the leaf deliverable and explicit "
+            "dependencies. Do not select from filenames, isolated keywords, or ancestor topic alone."
+        ),
+        "direct_skill_tools_required": False,
+        "entries": [dict(entry) for entry in KANBAN_PREPROCESSING_GUIDANCE_CATALOG],
+    }
+
+
+def _work_preprocessing_guidance_selection(payload: dict[str, Any]) -> dict[str, Any]:
+    catalog_by_id = {
+        str(entry["guidance_id"]): entry for entry in KANBAN_PREPROCESSING_GUIDANCE_CATALOG
+    }
+    raw_ids = payload.get("selected_guidance_ids")
+    if not isinstance(raw_ids, list):
+        raw_ids = []
+    selected_ids: list[str] = []
+    for value in raw_ids[:12]:
+        guidance_id = _clean_short_text(str(value or ""), "", limit=120)
+        if guidance_id in catalog_by_id and guidance_id not in selected_ids:
+            selected_ids.append(guidance_id)
+    raw_rationales = payload.get("guidance_rationales")
+    if not isinstance(raw_rationales, dict):
+        raw_rationales = {}
+    return {
+        "schema": KANBAN_PREPROCESSING_GUIDANCE_SELECTION_SCHEMA,
+        "selected_guidance_ids": selected_ids,
+        "selections": [
+            {
+                "guidance_id": guidance_id,
+                "label": catalog_by_id[guidance_id]["label"],
+                "rationale": _body_excerpt(
+                    str(raw_rationales.get(guidance_id) or ""),
+                    limit=600,
+                ),
+                "card_guidance": catalog_by_id[guidance_id]["card_guidance"],
+                "proof_guidance": catalog_by_id[guidance_id]["proof_guidance"],
+                "source_refs": list(catalog_by_id[guidance_id]["source_refs"]),
+            }
+            for guidance_id in selected_ids
+        ],
+        "rejected_unknown_ids": sorted(
+            {
+                _clean_short_text(str(value or ""), "", limit=120)
+                for value in raw_ids[:12]
+                if _clean_short_text(str(value or ""), "", limit=120)
+                and _clean_short_text(str(value or ""), "", limit=120) not in catalog_by_id
+            }
+        ),
+    }
+
+
 KANBAN_PROMPT_ROOT = (
     Path(
         os.environ.get(
@@ -15566,8 +16632,7 @@ KANBAN_PROMPT_ROOT = (
     / "config/prompts"
 )
 REVIEW_PROCESSOR_SYSTEM_PROMPT = (
-    "You are the Blueprints Kanban Review Processor running on the local "
-    "private no-think/no-protection/no-orientation endpoint. Return only one "
+    "You are the provider-neutral Blueprints Kanban Review Processor fallback. Return only one "
     "strict JSON object. Do not use markdown. Process the Review text as "
     "future guidance and acceptance-check data. If required infrastructure "
     "or provider wiring is missing, record that as a blocker/question rather "
@@ -15575,13 +16640,11 @@ REVIEW_PROCESSOR_SYSTEM_PROMPT = (
     "done unless proof in the context actually supports it."
 )
 PREPROCESSING_SYSTEM_PROMPT = (
-    "You are the Blueprints Kanban preprocessing processor running on the "
-    "local private no-think/no-protection/no-orientation endpoint. Return "
+    "You are the provider-neutral Blueprints Kanban preprocessing fallback. Return "
     "only one strict JSON object. Do not use markdown. Decide whether the "
     "current card context is ready for an agent to start implementation. "
     "The queue_source reason may be missing_readiness_marker or "
-    "readiness_marker_stale; treat that as why this pass is running, not "
-    "as an automatic failure. "
+    "readiness_marker_stale; treat that as the scheduling reason, not a failure. "
     "If the card is an actionable leaf whose next step is an audit, file "
     "inspection, command run, or implementation task, mark it ready even "
     "when that work has not been completed yet. "
@@ -15603,6 +16666,7 @@ PREPROCESSING_SYSTEM_PROMPT_PATH = Path(
         str(KANBAN_PROMPT_ROOT / "kanban-preprocessing-system.md"),
     )
 )
+KANBAN_PROCESSOR_MODEL_PROMPT_ROOT = KANBAN_PROMPT_ROOT / "kanban-model-variants"
 
 
 def _load_work_prompt(path: Path, fallback: str) -> str:
@@ -15611,6 +16675,62 @@ def _load_work_prompt(path: Path, fallback: str) -> str:
     except OSError:
         return fallback
     return prompt or fallback
+
+
+def _work_processor_prompt_variant(
+    processor_kind: str,
+    route_id: str,
+    messages: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Select an allowlisted model-specific SOUL/system pair for one attempt."""
+    clean_kind = _work_processor_kind(processor_kind)
+    if route_id not in KANBAN_PROCESSOR_MODEL_REGISTRY:
+        raise ValueError("unknown Kanban processor model route")
+    if clean_kind == "preprocessing":
+        generic_system_path = PREPROCESSING_SYSTEM_PROMPT_PATH
+        generic_system = PREPROCESSING_SYSTEM_PROMPT
+    else:
+        generic_system_path = REVIEW_PROCESSOR_SYSTEM_PROMPT_PATH
+        generic_system = REVIEW_PROCESSOR_SYSTEM_PROMPT
+    profile = _work_automation_processor_profile_spec(clean_kind)["profile"]
+    generic_soul_path = HERMES_LOCAL_STACK_ROOT / "config/profiles" / str(profile) / "SOUL.md"
+    variant_root = KANBAN_PROCESSOR_MODEL_PROMPT_ROOT / clean_kind / route_id
+    soul_path = variant_root / "soul.md"
+    system_path = variant_root / "system.md"
+    generic_soul = _load_work_prompt(generic_soul_path, "")
+    soul = _load_work_prompt(soul_path, generic_soul)
+    system = _load_work_prompt(
+        system_path,
+        _load_work_prompt(generic_system_path, generic_system),
+    )
+    combined = (
+        "# Selected Kanban processor SOUL overlay\n\n"
+        + soul
+        + "\n\n# Selected Kanban processor task contract\n\n"
+        + system
+    ).strip()
+    selected_messages = [dict(message) for message in messages]
+    if selected_messages and selected_messages[0].get("role") == "system":
+        selected_messages[0] = {"role": "system", "content": combined}
+    else:
+        selected_messages.insert(0, {"role": "system", "content": combined})
+    variant_available = soul_path.is_file() and system_path.is_file()
+    evidence = {
+        "schema": "xarta.kanban.processor_prompt_variant.v1",
+        "processor_kind": clean_kind,
+        "route_id": route_id,
+        "variant_available": variant_available,
+        "selection": "model_variant" if variant_available else "generic_fallback",
+        "soul_prompt_id": f"kanban-{clean_kind}-{route_id}-soul",
+        "system_prompt_id": f"kanban-{clean_kind}-{route_id}-system",
+        "soul_sha256": _sha256_text(soul),
+        "system_sha256": _sha256_text(system),
+        "instruction_sha256": _sha256_text(combined),
+        "request_sha256": _sha256_text(
+            json.dumps(selected_messages, ensure_ascii=True, sort_keys=True)
+        ),
+    }
+    return selected_messages, evidence
 
 
 def _work_review_processor_local_ai_messages(
@@ -15653,9 +16773,11 @@ def _work_review_processor_local_ai_messages(
             "proof_refs": ["source/proof refs"],
         },
     }
-    system = _load_work_prompt(REVIEW_PROCESSOR_SYSTEM_PROMPT_PATH, REVIEW_PROCESSOR_SYSTEM_PROMPT)
     return [
-        {"role": "system", "content": system},
+        # The editable generic/model prompt is selected inside
+        # _work_automation_processor_request_plan_sync. Keep message assembly
+        # free of file I/O so callers cannot accidentally read from the ASGI loop.
+        {"role": "system", "content": REVIEW_PROCESSOR_SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(context, ensure_ascii=True, sort_keys=True)},
     ]
 
@@ -15679,12 +16801,14 @@ async def _process_work_review_idle_marker(
         _work_review_idle_marker_context_sync,
         item_id,
     )
+    messages = await _run_personal_sync_work(
+        _work_review_processor_local_ai_messages,
+        item=item,
+        review_document=review_document,
+        marker=marker,
+    )
     ai = await _work_automation_local_ai_json_completion(
-        messages=_work_review_processor_local_ai_messages(
-            item=item,
-            review_document=review_document,
-            marker=marker,
-        ),
+        messages=messages,
         run_id=run_id,
         processor_kind="review",
     )
@@ -15734,7 +16858,7 @@ async def _process_work_review_idle_marker(
                 "schema": "xarta.kanban.review_processor.hermes_profile_decision.v1",
                 "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
                 "processor_engine": ai["processor_engine"],
-                "provider_policy": _work_review_processing_policy()["active_mode"],
+                "provider_policy": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
                 "provider_mode": ai["provider_mode"],
                 "profile": ai["profile"],
                 "primary_provider": ai["primary_provider"],
@@ -15745,6 +16869,7 @@ async def _process_work_review_idle_marker(
                 "response_model": ai["response_model"],
                 "api_base": ai["api_base"],
                 "prompt_sha256": ai["prompt_sha256"],
+                "model_routing": _work_automation_ai_routing_evidence(ai),
                 "marker_id": marker["marker_id"],
                 "document_source_hash": marker["document_source_hash"],
                 "llm_payload": payload,
@@ -15778,6 +16903,7 @@ async def _process_work_review_idle_marker(
                 "primary_model": ai["primary_model"],
                 "model_alias": ai["model_alias"],
                 "prompt_sha256": ai["prompt_sha256"],
+                "model_routing": _work_automation_ai_routing_evidence(ai),
             },
         ),
     )
@@ -15794,6 +16920,11 @@ async def _process_work_review_idle_marker(
         "primary_provider": ai["primary_provider"],
         "primary_model": ai["primary_model"],
         "model_alias": ai["model_alias"],
+        "chosen_route_id": ai.get("chosen_route_id", ""),
+        "chosen_model": ai.get("chosen_model", ai["primary_model"]),
+        "model_attempt_count": len(ai.get("model_attempts") or []),
+        "latency_ms": ai.get("latency_ms", 0),
+        "fallback_reason": ai.get("fallback_reason", ""),
     }
 
 
@@ -15842,6 +16973,7 @@ def _work_preprocessing_local_ai_messages(
             "recent_decisions": recent_decisions[:8],
             "ancestor_context": ancestor_context,
         },
+        "engineering_guidance_catalog": _work_preprocessing_guidance_catalog_payload(),
         "hard_rules": [
             "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
             "If the item lacks enough information to implement safely, ready must be false and decomposition_items must contain the concrete child work items needed to make progress.",
@@ -15858,9 +16990,23 @@ def _work_preprocessing_local_ai_messages(
             "Readiness is not completion.",
             "Leaves should be Doing only while actively operated on; otherwise use To Do or Blocked.",
             "When discussions, decisions, or commits conflict, prefer the newest timestamped Kanban evidence.",
+            "Operator corrections outrank weak contextual or lexical hints.",
+            "Distinguish a requested capability from retained production configuration and questions about that configuration.",
+            "Distinguish individual targets from typed named ordered collections that execute as one target; do not infer one retained runtime or configuration instance per collection member unless the scoped card explicitly requires it.",
+            "Examples and proof fixtures are evidence, not authorization for production behavior.",
+            "Keep backend, operator UI, production configuration, and proof ownership explicit and separate.",
+            "Task-specific regression fixtures and domain examples apply only when they appear in this card's scoped body, Detail, Review, Discussion, or decision evidence; never import a fixture from another item or domain.",
+            "Write proposed implementation cards outcome-first for the current likely GPT-5.6 Sol or Terra implementer, with explicit structured acceptance, dependencies, ownership, scoped proof, and a stopping condition.",
+            "Ancestor context informs meaning but never imports unrelated browser, real-proof, helper, or lexical acceptance gates into a leaf.",
+            "Use outcome_type=duplicate or superseded with canonical_item_ref and no decomposition_items when current work is already owned by a canonical card.",
+            "Select engineering guidance semantically from engineering_guidance_catalog only when it materially applies to this leaf or an explicit dependency. Never select it from a filename, isolated keyword, or broad ancestor topic.",
+            "The unattended processor must not browse arbitrary skills or run implementation tools. The supplied catalog is the bounded skill-derived context; implementation cards may point the later implementation agent to its source_refs.",
+            "For decomposition, put guidance_ids only on the child whose deliverable needs those patterns. Do not add database, HTTP, permission, browser, or event-loop work to unrelated children.",
         ],
         "required_output": {
             "ready": True,
+            "outcome_type": "ready|decompose|blocked|duplicate|superseded",
+            "canonical_item_ref": "required for duplicate or superseded; otherwise empty",
             "title": "short human title",
             "summary": "what preprocessing concluded",
             "rationale": "why the item is or is not ready",
@@ -15868,6 +17014,12 @@ def _work_preprocessing_local_ai_messages(
             "uncertainty": "remaining uncertainty",
             "blocking_codes": ["missing_cloud_api"],
             "recommended_next_actions": ["ask operator a concrete question"],
+            "selected_guidance_ids": [
+                "zero or more exact engineering_guidance_catalog guidance_id values"
+            ],
+            "guidance_rationales": {
+                "guidance_id": "why this pattern applies to the actual leaf deliverable"
+            },
             "decomposition_items": [
                 {
                     "title": "short child card title",
@@ -15877,15 +17029,18 @@ def _work_preprocessing_local_ai_messages(
                     "tags": ["kanban", "optional-routing-tag"],
                     "proof_path": "how this child can be proved complete",
                     "blocked_reason": "only when state_id is blocked",
+                    "guidance_ids": ["only catalog guidance ids applicable to this specific child"],
                 }
             ],
             "affected_refs": ["kanban_items:<id>", "xarta-kanban:item:<id>"],
             "proof_refs": ["source/proof refs"],
         },
     }
-    system = _load_work_prompt(PREPROCESSING_SYSTEM_PROMPT_PATH, PREPROCESSING_SYSTEM_PROMPT)
     return [
-        {"role": "system", "content": system},
+        # The editable generic/model prompt is selected inside
+        # _work_automation_processor_request_plan_sync. Keep message assembly
+        # free of file I/O so callers cannot accidentally read from the ASGI loop.
+        {"role": "system", "content": PREPROCESSING_SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(context, ensure_ascii=True, sort_keys=True)},
     ]
 
@@ -16042,6 +17197,28 @@ def _work_preprocessing_normalise_decomposition_items(
         proof_path = _body_excerpt(str(candidate.get("proof_path") or ""), limit=800)
         if proof_path:
             body_parts.append(f"Proof path: {proof_path}")
+        raw_guidance_ids = candidate.get("guidance_ids")
+        if not isinstance(raw_guidance_ids, list):
+            raw_guidance_ids = []
+        catalog_by_id = {
+            str(entry["guidance_id"]): entry for entry in KANBAN_PREPROCESSING_GUIDANCE_CATALOG
+        }
+        guidance_ids: list[str] = []
+        for value in raw_guidance_ids[:8]:
+            guidance_id = _clean_short_text(str(value or ""), "", limit=120)
+            if guidance_id in catalog_by_id and guidance_id not in guidance_ids:
+                guidance_ids.append(guidance_id)
+        if guidance_ids:
+            body_parts.extend(
+                [
+                    "Applicable implementation patterns (scoped to this child):",
+                    *[
+                        f"- [{guidance_id}] {catalog_by_id[guidance_id]['card_guidance']} "
+                        f"Proof: {catalog_by_id[guidance_id]['proof_guidance']}"
+                        for guidance_id in guidance_ids
+                    ],
+                ]
+            )
         if blocked_reason:
             body_parts.append(f"Blocked reason/question: {blocked_reason}")
         normalised.append(
@@ -16053,6 +17230,7 @@ def _work_preprocessing_normalise_decomposition_items(
                 "tags": tags,
                 "proof_path": proof_path,
                 "blocked_reason": blocked_reason,
+                "guidance_ids": guidance_ids,
             }
         )
     return normalised
@@ -16069,6 +17247,7 @@ def _work_preprocessing_child_candidate_sync(
     candidate: dict[str, Any],
 ) -> dict[str, Any]:
     with get_conn() as conn:
+        parent_row = _work_item_or_404(conn, parent_item_id)
         sibling_rows = conn.execute(
             """
             SELECT * FROM kanban_items
@@ -16090,6 +17269,49 @@ def _work_preprocessing_child_candidate_sync(
                 expected_depth=expected_child_depth,
             )
             return {"existing_item": existing_item}
+        ancestor_rows = _work_preprocessing_ancestor_rows(conn, parent_row)
+        root_item_id = ancestor_rows[-1]["item_id"] if ancestor_rows else parent_item_id
+        related_rows = conn.execute(
+            """
+            WITH RECURSIVE tree(item_id) AS (
+                SELECT item_id FROM kanban_items WHERE item_id=?
+                UNION ALL
+                SELECT child.item_id FROM kanban_items child
+                JOIN tree parent ON child.parent_item_id=parent.item_id
+                WHERE child.status!='archived'
+            ), linked(item_id) AS (
+                SELECT target_item_id FROM kanban_item_links WHERE source_item_id=?
+                UNION
+                SELECT source_item_id FROM kanban_item_links WHERE target_item_id=?
+            )
+            SELECT * FROM kanban_items
+            WHERE status!='archived'
+              AND (item_id IN (SELECT item_id FROM tree)
+                   OR item_id IN (SELECT item_id FROM linked))
+            ORDER BY updated_at DESC, item_id
+            """,
+            (root_item_id, parent_item_id, parent_item_id),
+        ).fetchall()
+        title_key = _work_preprocessing_title_key(candidate["title"])
+        proof_key = re.sub(r"\s+", " ", str(candidate.get("proof_path") or "").strip()).casefold()
+        for related_row in related_rows:
+            if related_row["item_id"] == parent_item_id:
+                continue
+            related_title_key = _work_preprocessing_title_key(related_row["title"])
+            related_body_key = re.sub(
+                r"\s+", " ", str(related_row["body_excerpt"] or "").strip()
+            ).casefold()
+            if related_title_key == title_key or (
+                proof_key and f"proof path: {proof_key}" in related_body_key
+            ):
+                return {
+                    "deduped_item": _row_to_work_item(related_row),
+                    "dedupe_reason": (
+                        "exact_normalized_title"
+                        if related_title_key == title_key
+                        else "exact_proof_ownership"
+                    ),
+                }
         item_id = _work_preprocessing_unique_child_id(
             conn,
             parent_item_id,
@@ -16116,9 +17338,11 @@ async def _work_preprocessing_create_decomposition_children(
             "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
             "created_count": 0,
             "existing_count": 0,
+            "deduped_count": 0,
             "total_count": 0,
             "created_items": [],
             "existing_items": [],
+            "deduped_items": [],
             "items": [],
             "skipped_reason": "automation_excluded",
         }
@@ -16128,6 +17352,7 @@ async def _work_preprocessing_create_decomposition_children(
     )
     created: list[dict[str, Any]] = []
     existing: list[dict[str, Any]] = []
+    deduped: list[dict[str, Any]] = []
     for candidate in candidates:
         candidate_result = await _run_personal_sync_work(
             _work_preprocessing_child_candidate_sync,
@@ -16138,6 +17363,17 @@ async def _work_preprocessing_create_decomposition_children(
         existing_item = candidate_result.get("existing_item")
         if existing_item is not None:
             existing.append(existing_item)
+            continue
+        deduped_item = candidate_result.get("deduped_item")
+        if deduped_item is not None:
+            deduped.append(
+                {
+                    "item": deduped_item,
+                    "reason": candidate_result.get("dedupe_reason") or "related_work_exists",
+                    "proposed_title": candidate["title"],
+                    "proposed_proof_path": candidate.get("proof_path") or "",
+                }
+            )
             continue
         item_id = str(candidate_result["item_id"])
         result = await create_work_item(
@@ -16201,9 +17437,11 @@ async def _work_preprocessing_create_decomposition_children(
         "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
         "created_count": len(created),
         "existing_count": len(existing),
+        "deduped_count": len(deduped),
         "total_count": len(all_items),
         "created_items": created,
         "existing_items": existing,
+        "deduped_items": deduped,
         "items": all_items,
     }
 
@@ -16229,6 +17467,10 @@ def _preprocessing_readiness_marker(
         if isinstance(processor_route, dict)
         else _work_automation_processor_profile_route("preprocessing")
     )
+    context_manifest = (
+        source.get("context_manifest") if isinstance(source.get("context_manifest"), dict) else {}
+    )
+    engineering_guidance = _work_preprocessing_guidance_selection(ai_payload)
     return {
         "schema": "xarta.kanban.context_readiness_marker.v1",
         "context_packet_schema": source["schema"],
@@ -16236,10 +17478,9 @@ def _preprocessing_readiness_marker(
         "canonical_code": f"xarta-kanban:item:{item_id}",
         "marked_at": now,
         "marked_by": actor,
-        "context_hash": source["document_source_hash"],
-        "component_hashes": {
-            "preprocessing_queue_source": source["document_source_hash"],
-        },
+        "context_hash": context_manifest.get("fingerprint") or source["document_source_hash"],
+        "component_hashes": dict(context_manifest.get("component_hashes") or {}),
+        "context_manifest": context_manifest,
         "counts": source["counts"],
         "source_refs": source["source_refs"],
         "packet_summary": _body_excerpt(
@@ -16249,6 +17490,7 @@ def _preprocessing_readiness_marker(
         "recommended_next_actions": [
             _body_excerpt(str(action or ""), limit=300) for action in next_actions[:12]
         ],
+        "engineering_guidance": engineering_guidance,
         "processor_marker_id": marker["marker_id"],
         "processor_profile": route.get("profile", ""),
         "processor_provider_mode": route.get(
@@ -16434,24 +17676,40 @@ async def _process_work_preprocessing_idle_marker(
     recent_decisions = context["recent_decisions"]
     hints = context["hints"]
     ancestor_context = context["ancestor_context"]
+    messages = await _run_personal_sync_work(
+        _work_preprocessing_local_ai_messages,
+        item=item,
+        source=source,
+        detail_document=detail_document,
+        review_document=review_document,
+        discussions=discussions,
+        recent_commits=recent_commits,
+        recent_decisions=recent_decisions,
+        ancestor_context=ancestor_context,
+        marker=marker,
+    )
     ai = await _work_automation_local_ai_json_completion(
-        messages=_work_preprocessing_local_ai_messages(
-            item=item,
-            source=source,
-            detail_document=detail_document,
-            review_document=review_document,
-            discussions=discussions,
-            recent_commits=recent_commits,
-            recent_decisions=recent_decisions,
-            ancestor_context=ancestor_context,
-            marker=marker,
-        ),
+        messages=messages,
         run_id=run_id,
         processor_kind="preprocessing",
     )
     ai = _work_automation_processor_ai_defaults(ai, "preprocessing")
     payload = ai["payload"]
+    engineering_guidance = _work_preprocessing_guidance_selection(payload)
     ready = bool(payload.get("ready"))
+    outcome_type = _clean_short_text(
+        str(payload.get("outcome_type") or ("ready" if ready else "decompose")),
+        "ready" if ready else "decompose",
+        limit=40,
+    ).lower()
+    if outcome_type not in {"ready", "decompose", "blocked", "duplicate", "superseded"}:
+        outcome_type = "ready" if ready else "decompose"
+    canonical_item_ref = _clean_short_text(
+        str(payload.get("canonical_item_ref") or ""), "", limit=260
+    )
+    duplicate_outcome = outcome_type in {"duplicate", "superseded"}
+    if duplicate_outcome:
+        ready = True
     title = _local_ai_optional_text(payload, "title", limit=220) or _clean_short_text(
         str(item["title"] or ""),
         "Preprocessing result",
@@ -16480,17 +17738,25 @@ async def _process_work_preprocessing_idle_marker(
         hard_blocking_codes.append("open_blockers")
     if body_length <= 0:
         hard_blocking_codes.append("missing_body")
+    if duplicate_outcome and not re.fullmatch(
+        r"(?:xarta-kanban:item:|kanban_items:)[A-Za-z0-9._:-]+",
+        canonical_item_ref,
+    ):
+        ready = False
+        hard_blocking_codes.append("missing_canonical_item_ref")
 
     decomposition_result: dict[str, Any] = {
         "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
         "created_count": 0,
         "existing_count": 0,
+        "deduped_count": 0,
         "total_count": 0,
         "created_items": [],
         "existing_items": [],
+        "deduped_items": [],
         "items": [],
     }
-    readiness_outcome = "ready"
+    readiness_outcome = outcome_type if duplicate_outcome else "ready"
     readiness_normalization: dict[str, Any] = {}
     if not hard_blocking_codes and not ready:
         decomposition_result = await _work_preprocessing_create_decomposition_children(
@@ -16501,7 +17767,35 @@ async def _process_work_preprocessing_idle_marker(
             marker_id=marker["marker_id"],
         )
         if int(decomposition_result.get("total_count") or 0) <= 0:
-            if blocking_codes:
+            if int(decomposition_result.get("deduped_count") or 0) > 0:
+                deduped_item = (decomposition_result.get("deduped_items") or [{}])[0].get(
+                    "item"
+                ) or {}
+                canonical_item_ref = (
+                    f"xarta-kanban:item:{deduped_item.get('item_id')}"
+                    if deduped_item.get("item_id")
+                    else canonical_item_ref
+                )
+                ready = True
+                duplicate_outcome = True
+                outcome_type = "duplicate"
+                readiness_outcome = "duplicate"
+                blocking_codes = [
+                    code
+                    for code in blocking_codes
+                    if code
+                    not in {
+                        "duplicate_leaf_no_new_work",
+                        "missing_decomposition_items",
+                    }
+                ]
+                readiness_normalization = {
+                    "schema": "xarta.kanban.preprocessing.readiness_normalization.v1",
+                    "reason": "all_proposed_children_owned_by_related_canonical_work",
+                    "canonical_item_ref": canonical_item_ref,
+                    "deduped_count": decomposition_result.get("deduped_count") or 0,
+                }
+            elif blocking_codes:
                 blocking_codes.append("missing_decomposition_items")
                 hard_blocking_codes.append("llm_reported_not_ready")
             else:
@@ -16553,7 +17847,7 @@ async def _process_work_preprocessing_idle_marker(
                     "schema": "xarta.kanban.preprocessing.hermes_profile_blocked_decision.v1",
                     "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
                     "processor_engine": ai["processor_engine"],
-                    "provider_policy": _work_review_processing_policy()["active_mode"],
+                    "provider_policy": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
                     "provider_mode": ai["provider_mode"],
                     "profile": ai["profile"],
                     "primary_provider": ai["primary_provider"],
@@ -16564,9 +17858,11 @@ async def _process_work_preprocessing_idle_marker(
                     "response_model": ai["response_model"],
                     "api_base": ai["api_base"],
                     "prompt_sha256": ai["prompt_sha256"],
+                    "model_routing": _work_automation_ai_routing_evidence(ai),
                     "marker_id": marker["marker_id"],
                     "document_source_hash": source["document_source_hash"],
                     "blocking_codes": all_blocking_codes,
+                    "engineering_guidance": engineering_guidance,
                     "decomposition": decomposition_result,
                     "source": source,
                     "llm_payload": payload,
@@ -16601,7 +17897,9 @@ async def _process_work_preprocessing_idle_marker(
                     "primary_model": ai["primary_model"],
                     "model_alias": ai["model_alias"],
                     "prompt_sha256": ai["prompt_sha256"],
+                    "model_routing": _work_automation_ai_routing_evidence(ai),
                     "blocking_codes": all_blocking_codes,
+                    "engineering_guidance": engineering_guidance,
                 },
             ),
         )
@@ -16618,6 +17916,11 @@ async def _process_work_preprocessing_idle_marker(
             "primary_provider": ai["primary_provider"],
             "primary_model": ai["primary_model"],
             "model_alias": ai["model_alias"],
+            "chosen_route_id": ai.get("chosen_route_id", ""),
+            "chosen_model": ai.get("chosen_model", ai["primary_model"]),
+            "model_attempt_count": len(ai.get("model_attempts") or []),
+            "latency_ms": ai.get("latency_ms", 0),
+            "fallback_reason": ai.get("fallback_reason", ""),
         }
 
     if int(decomposition_result.get("total_count") or 0) > 0:
@@ -16701,7 +18004,7 @@ async def _process_work_preprocessing_idle_marker(
                     "schema": "xarta.kanban.preprocessing.decomposition_decision.v1",
                     "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
                     "processor_engine": ai["processor_engine"],
-                    "provider_policy": _work_review_processing_policy()["active_mode"],
+                    "provider_policy": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
                     "provider_mode": ai["provider_mode"],
                     "profile": ai["profile"],
                     "primary_provider": ai["primary_provider"],
@@ -16712,9 +18015,11 @@ async def _process_work_preprocessing_idle_marker(
                     "response_model": ai["response_model"],
                     "api_base": ai["api_base"],
                     "prompt_sha256": ai["prompt_sha256"],
+                    "model_routing": _work_automation_ai_routing_evidence(ai),
                     "marker_id": marker["marker_id"],
                     "document_source_hash": updated_source["document_source_hash"],
                     "readiness_marker": readiness_marker,
+                    "engineering_guidance": engineering_guidance,
                     "decomposition": decomposition_result,
                     "parent_lane_update": {
                         "from_state_id": item["state_id"],
@@ -16756,7 +18061,9 @@ async def _process_work_preprocessing_idle_marker(
                     "primary_model": ai["primary_model"],
                     "model_alias": ai["model_alias"],
                     "prompt_sha256": ai["prompt_sha256"],
+                    "model_routing": _work_automation_ai_routing_evidence(ai),
                     "readiness_marker_context_hash": readiness_marker["context_hash"],
+                    "engineering_guidance": engineering_guidance,
                     "decomposition_total_count": decomposition_result["total_count"],
                     "decomposition_created_count": decomposition_result["created_count"],
                     "decomposition_existing_count": decomposition_result["existing_count"],
@@ -16776,6 +18083,11 @@ async def _process_work_preprocessing_idle_marker(
             "primary_provider": ai["primary_provider"],
             "primary_model": ai["primary_model"],
             "model_alias": ai["model_alias"],
+            "chosen_route_id": ai.get("chosen_route_id", ""),
+            "chosen_model": ai.get("chosen_model", ai["primary_model"]),
+            "model_attempt_count": len(ai.get("model_attempts") or []),
+            "latency_ms": ai.get("latency_ms", 0),
+            "fallback_reason": ai.get("fallback_reason", ""),
             "decomposition": {
                 "total_count": decomposition_result["total_count"],
                 "created_count": decomposition_result["created_count"],
@@ -16819,7 +18131,9 @@ async def _process_work_preprocessing_idle_marker(
         WorkReviewDecisionCreateRequest(
             decision_id=decision_id,
             processor_kind="preprocessing",
-            decision_type="context_readiness_marked",
+            decision_type=(
+                f"preprocessing_{outcome_type}" if duplicate_outcome else "context_readiness_marked"
+            ),
             title=title,
             summary=summary,
             rationale=rationale,
@@ -16828,6 +18142,7 @@ async def _process_work_preprocessing_idle_marker(
                 f"xarta-kanban:item:{item_id}",
                 f"kanban_agent_hints:{item_id}",
                 f"kanban_review_processor_markers:{marker['marker_id']}",
+                *([canonical_item_ref] if canonical_item_ref else []),
             ],
             confidence=confidence,
             uncertainty=uncertainty,
@@ -16842,7 +18157,7 @@ async def _process_work_preprocessing_idle_marker(
                 "schema": "xarta.kanban.preprocessing.hermes_profile_decision.v1",
                 "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
                 "processor_engine": ai["processor_engine"],
-                "provider_policy": _work_review_processing_policy()["active_mode"],
+                "provider_policy": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
                 "provider_mode": ai["provider_mode"],
                 "profile": ai["profile"],
                 "primary_provider": ai["primary_provider"],
@@ -16853,10 +18168,14 @@ async def _process_work_preprocessing_idle_marker(
                 "response_model": ai["response_model"],
                 "api_base": ai["api_base"],
                 "prompt_sha256": ai["prompt_sha256"],
+                "model_routing": _work_automation_ai_routing_evidence(ai),
                 "marker_id": marker["marker_id"],
                 "document_source_hash": source["document_source_hash"],
                 "readiness_marker": readiness_marker,
+                "engineering_guidance": engineering_guidance,
                 "readiness_normalization": readiness_normalization or None,
+                "outcome_type": outcome_type,
+                "canonical_item_ref": canonical_item_ref,
                 "llm_payload": payload,
                 "llm_content_excerpt": ai["content_excerpt"],
             },
@@ -16888,9 +18207,13 @@ async def _process_work_preprocessing_idle_marker(
                 "primary_model": ai["primary_model"],
                 "model_alias": ai["model_alias"],
                 "prompt_sha256": ai["prompt_sha256"],
+                "model_routing": _work_automation_ai_routing_evidence(ai),
                 "readiness_marker_context_hash": readiness_marker["context_hash"],
+                "engineering_guidance": engineering_guidance,
                 "readiness_outcome": readiness_outcome,
                 "readiness_normalization": readiness_normalization or None,
+                "outcome_type": outcome_type,
+                "canonical_item_ref": canonical_item_ref,
             },
         ),
     )
@@ -16907,6 +18230,13 @@ async def _process_work_preprocessing_idle_marker(
         "primary_provider": ai["primary_provider"],
         "primary_model": ai["primary_model"],
         "model_alias": ai["model_alias"],
+        "chosen_route_id": ai.get("chosen_route_id", ""),
+        "chosen_model": ai.get("chosen_model", ai["primary_model"]),
+        "model_attempt_count": len(ai.get("model_attempts") or []),
+        "latency_ms": ai.get("latency_ms", 0),
+        "fallback_reason": ai.get("fallback_reason", ""),
+        "outcome_type": outcome_type,
+        "canonical_item_ref": canonical_item_ref,
     }
 
 
@@ -16958,9 +18288,31 @@ async def _process_work_automation_claimed_marker(
     except Exception as exc:
         failed_complete: dict[str, Any] | None = None
         error_class = _work_review_failure_error_class(str(exc), {})
-        route = _work_automation_processor_profile_route(
-            processor_kind if processor_kind in KANBAN_PROCESSOR_PROFILE_SPECS else "review"
+        route = await _run_personal_sync_work(
+            _work_automation_processor_profile_route,
+            processor_kind if processor_kind in KANBAN_PROCESSOR_PROFILE_SPECS else "review",
         )
+        route_attempts = list(exc.attempts) if isinstance(exc, WorkProcessorRoutesExhausted) else []
+        routing_failure = {
+            "schema": KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
+            "attempts": route_attempts,
+            "chosen_route_id": "",
+            "chosen_provider": "",
+            "chosen_model": "",
+            "latency_ms": round(
+                sum(float(attempt.get("latency_ms") or 0) for attempt in route_attempts),
+                3,
+            ),
+            "fallback_reason": (
+                f"all_configured_{processor_kind}_routes_failed"
+                if route_attempts
+                else "processor_failed_before_model_routing"
+            ),
+            "source_hash": marker.get("document_source_hash") or "",
+            "marker_id": marker.get("marker_id") or "",
+            "lease_holder": holder_id,
+            "final_outcome": ("all_routes_failed" if route_attempts else "processor_failed"),
+        }
         with suppress(Exception):
             failed_complete = await complete_work_review_processor_marker(
                 marker["marker_id"],
@@ -16984,6 +18336,7 @@ async def _process_work_automation_claimed_marker(
                         "primary_model": route["primary_model"],
                         "model_alias": route["model_alias"],
                         "error_class": error_class,
+                        "model_routing": routing_failure,
                     },
                 ),
             )
@@ -17000,6 +18353,13 @@ async def _process_work_automation_claimed_marker(
             "primary_provider": route["primary_provider"],
             "primary_model": route["primary_model"],
             "model_alias": route["model_alias"],
+            "chosen_route_id": "",
+            "chosen_model": "",
+            "model_attempt_count": len(route_attempts),
+            "model_attempts": route_attempts,
+            "latency_ms": routing_failure["latency_ms"],
+            "fallback_reason": routing_failure["fallback_reason"],
+            "final_outcome": routing_failure["final_outcome"],
         }
 
 
@@ -17303,14 +18663,21 @@ def _trigger_work_review_processor_idle_scan_sync(
     clean_item_id = _clean_short_text(body.item_id, "", limit=180)
     scan_limit = _clean_review_scan_limit(body.max_items)
     include_empty = bool(body.include_empty)
+    include_completed = bool(
+        body.reprocess_completed
+        or (
+            isinstance(body.metadata, dict)
+            and body.metadata.get("explicit_reprocess_completed") is True
+        )
+    )
     with _kanban_automation_scan_conn(operation="review_processor_idle_scan") as conn:
         root_item = _work_item_or_404(conn, clean_item_id) if clean_item_id else None
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         args: list[Any] = []
-        where = (
-            "WHERE item.status != 'archived' "
-            f"AND {_work_item_automation_included_predicate('item')}"
-        )
+        where = "WHERE item.status != 'archived' "
+        if not include_completed:
+            where += "AND item.status NOT IN ('done', 'closed', 'resolved') "
+        where += f"AND {_work_item_automation_included_predicate('item')}"
         if scope_ids:
             placeholders = ",".join("?" for _ in scope_ids)
             where += f" AND item.item_id IN ({placeholders})"
@@ -17434,6 +18801,7 @@ def _trigger_work_review_processor_idle_scan_sync(
                 "eligible_review_count": len(scan_entries),
                 "queued_count": len(queued_rows),
                 "skipped_empty_count": skipped_empty,
+                "explicit_reprocess_completed": include_completed,
                 "cancelled_deleted_count": len(cancelled_rows),
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
@@ -18922,7 +20290,7 @@ def _requeue_timed_out_work_review_processor_markers_sync(
 async def get_work_review_processor_output_contract() -> dict[str, Any]:
     return {
         "ok": True,
-        "contract": _work_review_processor_output_contract(),
+        "contract": await _run_personal_sync_work(_work_review_processor_output_contract),
     }
 
 
@@ -18930,7 +20298,7 @@ async def get_work_review_processor_output_contract() -> dict[str, Any]:
 async def get_work_review_processor_processing_policy() -> dict[str, Any]:
     return {
         "ok": True,
-        "policy": _work_review_processing_policy(),
+        "policy": await _run_personal_sync_work(_work_review_processing_policy),
     }
 
 
@@ -18938,7 +20306,7 @@ async def get_work_review_processor_processing_policy() -> dict[str, Any]:
 async def get_work_automation_idle_worker_contract() -> dict[str, Any]:
     return {
         "ok": True,
-        "contract": _work_automation_idle_worker_contract(),
+        "contract": await _run_personal_sync_work(_work_automation_idle_worker_contract),
     }
 
 
@@ -18946,7 +20314,7 @@ async def get_work_automation_idle_worker_contract() -> dict[str, Any]:
 async def get_work_review_processor_metadata_contract() -> dict[str, Any]:
     return {
         "ok": True,
-        "contract": _work_review_processing_metadata_contract(),
+        "contract": await _run_personal_sync_work(_work_review_processing_metadata_contract),
     }
 
 
@@ -18954,7 +20322,7 @@ async def get_work_review_processor_metadata_contract() -> dict[str, Any]:
 async def get_work_preprocessing_readiness_contract() -> dict[str, Any]:
     return {
         "ok": True,
-        "contract": _work_preprocessing_readiness_contract(),
+        "contract": await _run_personal_sync_work(_work_preprocessing_readiness_contract),
     }
 
 
@@ -19304,6 +20672,107 @@ def _release_work_review_processor_lease_sync(
         }
 
 
+def _compact_work_automation_status_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return decision-useful processor state without contracts or refresh inventories."""
+
+    def compact_marker(marker: Any) -> dict[str, Any]:
+        value = marker if isinstance(marker, dict) else {}
+        return {
+            key: value.get(key)
+            for key in (
+                "marker_id",
+                "processor_kind",
+                "item_id",
+                "status",
+                "source_hash",
+                "document_source_hash",
+                "processed_source_hash",
+                "lease_id",
+                "retry_attempt_count",
+                "next_retry_at",
+                "last_error_class",
+                "last_error",
+                "queued_at",
+                "processing_started_at",
+                "processed_at",
+                "updated_at",
+            )
+            if value.get(key) not in (None, "", [], {})
+        }
+
+    def compact_processor(section: Any, marker_key: str) -> dict[str, Any]:
+        value = section if isinstance(section, dict) else {}
+        lease = value.get("lease") if isinstance(value.get("lease"), dict) else {}
+        markers = value.get(marker_key) if isinstance(value.get(marker_key), list) else []
+        return {
+            "status": value.get("status") or "",
+            "queue_length": int(value.get("queue_length") or 0),
+            "active_item_id": value.get("active_item_id") or "",
+            "last_completed_item_id": value.get("last_completed_item_id") or "",
+            "last_completed_at": value.get("last_completed_at") or "",
+            "retry_waiting_count": int(value.get("retry_waiting_count") or 0),
+            "retry_due_count": int(value.get("retry_due_count") or 0),
+            "repeated_failure_count": int(value.get("repeated_failure_count") or 0),
+            "last_error": value.get("last_error") or "",
+            "next_retry_at": value.get("next_retry_at") or "",
+            "lease": {
+                key: lease.get(key)
+                for key in (
+                    "lease_id",
+                    "active",
+                    "item_id",
+                    "holder_id",
+                    "acquired_at",
+                    "heartbeat_at",
+                    "expires_at",
+                )
+                if lease.get(key) not in (None, "", [], {})
+            },
+            "recent_markers": [compact_marker(marker) for marker in markers[:5]],
+            "recent_markers_truncated": len(markers) > 5,
+        }
+
+    exclusions = (
+        payload.get("automation_exclusions")
+        if isinstance(payload.get("automation_exclusions"), dict)
+        else {}
+    )
+    decisions = payload.get("decisions") if isinstance(payload.get("decisions"), dict) else {}
+    return {
+        "ok": bool(payload.get("ok")),
+        "schema": "xarta.kanban.automation_status.compact.v1",
+        "generated_at": payload.get("generated_at") or "",
+        "item": payload.get("item"),
+        "provider_mode": payload.get("provider_mode") or {},
+        "idle_worker": payload.get("idle_worker") or {},
+        "automation_exclusions": {
+            "count": int(exclusions.get("count") or 0),
+            "recent_items": [
+                {
+                    key: item.get(key)
+                    for key in ("item_id", "title", "state_id", "status", "updated_at")
+                }
+                for item in (exclusions.get("recent_items") or [])[:5]
+                if isinstance(item, dict)
+            ],
+        },
+        "review_processor": compact_processor(payload.get("review_processor"), "review_markers"),
+        "preprocessing": compact_processor(payload.get("preprocessing"), "markers"),
+        "decisions": {
+            "count": int(decisions.get("count") or 0),
+            "by_status": decisions.get("by_status") or {},
+            "recent": (decisions.get("recent") or [])[:5],
+        },
+        "commit_link_health": payload.get("commit_link_health") or {},
+        "output_bounds": {
+            "recent_markers_per_processor": 5,
+            "recent_decisions": 5,
+            "recent_exclusions": 5,
+            "contracts_included": False,
+        },
+    }
+
+
 @router.get("/kanban/automation/status")
 async def get_work_automation_status(
     item_id: Annotated[str | None, Query()] = None,
@@ -19312,6 +20781,7 @@ async def get_work_automation_status(
     include_auth_drift: Annotated[bool, Query()] = False,
     include_decision_metadata: Annotated[bool, Query()] = False,
     metrics: Annotated[bool, Query()] = False,
+    compact: Annotated[bool, Query()] = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
     clean_item_id = _clean_short_text(item_id, "", limit=180)
@@ -19333,6 +20803,8 @@ async def get_work_automation_status(
             thread_finished = time.monotonic()
 
     payload = await _run_personal_sync_work(run_status_sync)
+    if compact:
+        payload = _compact_work_automation_status_response(payload)
     finished = time.monotonic()
     if metrics:
         sync_seconds = max(0.0, thread_finished - thread_started) if thread_started else 0.0

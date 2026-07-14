@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ class PromptSpec:
     apply_strategy: str = "write-file"
     live_path: Path | None = None
     restart_label: str = ""
+    processor_kind: str = ""
+    model_route_id: str = ""
+    prompt_role: str = ""
 
 
 PROMPT_REGISTRY: dict[str, PromptSpec] = {
@@ -102,6 +106,48 @@ PROMPT_REGISTRY: dict[str, PromptSpec] = {
         restart_label="No restart required; next marker uses latest prompt",
     ),
 }
+
+KANBAN_PROCESSOR_PROMPT_ROUTE_LABELS = {
+    "chatgpt-5-6-sol": "ChatGPT 5.6 Sol",
+    "chatgpt-5-6-terra": "ChatGPT 5.6 Terra",
+    "chatgpt-5-6-luna": "ChatGPT 5.6 Luna",
+    "chatgpt-5-5": "ChatGPT 5.5",
+    "private-local-no-think": "Private local Qwen no-think",
+    "private-local-thinking": "Private local Qwen thinking",
+}
+
+for _processor_kind, _processor_label in (
+    ("preprocessing", "Preprocessor"),
+    ("review", "Review Processor"),
+):
+    for _route_id, _route_label in KANBAN_PROCESSOR_PROMPT_ROUTE_LABELS.items():
+        for _prompt_role, _role_label, _filename in (
+            ("soul", "SOUL overlay", "soul.md"),
+            ("system", "system prompt", "system.md"),
+        ):
+            _prompt_id = f"kanban-{_processor_kind}-{_route_id}-{_prompt_role}"
+            PROMPT_REGISTRY[_prompt_id] = PromptSpec(
+                prompt_id=_prompt_id,
+                label=f"{_processor_label} · {_route_label} · {_role_label}",
+                surface="kanban",
+                group=f"{_processor_label} model variants",
+                description=(
+                    f"Automatically selected {_prompt_role} instructions for the "
+                    f"allowlisted {_route_label} route."
+                ),
+                path=(
+                    HERMES_LOCAL_ROOT
+                    / "config/prompts/kanban-model-variants"
+                    / _processor_kind
+                    / _route_id
+                    / _filename
+                ),
+                apply_strategy="write-file",
+                restart_label="No restart required; next model attempt uses latest prompt",
+                processor_kind=_processor_kind,
+                model_route_id=_route_id,
+                prompt_role=_prompt_role,
+            )
 
 
 class PromptApplyRequest(BaseModel):
@@ -195,9 +241,26 @@ def _write_prompt(spec: PromptSpec, content: str) -> bool:
     previous = spec.path.read_text(encoding="utf-8") if spec.path.exists() else ""
     if previous == content:
         return False
+
+    existing_stat = spec.path.stat() if spec.path.exists() else None
+    owner_source = spec.path.parent
+    missing_parents: list[Path] = []
+    while not owner_source.exists():
+        missing_parents.append(owner_source)
+        owner_source = owner_source.parent
+    owner_stat = existing_stat or owner_source.stat()
     spec.path.parent.mkdir(parents=True, exist_ok=True)
+    for directory in reversed(missing_parents):
+        directory.chmod(0o755)
+        if os.geteuid() == 0:
+            os.chown(directory, owner_stat.st_uid, owner_stat.st_gid)
+
+    target_mode = stat.S_IMODE(existing_stat.st_mode) if existing_stat else 0o644
     fd, temp_path = tempfile.mkstemp(prefix=f".{spec.path.name}.", dir=spec.path.parent)
     try:
+        os.fchmod(fd, target_mode)
+        if os.geteuid() == 0:
+            os.fchown(fd, owner_stat.st_uid, owner_stat.st_gid)
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
         os.replace(temp_path, spec.path)
@@ -220,6 +283,9 @@ def _prompt_summary(spec: PromptSpec) -> dict[str, Any]:
         "live_path": str(spec.live_path) if spec.live_path else "",
         "apply_strategy": spec.apply_strategy,
         "restart_label": spec.restart_label,
+        "processor_kind": spec.processor_kind,
+        "model_route_id": spec.model_route_id,
+        "prompt_role": spec.prompt_role,
         "exists": bool(stat),
         "updated_at": stat.st_mtime if stat else None,
         "size": stat.st_size if stat else 0,
