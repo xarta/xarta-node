@@ -3669,7 +3669,7 @@ def _work_preprocessing_context_manifest(
         for row in conn.execute(
             """
             SELECT * FROM kanban_review_decisions
-            WHERE item_id=?
+            WHERE item_id=? AND processor_kind!='preprocessing'
             ORDER BY updated_at DESC, created_at DESC, decision_id
             LIMIT 12
             """,
@@ -3800,7 +3800,8 @@ def _work_preprocessing_context_manifest(
                         for row in conn.execute(
                             """
                             SELECT proof_refs_json FROM kanban_review_decisions
-                            WHERE item_id=? ORDER BY updated_at DESC LIMIT 12
+                            WHERE item_id=? AND processor_kind!='preprocessing'
+                            ORDER BY updated_at DESC LIMIT 12
                             """,
                             (item_id,),
                         ).fetchall()
@@ -4055,6 +4056,31 @@ def _work_preprocessing_context_source(
         "ready": reason == "ready",
         "needs_preprocessing": reason != "ready" and bool(classification.get("eligible", True)),
     }
+
+
+def _get_work_item_context_manifest_sync(item_id: str) -> dict[str, Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    with get_conn() as conn:
+        item_row = _work_item_or_404(conn, clean_item_id)
+        source = _work_preprocessing_context_source(conn, item_row)
+    return {
+        "ok": True,
+        "schema": "xarta.kanban.context_manifest_read.v1",
+        "item_id": clean_item_id,
+        "canonical_code": f"xarta-kanban:item:{clean_item_id}",
+        "reason": source.get("reason") or "",
+        "source_hash": source.get("document_source_hash") or "",
+        "counts": source.get("counts") or {},
+        "source_refs": source.get("source_refs") or [],
+        "context_manifest": source.get("context_manifest") or {},
+        "manifest_delta": source.get("manifest_delta") or {},
+        "output_bounds": (source.get("context_manifest") or {}).get("bounds") or {},
+    }
+
+
+@router.get("/kanban/items/{item_id}/context-manifest")
+async def get_work_item_context_manifest(item_id: str) -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_work_item_context_manifest_sync, item_id)
 
 
 def _work_preprocessing_marker_row(
