@@ -447,6 +447,10 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
             "automation_processing_policy_schema": "xarta.kanban.review_processor.policy.v1",
             "automation_processing_policy_active_mode": "cloud-first",
             "automation_processing_policy_local_gate": "structured-job-packets-required",
+            "model_settings_visible": True,
+            "model_settings_surface": "desktop-portrait-sidecar",
+            "model_settings_route_count": 12,
+            "model_settings_dirty_count": 1,
         }
     )
     assert cleaned["automation_status_loaded"] is True
@@ -472,6 +476,10 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
     )
     assert cleaned["automation_processing_policy_active_mode"] == "cloud-first"
     assert cleaned["automation_processing_policy_local_gate"] == "structured-job-packets-required"
+    assert cleaned["model_settings_visible"] is True
+    assert cleaned["model_settings_surface"] == "desktop-portrait-sidecar"
+    assert cleaned["model_settings_route_count"] == 12
+    assert cleaned["model_settings_dirty_count"] == 1
 
 
 def test_voice_dev_vad_detector_actions_are_allowed():
@@ -1196,6 +1204,10 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "automation_processing_policy_schema": "",
         "automation_processing_policy_active_mode": "",
         "automation_processing_policy_local_gate": "",
+        "model_settings_visible": False,
+        "model_settings_surface": "",
+        "model_settings_route_count": 0,
+        "model_settings_dirty_count": 0,
         "error": "",
     }
     assert view["body_shade"] == {

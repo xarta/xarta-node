@@ -61,7 +61,7 @@
   "review_processor": {
     "processor_kind": "review",
     "candidate_rule": {
-      "item_status": "not archived",
+      "item_status": "not archived and not completed unless reprocess_completed=true is explicit",
       "automation_excluded": false,
       "requires_review_text": true,
       "source_change_required": true
@@ -71,7 +71,8 @@
       "review updated_at",
       "review document_source_hash"
     ],
-    "queue_rule": "Queue when Review text exists and the current Review source hash differs from the last successful/non-retryable processed source hash, unless a current queued, processing, or retry-waiting marker already exists for the same source.",
+    "queue_rule": "Queue when Review text exists and the current Review source hash differs from the last successful/non-retryable processed source hash, unless a current queued, processing, or retry-waiting marker already exists for the same source. Completed cards are skipped unless the caller supplies the named reprocess_completed=true field.",
+    "feedback_capture_rule": "Explicit operator feedback is always appended durably to Review, but capture on a completed card returns skipped_completed_no_reprocess and does not queue a marker unless the request supplies reprocess_completed=true for a genuinely new unresolved requirement.",
     "completion_rule": "Record a kanban_review_decisions row on success, complete the marker, and store successful processed source hash/date. Retryable failed completion records a failure event and next_retry_at without updating last_successful_source_hash, and clears legacy processed_source_hash/date fields when they match the failed source."
   },
   "preprocessing_processor": {
@@ -178,6 +179,7 @@
     "New ToDo leaf with missing readiness marker: preprocessing marker is queued and processed.",
     "Backlog, Doing, Blocked, Done, archived, and non-leaf cards are not preprocessing candidates.",
     "Fresh readiness marker and unchanged source hashes: no reprocessing.",
+    "Detail, Review, proof, or explicit feedback capture on a Done card does not queue Review Processor or preprocessing work unless the named reprocess_completed field is true.",
     "Actionable leaf with no blocker/question/decomposition from local AI is marked ready_leaf_no_decomposition, not failed.",
     "Body/detail/review/discussion/tree/link/blocker/commit/todo/count drift makes readiness stale and requeues preprocessing.",
     "Old queued marker from invalid/global bad run is cancelled instead of processed.",
