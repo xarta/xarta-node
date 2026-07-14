@@ -724,6 +724,7 @@ class KanbanStore:
                 created_at, updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(link_id) DO NOTHING
             """,
             (
                 payload["link_id"],
@@ -739,6 +740,34 @@ class KanbanStore:
             "SELECT * FROM kanban_item_links WHERE link_id=?",
             (payload["link_id"],),
         ).fetchone()
+
+    def item_link_semantic_row(
+        self,
+        source_item_id: str,
+        target_item_id: str,
+        link_type: str,
+        metadata: dict[str, Any],
+    ) -> Any | None:
+        """Return an existing typed link for the same normalized semantic request."""
+        expected = {key: value for key, value in metadata.items() if key != "link_id"}
+        rows = self.conn.execute(
+            """
+            SELECT * FROM kanban_item_links
+            WHERE source_item_id=? AND target_item_id=? AND link_type=?
+            ORDER BY created_at ASC, link_id ASC
+            """,
+            (source_item_id, target_item_id, link_type),
+        ).fetchall()
+        for row in rows:
+            try:
+                stored = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                stored = {}
+            if not isinstance(stored, dict):
+                stored = {}
+            if {key: value for key, value in stored.items() if key != "link_id"} == expected:
+                return row
+        return None
 
     def blocker_row(self, blocker_id: str) -> Any | None:
         clean_blocker_id = self._clean_id(blocker_id)

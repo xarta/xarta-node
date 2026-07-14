@@ -5071,6 +5071,47 @@ def test_work_kanban_relationship_writes_delegate_to_kanban_store_boundary(monke
     )["link"]
     assert link["link_id"] == "kanban-link-relationship-boundary"
 
+    replay = asyncio.run(
+        routes_personal.create_work_item_link(
+            "relationship-boundary-source",
+            routes_personal.WorkItemLinkCreateRequest(
+                target_item_id="relationship-boundary-target",
+                link_type="depends_on",
+                metadata={"proof": "same semantic typed link"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="relationship-boundary-link-replay-first",
+            ),
+        )
+    )
+    replay_again = asyncio.run(
+        routes_personal.create_work_item_link(
+            "relationship-boundary-source",
+            routes_personal.WorkItemLinkCreateRequest(
+                target_item_id="relationship-boundary-target",
+                link_type="depends_on",
+                metadata={"proof": "same semantic typed link"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="relationship-boundary-link-replay-second",
+            ),
+        )
+    )
+    assert replay["idempotent_replay"] is False
+    assert replay_again["idempotent_replay"] is True
+    assert replay_again["link"]["link_id"] == replay["link"]["link_id"]
+    assert (
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM kanban_item_links
+            WHERE source_item_id='relationship-boundary-source'
+              AND target_item_id='relationship-boundary-target'
+              AND link_type='depends_on'
+            """
+        ).fetchone()[0]
+        == 2
+    )
+
     blocker = asyncio.run(
         routes_personal.create_work_blocker(
             routes_personal.WorkBlockerUpsertRequest(
@@ -5160,7 +5201,7 @@ def test_work_kanban_relationship_writes_delegate_to_kanban_store_boundary(monke
     assert updated_commit["metadata"]["relationship_boundary"] == "updated"
 
     assert calls == {
-        "create_item_link_row": 1,
+        "create_item_link_row": 2,
         "blocker_row": 6,
         "upsert_blocker_row": 3,
         "upsert_item_commit_row": 2,
@@ -7580,13 +7621,20 @@ def test_work_review_processor_processing_policy_endpoint(monkeypatch):
     assert result["ok"] is True
     assert policy["schema"] == routes_personal.KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA
     assert policy["active_mode"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
-    assert policy["applies_to"] == ["review_processor", "preprocessing"]
+    assert policy["applies_to"] == [
+        "review_processor",
+        "preprocessing",
+        "blocker_processor",
+    ]
     assert policy["profile_processing"]["state"] == "active"
     assert policy["profile_processing"]["routes"]["review"]["profile"] == (
         "hermes-kanban-review-processor"
     )
     assert policy["profile_processing"]["routes"]["preprocessing"]["profile"] == (
         "hermes-kanban-preprocessor"
+    )
+    assert policy["profile_processing"]["routes"]["blocker"]["profile"] == (
+        "hermes-kanban-blocker-processor"
     )
     assert policy["local_processing"]["state"] == "fallback-model-only"
     assert policy["local_processing"]["gate"] == "hermes_profile_configured_fallback_only"
@@ -9575,6 +9623,29 @@ def test_work_review_feedback_capture_delegates_whole_boundary_off_event_loop(mo
         (
             routes_personal._append_work_item_review_feedback_sync,
             ("work-off-loop-feedback", request),
+        )
+    ]
+
+
+def test_work_item_link_creation_delegates_whole_boundary_off_event_loop(monkeypatch):
+    calls = []
+
+    async def run_sync(func, *args):
+        calls.append((func, args))
+        return {"ok": True, "link": {"link_id": "kanban-link-off-loop"}}
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", run_sync)
+    request = routes_personal.WorkItemLinkCreateRequest(
+        target_item_id="work-off-loop-target",
+        link_type="split_from",
+        metadata={"proof": "event-loop-boundary"},
+    )
+    result = asyncio.run(routes_personal.create_work_item_link("work-off-loop-source", request))
+    assert result["link"]["link_id"] == "kanban-link-off-loop"
+    assert calls == [
+        (
+            routes_personal._create_work_item_link_sync,
+            ("work-off-loop-source", request),
         )
     ]
 
@@ -12935,8 +13006,11 @@ def test_work_processor_routing_settings_persist_reset_and_reject_stale_writes(m
     initial = routes_personal._get_work_processor_routing_settings_sync(probe=False)
     preprocessing = initial["settings"]["preprocessing"]
     review = initial["settings"]["review"]
+    blocker = initial["settings"]["blocker"]
     assert preprocessing["route_ids"] == list(routes_personal.KANBAN_PROCESSOR_ROUTE_IDS)
     assert review["processor_kind"] == "review"
+    assert blocker["processor_kind"] == "blocker"
+    assert blocker["route_ids"] == list(routes_personal.KANBAN_PROCESSOR_ROUTE_IDS)
     reversed_ids = list(reversed(preprocessing["route_ids"]))
 
     saved = routes_personal._update_work_processor_routing_settings_sync(
@@ -12977,6 +13051,28 @@ def test_work_processor_routing_settings_persist_reset_and_reject_stale_writes(m
     )
     assert reset["settings"]["route_ids"] == list(routes_personal.KANBAN_PROCESSOR_ROUTE_IDS)
     assert reset["audit"]["action"] == "reset_processor_model_priority"
+
+    blocker_saved = routes_personal._update_work_processor_routing_settings_sync(
+        "blocker",
+        routes_personal.WorkProcessorRoutingSettingsUpdateRequest(
+            route_ids=reversed_ids,
+            expected_revision=blocker["revision"],
+            actor="codex-test",
+            source_surface="pytest",
+            request_id="blocker-routing-save",
+        ),
+    )
+    assert blocker_saved["settings"]["route_ids"] == reversed_ids
+    with pytest.raises(routes_personal.HTTPException) as blocker_stale:
+        routes_personal._update_work_processor_routing_settings_sync(
+            "blocker",
+            routes_personal.WorkProcessorRoutingSettingsUpdateRequest(
+                route_ids=list(routes_personal.KANBAN_PROCESSOR_ROUTE_IDS),
+                expected_revision=blocker["revision"],
+            ),
+        )
+    assert blocker_stale.value.status_code == 409
+    assert blocker_stale.value.detail["current"]["route_ids"] == reversed_ids
 
     with pytest.raises(Exception):
         routes_personal.WorkProcessorRoutingSettingsUpdateRequest(
@@ -13052,7 +13148,9 @@ def test_work_processor_model_failover_is_bounded_and_records_attempts(monkeypat
         routes_personal._work_automation_processor_profile_json_completion(
             messages=[{"role": "user", "content": "bounded failover proof"}],
             run_id="pytest-route-failover",
-            processor_kind="preprocessing",
+            processor_kind="blocker",
+            source_hash="sha256:blocker-source",
+            state_identity={"state_key": "blocker:test"},
         )
     )
     assert [call["route_id"] for call in calls] == [
@@ -13067,6 +13165,11 @@ def test_work_processor_model_failover_is_bounded_and_records_attempts(monkeypat
         "failed",
         "chosen",
     ]
+    assert all(
+        attempt["source_hash"] == "sha256:blocker-source"
+        and attempt["state_identity"]["state_key"] == "blocker:test"
+        for attempt in result["model_attempts"]
+    )
 
 
 def test_work_processor_all_unavailable_retains_retryable_attempt_evidence(monkeypatch):
@@ -13131,6 +13234,132 @@ def test_work_processor_all_unavailable_retains_retryable_attempt_evidence(monke
     assert all(attempt["latency_ms"] == 0 for attempt in exhausted.value.attempts)
 
 
+def test_blocker_processor_completion_uses_structured_bounded_blueprints_routing(monkeypatch):
+    captured = {}
+
+    async def complete(**kwargs):
+        captured.update(kwargs)
+        return {
+            "payload": {
+                "decision_type": "needs_operator",
+                "rationale": "Current authorization is genuinely absent.",
+                "confidence": "high",
+                "limitations": "Operator approval remains required.",
+                "evidence_refs": ["kanban_blockers:blocker-structured"],
+                "proof_refs": [],
+            },
+            "response_id": "response-structured",
+            "response_model": "profile-response",
+            "finish_reason": "stop",
+            "usage": {"total_tokens": 42},
+            "content_excerpt": '{"decision_type":"needs_operator"}',
+            "routing_schema": routes_personal.KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
+            "routing_revision": "sha256:blocker-routing",
+            "model_attempts": [
+                {
+                    "route_id": "chatgpt-5-6-sol",
+                    "outcome": "chosen",
+                    "prompt_variant": {
+                        "soul_prompt_id": "kanban-blocker-chatgpt-5-6-sol-soul",
+                        "system_prompt_id": "kanban-blocker-chatgpt-5-6-sol-system",
+                        "soul_sha256": "sha256:soul",
+                        "system_sha256": "sha256:system",
+                    },
+                }
+            ],
+            "chosen_route_id": "chatgpt-5-6-sol",
+            "chosen_provider": "openai-codex",
+            "chosen_model": "gpt-5.6-sol",
+            "latency_ms": 12.5,
+            "fallback_reason": "",
+            "source_hash": "sha256:structured-source",
+            "state_identity": {"state_key": "blocker:blocker-structured"},
+            "final_outcome": "completed",
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_processor_profile_json_completion",
+        complete,
+    )
+    response = asyncio.run(
+        routes_personal.complete_work_blocker_processor(
+            routes_personal.WorkBlockerProcessorCompletionRequest(
+                candidate_ref="kanban_blockers:blocker-structured",
+                source_hash="sha256:structured-source",
+                source_context={
+                    "blockers": [{"blocker_id": "blocker-structured", "status": "open"}],
+                    "blocker_history": [{"blocker_id": "old", "status": "resolved"}],
+                },
+                evidence_refs=["kanban_blockers:blocker-structured"],
+                state_identity={"state_key": "blocker:blocker-structured"},
+                request_id="blocker-structured-request",
+                run_id="blocker-structured-run",
+            )
+        )
+    )
+    assert response["ok"] is True
+    assert response["decision"]["decision_type"] == "needs_operator"
+    assert response["model_routing"]["chosen_route_id"] == "chatgpt-5-6-sol"
+    assert response["model_routing"]["source_hash"] == "sha256:structured-source"
+    assert captured["processor_kind"] == "blocker"
+    assert captured["state_identity"]["state_key"] == "blocker:blocker-structured"
+    assert "file" not in captured
+    assert "terminal" not in captured
+    assert "provider" not in captured
+    assert "model" not in captured
+
+
+def test_blocker_processor_completion_returns_retryable_all_route_evidence(monkeypatch):
+    attempts = [
+        {
+            "route_id": route_id,
+            "label": routes_personal.KANBAN_PROCESSOR_MODEL_REGISTRY[route_id]["label"],
+            "provider": "server-provider",
+            "model": f"server-model-{route_id}",
+            "availability_classification": "gateway_unavailable",
+            "error_classification": "gateway_unavailable",
+            "latency_ms": 0,
+            "fallback_reason": "",
+            "prompt_variant": {
+                "soul_prompt_id": f"kanban-blocker-{route_id}-soul",
+                "system_prompt_id": f"kanban-blocker-{route_id}-system",
+            },
+            "source_hash": "sha256:all-routes-source",
+            "run_id": "all-routes-run",
+            "state_identity": {"state_key": "blocker:all-routes"},
+            "outcome": "unavailable",
+        }
+        for route_id in routes_personal.KANBAN_PROCESSOR_ROUTE_IDS
+    ]
+
+    async def exhausted(**_kwargs):
+        raise routes_personal.WorkProcessorRoutesExhausted("blocker", attempts)
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_processor_profile_json_completion",
+        exhausted,
+    )
+    response = asyncio.run(
+        routes_personal.complete_work_blocker_processor(
+            routes_personal.WorkBlockerProcessorCompletionRequest(
+                candidate_ref="kanban_blockers:all-routes",
+                source_hash="sha256:all-routes-source",
+                source_context={"blockers": [{"status": "open"}]},
+                state_identity={"state_key": "blocker:all-routes"},
+                run_id="all-routes-run",
+            )
+        )
+    )
+    assert response["ok"] is False
+    assert response["retryable"] is True
+    assert response["model_routing"]["final_outcome"] == "all_routes_failed"
+    assert len(response["model_routing"]["attempts"]) == len(
+        routes_personal.KANBAN_PROCESSOR_ROUTE_IDS
+    )
+
+
 def test_work_processor_prompt_variant_selects_model_files_and_generic_fallback(
     monkeypatch, tmp_path
 ):
@@ -13170,6 +13399,48 @@ def test_work_processor_prompt_variant_selects_model_files_and_generic_fallback(
     )
     assert "Generic preprocessing contract" in fallback[0]["content"]
     assert fallback_evidence["selection"] == "generic_fallback"
+
+
+def test_blocker_processor_prompt_variant_records_route_pair_and_generic_pair(
+    monkeypatch, tmp_path
+):
+    prompt_root = tmp_path / "prompts"
+    variant = prompt_root / "kanban-model-variants/blocker/private-local-thinking"
+    variant.mkdir(parents=True)
+    (variant / "soul.md").write_text("Blocker thinking SOUL", encoding="utf-8")
+    (variant / "system.md").write_text("Blocker thinking contract", encoding="utf-8")
+    generic_soul = prompt_root / "kanban-blocker-processor-soul.md"
+    generic_system = prompt_root / "kanban-blocker-processor-system.md"
+    generic_soul.write_text("Generic blocker SOUL", encoding="utf-8")
+    generic_system.write_text("Generic blocker contract", encoding="utf-8")
+    monkeypatch.setattr(
+        routes_personal,
+        "KANBAN_PROCESSOR_MODEL_PROMPT_ROOT",
+        prompt_root / "kanban-model-variants",
+    )
+    monkeypatch.setattr(routes_personal, "BLOCKER_PROCESSOR_SOUL_PROMPT_PATH", generic_soul)
+    monkeypatch.setattr(routes_personal, "BLOCKER_PROCESSOR_SYSTEM_PROMPT_PATH", generic_system)
+
+    selected, evidence = routes_personal._work_processor_prompt_variant(
+        "blocker",
+        "private-local-thinking",
+        [{"role": "user", "content": "structured blocker context"}],
+    )
+    assert "Blocker thinking SOUL" in selected[0]["content"]
+    assert evidence["soul_prompt_id"] == "kanban-blocker-private-local-thinking-soul"
+    assert evidence["system_prompt_id"] == "kanban-blocker-private-local-thinking-system"
+    assert evidence["soul_sha256"].startswith("sha256:")
+    assert evidence["system_sha256"].startswith("sha256:")
+
+    fallback, fallback_evidence = routes_personal._work_processor_prompt_variant(
+        "blocker",
+        "chatgpt-5-6-luna",
+        [{"role": "user", "content": "generic blocker context"}],
+    )
+    assert "Generic blocker SOUL" in fallback[0]["content"]
+    assert "Generic blocker contract" in fallback[0]["content"]
+    assert fallback_evidence["soul_prompt_id"] == "kanban-blocker-generic-soul"
+    assert fallback_evidence["system_prompt_id"] == "kanban-blocker-generic-system"
 
 
 def test_private_no_think_preprocessing_prompt_forbids_skill_and_tool_access() -> None:

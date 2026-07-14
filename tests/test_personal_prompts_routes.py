@@ -104,11 +104,15 @@ def test_apply_prompt_recreates_owned_parent_with_safe_file_mode(
     )
 
 
-def test_hermes_profile_apply_runs_installer_and_restart(
+def test_blocker_processor_profile_apply_runs_installer_and_restart(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    configure_registry(monkeypatch, tmp_path, apply_strategy="hermes-kanban-profile")
+    configure_registry(
+        monkeypatch,
+        tmp_path,
+        apply_strategy="hermes-profile:hermes-kanban-blocker-processor",
+    )
     calls: list[tuple[list[str], int]] = []
 
     def fake_run(command: list[str], timeout: int = 60) -> dict:
@@ -124,14 +128,16 @@ def test_hermes_profile_apply_runs_installer_and_restart(
 
     assert result["ok"] is True
     assert len(calls) == 2
-    assert calls[0][0][:5] == [
-        "docker",
-        "exec",
-        "hermes-local",
+    assert calls[0][0][3:7] == [
         "/opt/data/scripts/install_hermes_kanban_profile.py",
+        "--profile",
+        "hermes-kanban-blocker-processor",
         "--force",
     ]
-    assert calls[1][0][-2:] == ["-t", "/run/service/gateway-hermes-kanban"]
+    assert calls[1][0][-2:] == [
+        "-t",
+        "/run/service/gateway-hermes-kanban-blocker-processor",
+    ]
 
 
 def test_processor_profile_apply_runs_target_installer_and_restart(
@@ -171,8 +177,11 @@ def test_kanban_prompt_registry_includes_processor_runtime_sources() -> None:
     assert {
         "hermes-kanban-preprocessor-soul",
         "hermes-kanban-review-processor-soul",
+        "hermes-kanban-blocker-processor-soul",
         "kanban-preprocessing-system",
         "kanban-review-processor-system",
+        "kanban-blocker-generic-soul",
+        "kanban-blocker-generic-system",
     }.issubset(prompts.PROMPT_REGISTRY)
     assert prompts.PROMPT_REGISTRY["kanban-preprocessing-system"].apply_strategy == "write-file"
     assert prompts.PROMPT_REGISTRY["kanban-review-processor-system"].apply_strategy == "write-file"
@@ -181,12 +190,17 @@ def test_kanban_prompt_registry_includes_processor_runtime_sources() -> None:
         for spec in prompts.PROMPT_REGISTRY.values()
         if spec.model_route_id and spec.processor_kind and spec.prompt_role
     ]
-    assert len(variants) == 24
-    assert {spec.processor_kind for spec in variants} == {"preprocessing", "review"}
+    assert len(variants) == 38
+    assert {spec.processor_kind for spec in variants} == {
+        "preprocessing",
+        "review",
+        "blocker",
+    }
     assert {spec.prompt_role for spec in variants} == {"soul", "system"}
-    assert {spec.model_route_id for spec in variants} == set(
-        prompts.KANBAN_PROCESSOR_PROMPT_ROUTE_LABELS
-    )
+    assert {spec.model_route_id for spec in variants} == {
+        *prompts.KANBAN_PROCESSOR_PROMPT_ROUTE_LABELS,
+        "generic",
+    }
     assert all(spec.apply_strategy == "write-file" for spec in variants)
     sol = prompts.PROMPT_REGISTRY["kanban-preprocessing-chatgpt-5-6-sol-system"]
     summary = prompts._prompt_summary(sol)
@@ -194,6 +208,9 @@ def test_kanban_prompt_registry_includes_processor_runtime_sources() -> None:
     assert summary["processor_kind"] == "preprocessing"
     assert summary["model_route_id"] == "chatgpt-5-6-sol"
     assert summary["prompt_role"] == "system"
+    blocker = prompts.PROMPT_REGISTRY["kanban-blocker-private-local-no-think-system"]
+    assert blocker.path.name == "system.md"
+    assert "LiteLLM" in blocker.label
 
 
 def test_unknown_prompt_returns_404(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
