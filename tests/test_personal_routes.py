@@ -4158,6 +4158,21 @@ def test_work_kanban_schema_api_depth_audit_sync_and_promote(monkeypatch, tmp_pa
         "step-16-root-board-item/items/work-root/discussions/discussion-step18.md"
     )
 
+    with pytest.raises(routes_personal.HTTPException) as duplicate_discussion:
+        asyncio.run(
+            routes_personal.create_work_discussion(
+                "work-root",
+                routes_personal.WorkDiscussionCreateRequest(
+                    discussion_id="discussion-step18",
+                    body=discussion_body,
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="discussion-create-replay",
+                ),
+            )
+        )
+    assert duplicate_discussion.value.status_code == 409
+
     updated_discussion_body = "Edited discussion\n\n```text\nkeeps newlines\n```"
     updated_discussion = asyncio.run(
         routes_personal.update_work_discussion(
