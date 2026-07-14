@@ -42,26 +42,42 @@ class PromptSpec:
 
 
 PROMPT_REGISTRY: dict[str, PromptSpec] = {
-    "hermes-kanban-soul": PromptSpec(
-        prompt_id="hermes-kanban-soul",
-        label="Blocker Resolver SOUL.md",
+    "hermes-kanban-blocker-processor-soul": PromptSpec(
+        prompt_id="hermes-kanban-blocker-processor-soul",
+        label="Blocker Processor profile SOUL.md",
         surface="kanban",
-        group="Hermes Kanban",
-        description="Profile-level SOUL prompt for the hermes-kanban blocker resolver gateway.",
-        path=HERMES_LOCAL_ROOT / "config/profiles/hermes-kanban/SOUL.md",
-        apply_strategy="hermes-kanban-profile",
-        live_path=HERMES_LOCAL_ROOT / "data/profiles/hermes-kanban/SOUL.md",
-        restart_label="Refresh hermes-kanban profile gateway",
+        group="Hermes Kanban Processors",
+        description="Profile-level SOUL prompt for the blocker processor gateway.",
+        path=HERMES_LOCAL_ROOT / "config/profiles/hermes-kanban-blocker-processor/SOUL.md",
+        apply_strategy="hermes-profile:hermes-kanban-blocker-processor",
+        live_path=(HERMES_LOCAL_ROOT / "data/profiles/hermes-kanban-blocker-processor/SOUL.md"),
+        restart_label="Refresh hermes-kanban-blocker-processor profile gateway",
     ),
-    "hermes-kanban-blocker-resolver-system": PromptSpec(
-        prompt_id="hermes-kanban-blocker-resolver-system",
-        label="Blocker Resolver system prompt",
+    "kanban-blocker-generic-soul": PromptSpec(
+        prompt_id="kanban-blocker-generic-soul",
+        label="Blocker Processor · unmatched route · SOUL overlay",
         surface="kanban",
-        group="Hermes Kanban",
-        description="System prompt read by the scheduled/manual Kanban blocker resolver script.",
-        path=HERMES_LOCAL_ROOT / "config/prompts/hermes-kanban-blocker-resolver-system.md",
+        group="Blocker Processor model variants",
+        description="Provider-neutral SOUL fallback when no route-specific pair is available.",
+        path=HERMES_LOCAL_ROOT / "config/prompts/kanban-blocker-processor-soul.md",
         apply_strategy="write-file",
-        restart_label="No restart required",
+        restart_label="No restart required; next model attempt uses latest prompt",
+        processor_kind="blocker",
+        model_route_id="generic",
+        prompt_role="soul",
+    ),
+    "kanban-blocker-generic-system": PromptSpec(
+        prompt_id="kanban-blocker-generic-system",
+        label="Blocker Processor · unmatched route · system prompt",
+        surface="kanban",
+        group="Blocker Processor model variants",
+        description="Provider-neutral decision contract when no route-specific pair is available.",
+        path=HERMES_LOCAL_ROOT / "config/prompts/kanban-blocker-processor-system.md",
+        apply_strategy="write-file",
+        restart_label="No restart required; next model attempt uses latest prompt",
+        processor_kind="blocker",
+        model_route_id="generic",
+        prompt_role="system",
     ),
     "hermes-kanban-preprocessor-soul": PromptSpec(
         prompt_id="hermes-kanban-preprocessor-soul",
@@ -112,13 +128,14 @@ KANBAN_PROCESSOR_PROMPT_ROUTE_LABELS = {
     "chatgpt-5-6-terra": "ChatGPT 5.6 Terra",
     "chatgpt-5-6-luna": "ChatGPT 5.6 Luna",
     "chatgpt-5-5": "ChatGPT 5.5",
-    "private-local-no-think": "Private local Qwen no-think",
-    "private-local-thinking": "Private local Qwen thinking",
+    "private-local-no-think": "Private local LiteLLM — no think",
+    "private-local-thinking": "Private local LiteLLM — thinking",
 }
 
 for _processor_kind, _processor_label in (
     ("preprocessing", "Preprocessor"),
     ("review", "Review Processor"),
+    ("blocker", "Blocker Processor"),
 ):
     for _route_id, _route_label in KANBAN_PROCESSOR_PROMPT_ROUTE_LABELS.items():
         for _prompt_role, _role_label, _filename in (
@@ -294,9 +311,7 @@ def _prompt_summary(spec: PromptSpec) -> dict[str, Any]:
 
 def _apply_prompt(spec: PromptSpec, restart: bool) -> list[dict[str, Any]]:
     profile = ""
-    if spec.apply_strategy == "hermes-kanban-profile":
-        profile = "hermes-kanban"
-    elif spec.apply_strategy.startswith(HERMES_PROFILE_APPLY_PREFIX):
+    if spec.apply_strategy.startswith(HERMES_PROFILE_APPLY_PREFIX):
         profile = spec.apply_strategy.removeprefix(HERMES_PROFILE_APPLY_PREFIX).strip()
     if not profile:
         return []
@@ -309,8 +324,7 @@ def _apply_prompt(spec: PromptSpec, restart: bool) -> list[dict[str, Any]]:
         "--force",
         "--json",
     ]
-    if profile != "hermes-kanban":
-        install_command[4:4] = ["--profile", profile]
+    install_command[4:4] = ["--profile", profile]
     actions = [_run_command(install_command, timeout=90)]
     if restart and actions[-1].get("ok"):
         actions.append(

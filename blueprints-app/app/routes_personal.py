@@ -299,6 +299,7 @@ _WORK_PROCESSOR_HTTP_CLIENT_LOCK = threading.Lock()
 KANBAN_PROCESSOR_ROUTING_SETTING_KEYS = {
     "preprocessing": "personal.kanban.processor_models.preprocessing",
     "review": "personal.kanban.processor_models.review",
+    "blocker": "personal.kanban.processor_models.blocker",
 }
 CODEX_MODELS_CACHE_PATH = Path(
     os.environ.get("BLUEPRINTS_CODEX_MODELS_CACHE", "/root/.codex/models_cache.json")
@@ -321,6 +322,17 @@ HERMES_PROFILE_DATA_ROOT = Path(
     )
 )
 KANBAN_PROCESSOR_PROFILE_SPECS: dict[str, dict[str, Any]] = {
+    "blocker": {
+        "profile": "hermes-kanban-blocker-processor",
+        "api_base_env": "BLUEPRINTS_KANBAN_BLOCKER_PROCESSOR_API_BASE",
+        "api_key_file_env": "BLUEPRINTS_KANBAN_BLOCKER_PROCESSOR_API_KEY_FILE",
+        "api_base": "http://127.0.0.1:8648",
+        "api_key_file": str(HERMES_PROFILE_DATA_ROOT / "hermes-kanban-blocker-processor/.env"),
+        "primary_provider": "openai-codex",
+        "primary_model": "gpt-5.5",
+        "fallback_provider": KANBAN_PROFILE_FALLBACK_PROVIDER_DEFAULT,
+        "fallback_model": KANBAN_PROFILE_FALLBACK_MODEL_DEFAULT,
+    },
     "preprocessing": {
         "profile": "hermes-kanban-preprocessor",
         "api_base_env": "BLUEPRINTS_KANBAN_PREPROCESSOR_API_BASE",
@@ -1205,6 +1217,22 @@ class WorkProcessorRoutingSettingsUpdateRequest(BaseModel):
     run_id: str | None = None
 
 
+class WorkBlockerProcessorCompletionRequest(BaseModel):
+    """Bounded internal input for one semantic blocker-processing request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_ref: str
+    source_hash: str
+    source_context: dict[str, Any]
+    evidence_refs: list[str] = []
+    state_identity: dict[str, Any] = {}
+    actor: str = "hermes-kanban-blocker-processor"
+    source_surface: str = "hermes-kanban-blocker-processor"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
 class WorkAutomationFailurePruneRequest(BaseModel):
     item_id: str | None = None
     marker_id: str | None = None
@@ -1807,6 +1835,8 @@ def _work_processor_kind(value: str) -> str:
     clean = _clean_short_text(value, "", limit=80).lower().replace("-", "_")
     if clean == "review_processor":
         clean = "review"
+    if clean in {"blocker_processor", "hermes_kanban_blocker_resolver"}:
+        clean = "blocker"
     if clean not in KANBAN_PROCESSOR_ROUTING_SETTING_KEYS:
         raise HTTPException(404, f"unsupported Kanban processor kind: {clean or value}")
     return clean
@@ -2067,17 +2097,19 @@ def _work_processor_routing_snapshot(
 
 def _work_review_processing_policy() -> dict[str, Any]:
     processor_routes = {
-        kind: _work_automation_processor_profile_route(kind) for kind in ("review", "preprocessing")
+        kind: _work_automation_processor_profile_route(kind)
+        for kind in ("review", "preprocessing", "blocker")
     }
     auth_drift = {
-        kind: _work_automation_processor_profile_drift(kind) for kind in ("review", "preprocessing")
+        kind: _work_automation_processor_profile_drift(kind)
+        for kind in ("review", "preprocessing", "blocker")
     }
     policy = {
         "schema": KANBAN_REVIEW_PROCESSING_POLICY_SCHEMA,
         "status": "active",
         "version": "2026-06-29",
         "active_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
-        "applies_to": ["review_processor", "preprocessing"],
+        "applies_to": ["review_processor", "preprocessing", "blocker_processor"],
         "profile_processing": {
             "state": "active",
             "required": True,
@@ -2101,8 +2133,8 @@ def _work_review_processing_policy() -> dict[str, Any]:
             "blocked_until_explicit_api": [],
         },
         "routing_rules": [
-            "Review Processor and preprocessing jobs call their dedicated Hermes profile gateway while this policy is active.",
-            "Primary model for both profiles is openai-codex/gpt-5.5 through the Codex subscription/auth path.",
+            "Review Processor, preprocessing, and blocker processing jobs call their dedicated Hermes profile gateway while this policy is active.",
+            "The static profile default is not the per-request route; Blueprints sends one opaque allowlisted route on every attempt.",
             "Configured local fallback is a model fallback only; deterministic substitute decisions are forbidden.",
             "Do not use deterministic substitute processing when a required provider route is unavailable.",
             "If a requested provider/API path is missing, record retryable failure/backoff instead of silently changing provider mode.",
@@ -12868,7 +12900,7 @@ def _get_work_processor_routing_settings_sync(probe: bool = True) -> dict[str, A
                 processor_kind,
                 probe=probe,
             )
-            for processor_kind in ("preprocessing", "review")
+            for processor_kind in ("preprocessing", "review", "blocker")
         }
     return {
         "ok": True,
@@ -12974,6 +13006,74 @@ def _update_work_processor_routing_settings_sync(
             "request_id": meta["request_id"],
             "updated_at": now,
         },
+    }
+
+
+@router.post("/kanban/automation/blocker-processor/complete")
+async def complete_work_blocker_processor(
+    body: WorkBlockerProcessorCompletionRequest,
+) -> dict[str, Any]:
+    """Run one completion-only blocker decision through Blueprints-owned routing."""
+    meta = _work_request_meta(body)
+    messages = _work_blocker_processor_messages(body)
+    state_identity = {
+        **(body.state_identity if isinstance(body.state_identity, dict) else {}),
+        "candidate_ref": body.candidate_ref,
+        "request_id": meta["request_id"],
+        "run_id": meta["run_id"],
+    }
+    try:
+        ai = await _work_automation_processor_profile_json_completion(
+            messages=messages,
+            run_id=meta["run_id"],
+            processor_kind="blocker",
+            source_hash=body.source_hash,
+            state_identity=state_identity,
+        )
+    except WorkProcessorRoutesExhausted as exc:
+        attempts = list(exc.attempts)
+        return {
+            "ok": False,
+            "schema": "xarta.kanban.blocker_processor.completion.v1",
+            "processor_kind": "blocker",
+            "candidate_ref": _clean_short_text(body.candidate_ref, "", limit=260),
+            "source_hash": _clean_short_text(body.source_hash, "", limit=180),
+            "run_id": meta["run_id"],
+            "model_routing": {
+                "schema": KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
+                "attempts": attempts,
+                "chosen_route_id": "",
+                "chosen_provider": "",
+                "chosen_model": "",
+                "latency_ms": round(
+                    sum(float(attempt.get("latency_ms") or 0) for attempt in attempts),
+                    3,
+                ),
+                "fallback_reason": "all_configured_blocker_routes_failed",
+                "source_hash": body.source_hash,
+                "state_identity": state_identity,
+                "final_outcome": "all_routes_failed",
+            },
+            "error": "all_configured_blocker_routes_failed",
+            "retryable": True,
+        }
+    return {
+        "ok": True,
+        "schema": "xarta.kanban.blocker_processor.completion.v1",
+        "processor_kind": "blocker",
+        "candidate_ref": _clean_short_text(body.candidate_ref, "", limit=260),
+        "source_hash": _clean_short_text(body.source_hash, "", limit=180),
+        "run_id": meta["run_id"],
+        "decision": ai["payload"],
+        "response": {
+            "id": ai.get("response_id") or "",
+            "model": ai.get("response_model") or "",
+            "finish_reason": ai.get("finish_reason") or "",
+            "content": ai.get("content_excerpt") or "",
+            "usage": ai.get("usage") if isinstance(ai.get("usage"), dict) else {},
+        },
+        "model_routing": _work_automation_ai_routing_evidence(ai),
+        "retryable": False,
     }
 
 
@@ -15521,6 +15621,10 @@ def _clean_kanban_link_type(value: str | None) -> str:
 
 @router.post("/kanban/items/{item_id}/links")
 async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -> dict[str, Any]:
+    return await _run_personal_sync_work(_create_work_item_link_sync, item_id, body)
+
+
+def _create_work_item_link_sync(item_id: str, body: WorkItemLinkCreateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
@@ -15534,35 +15638,61 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
         raise HTTPException(400, "Kanban item link target must be a different item")
     link_type = _clean_kanban_link_type(body.link_type)
     metadata = body.metadata if isinstance(body.metadata, dict) else {}
+    semantic_metadata = {key: value for key, value in metadata.items() if key != "link_id"}
+    explicit_link_id = metadata.get("link_id") if isinstance(metadata.get("link_id"), str) else None
+    semantic_hash = _hash_json_payload(
+        {
+            "source_item_id": source_item_id,
+            "target_item_id": target_item_id,
+            "link_type": link_type,
+            "metadata": semantic_metadata,
+        }
+    )
     link_id = _clean_work_id(
-        metadata.get("link_id") if isinstance(metadata.get("link_id"), str) else None,
+        explicit_link_id or f"kanban-link-{semantic_hash.removeprefix('sha256:')[:12]}",
         "kanban-link",
     )
-    row = {
-        "link_id": link_id,
+    source_payload = {
         "source_item_id": source_item_id,
         "target_item_id": target_item_id,
         "link_type": link_type,
-        "metadata_json": json.dumps(metadata, ensure_ascii=True, sort_keys=True),
-        "created_at": now,
-        "updated_at": now,
+        "metadata": semantic_metadata,
     }
-    source_hash = _hash_json_payload(row)
+    source_hash = _hash_json_payload(source_payload)
     with get_conn() as conn:
         store = _kanban_write_store(conn)
         source = _work_item_or_404(conn, source_item_id)
         _work_item_or_404(conn, target_item_id)
-        link_row = store.create_item_link_row(
-            {
-                "link_id": link_id,
-                "source_item_id": source_item_id,
-                "target_item_id": target_item_id,
-                "link_type": link_type,
-                "metadata": metadata,
-                "created_at": now,
-                "updated_at": now,
-            }
+        link_row = store.item_link_semantic_row(
+            source_item_id,
+            target_item_id,
+            link_type,
+            semantic_metadata,
         )
+        idempotent_replay = link_row is not None
+        if link_row is None:
+            link_row = store.create_item_link_row(
+                {
+                    "link_id": link_id,
+                    "source_item_id": source_item_id,
+                    "target_item_id": target_item_id,
+                    "link_type": link_type,
+                    "metadata": semantic_metadata,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            if link_row is None:
+                link_row = store.item_link_semantic_row(
+                    source_item_id,
+                    target_item_id,
+                    link_type,
+                    semantic_metadata,
+                )
+                idempotent_replay = True
+        if link_row is None:
+            raise HTTPException(409, "Kanban typed-link replay could not be reconciled")
+        link_id = str(link_row["link_id"])
         audit_row = _write_work_audit(
             conn,
             audit_id=audit_id,
@@ -15580,10 +15710,19 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
             metadata={
                 "target_item_id": target_item_id,
                 "link_type": link_type,
+                "idempotent_replay": idempotent_replay,
             },
         )
         gen = _kanban_table_sync_gen(conn, "kanban-item-link")
-        enqueue_for_all_peers(conn, "UPDATE", "kanban_item_links", link_id, dict(link_row), gen)
+        if not idempotent_replay:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_item_links",
+                link_id,
+                dict(link_row),
+                gen,
+            )
         enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
     return {
         "ok": True,
@@ -15596,6 +15735,7 @@ async def create_work_item_link(item_id: str, body: WorkItemLinkCreateRequest) -
             "created_at": link_row["created_at"],
             "updated_at": link_row["updated_at"],
         },
+        "idempotent_replay": idempotent_replay,
         "audit": {"audit_id": audit_id, "action": "create_work_item_link", "result": "ok"},
     }
 
@@ -16154,7 +16294,7 @@ def _work_automation_idle_worker_config() -> dict[str, Any]:
         "provider_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
         "processor_profiles": {
             kind: _work_automation_processor_profile_route(kind)
-            for kind in ("review", "preprocessing")
+            for kind in ("review", "preprocessing", "blocker")
         },
         "local_ai_model_alias": local_model_alias,
         "local_ai_max_tokens": _env_int(
@@ -16380,6 +16520,8 @@ async def _work_automation_processor_profile_json_completion(
     messages: list[dict[str, str]],
     run_id: str,
     processor_kind: str,
+    source_hash: str = "",
+    state_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     request_plan = await _run_personal_sync_work(
         _work_automation_processor_request_plan_sync,
@@ -16391,6 +16533,13 @@ async def _work_automation_processor_profile_json_completion(
     route = request_plan["route"]
     routing = request_plan["routing"]
     route_definitions = request_plan["route_definitions"]
+    bounded_state_identity = {
+        _clean_short_text(str(key or ""), "", limit=80): _clean_short_text(
+            str(value or ""), "", limit=260
+        )
+        for key, value in list((state_identity or {}).items())[:16]
+        if _clean_short_text(str(key or ""), "", limit=80)
+    }
     attempts: list[dict[str, Any]] = []
     previous_failure = ""
     timeout_seconds = _env_int(
@@ -16414,6 +16563,9 @@ async def _work_automation_processor_profile_json_completion(
             "availability_state": public_route["availability_state"],
             "availability_classification": public_route["availability_classification"],
             "fallback_reason": previous_failure,
+            "source_hash": _clean_short_text(source_hash, "", limit=180),
+            "run_id": _clean_short_text(run_id, "", limit=180),
+            "state_identity": bounded_state_identity,
             "latency_ms": 0,
             "outcome": "not_attempted",
             "error_classification": "",
@@ -16474,8 +16626,17 @@ async def _work_automation_processor_profile_json_completion(
             "fallback_model": route["fallback_model"],
             "model_alias": f"{route['profile']}:{definition['provider']}/{definition['model']}",
             "run_id": run_id,
+            "source_hash": _clean_short_text(source_hash, "", limit=180),
+            "state_identity": bounded_state_identity,
             "api_base": route["api_base"],
+            "response_id": _clean_short_text(str(response.get("id") or ""), "", limit=180),
             "response_model": _clean_short_text(str(response.get("model") or ""), "", limit=180),
+            "finish_reason": _clean_short_text(
+                str(choices[0].get("finish_reason") or "") if isinstance(choices[0], dict) else "",
+                "",
+                limit=120,
+            ),
+            "usage": response.get("usage") if isinstance(response.get("usage"), dict) else {},
             "prompt_sha256": prompt_sha256,
             "prompt_variant": prompt_variant,
             "content_excerpt": _body_excerpt(str(content or ""), limit=4000),
@@ -16508,7 +16669,12 @@ def _work_automation_processor_ai_defaults(
         "fallback_model": route["fallback_model"],
         "model_alias": route["model_alias"],
         "api_base": route["api_base"],
+        "response_id": "",
         "response_model": "",
+        "finish_reason": "",
+        "usage": {},
+        "source_hash": "",
+        "state_identity": {},
         "prompt_sha256": "",
         "content_excerpt": "",
         "payload": {},
@@ -16527,7 +16693,8 @@ def _work_automation_ai_routing_evidence(ai: dict[str, Any]) -> dict[str, Any]:
         "chosen_model": ai.get("chosen_model") or ai.get("primary_model") or "",
         "latency_ms": ai.get("latency_ms") or 0,
         "fallback_reason": ai.get("fallback_reason") or "",
-        "source_hash": ai.get("prompt_sha256") or "",
+        "source_hash": ai.get("source_hash") or ai.get("prompt_sha256") or "",
+        "state_identity": dict(ai.get("state_identity") or {}),
         "prompt_variant": dict(ai.get("prompt_variant") or {}),
         "final_outcome": ai.get("final_outcome") or "",
     }
@@ -16654,6 +16821,16 @@ PREPROCESSING_SYSTEM_PROMPT = (
     "for true operator questions or external blockers. Do not invent "
     "deterministic substitute work."
 )
+BLOCKER_PROCESSOR_SYSTEM_PROMPT = (
+    "You are the provider-neutral Blueprints Kanban Blocker Processor. Return only one "
+    "strict JSON object and no markdown. Decide from the whole supplied context and structured "
+    "state; exact words, filenames, ancestor vocabulary, and regex matches are only weak lexical "
+    "evidence and must never decide the outcome. Use decision_type=unblocked only for stale or "
+    "resolved technical blockers, converted_to_todo only for concrete AI-suitable work, and "
+    "needs_operator only for genuine operator, provider, credential, authorization, privacy, "
+    "legal, product-direction, or missing-intent blockers. The processor is completion-only: it "
+    "has no file, terminal, web, delegation, skill-management, or mounted-skill access."
+)
 REVIEW_PROCESSOR_SYSTEM_PROMPT_PATH = Path(
     os.environ.get(
         "BLUEPRINTS_KANBAN_REVIEW_PROCESSOR_PROMPT",
@@ -16664,6 +16841,18 @@ PREPROCESSING_SYSTEM_PROMPT_PATH = Path(
     os.environ.get(
         "BLUEPRINTS_KANBAN_PREPROCESSING_PROMPT",
         str(KANBAN_PROMPT_ROOT / "kanban-preprocessing-system.md"),
+    )
+)
+BLOCKER_PROCESSOR_SYSTEM_PROMPT_PATH = Path(
+    os.environ.get(
+        "BLUEPRINTS_KANBAN_BLOCKER_PROCESSOR_PROMPT",
+        str(KANBAN_PROMPT_ROOT / "kanban-blocker-processor-system.md"),
+    )
+)
+BLOCKER_PROCESSOR_SOUL_PROMPT_PATH = Path(
+    os.environ.get(
+        "BLUEPRINTS_KANBAN_BLOCKER_PROCESSOR_SOUL",
+        str(KANBAN_PROMPT_ROOT / "kanban-blocker-processor-soul.md"),
     )
 )
 KANBAN_PROCESSOR_MODEL_PROMPT_ROOT = KANBAN_PROMPT_ROOT / "kanban-model-variants"
@@ -16689,11 +16878,18 @@ def _work_processor_prompt_variant(
     if clean_kind == "preprocessing":
         generic_system_path = PREPROCESSING_SYSTEM_PROMPT_PATH
         generic_system = PREPROCESSING_SYSTEM_PROMPT
+        generic_soul_path = None
+    elif clean_kind == "blocker":
+        generic_system_path = BLOCKER_PROCESSOR_SYSTEM_PROMPT_PATH
+        generic_system = BLOCKER_PROCESSOR_SYSTEM_PROMPT
+        generic_soul_path = BLOCKER_PROCESSOR_SOUL_PROMPT_PATH
     else:
         generic_system_path = REVIEW_PROCESSOR_SYSTEM_PROMPT_PATH
         generic_system = REVIEW_PROCESSOR_SYSTEM_PROMPT
+        generic_soul_path = None
     profile = _work_automation_processor_profile_spec(clean_kind)["profile"]
-    generic_soul_path = HERMES_LOCAL_STACK_ROOT / "config/profiles" / str(profile) / "SOUL.md"
+    if generic_soul_path is None:
+        generic_soul_path = HERMES_LOCAL_STACK_ROOT / "config/profiles" / str(profile) / "SOUL.md"
     variant_root = KANBAN_PROCESSOR_MODEL_PROMPT_ROOT / clean_kind / route_id
     soul_path = variant_root / "soul.md"
     system_path = variant_root / "system.md"
@@ -16715,14 +16911,28 @@ def _work_processor_prompt_variant(
     else:
         selected_messages.insert(0, {"role": "system", "content": combined})
     variant_available = soul_path.is_file() and system_path.is_file()
+    generic_soul_id = {
+        "blocker": "kanban-blocker-generic-soul",
+        "preprocessing": "hermes-kanban-preprocessor-soul",
+        "review": "hermes-kanban-review-processor-soul",
+    }[clean_kind]
+    generic_system_id = {
+        "blocker": "kanban-blocker-generic-system",
+        "preprocessing": "kanban-preprocessing-system",
+        "review": "kanban-review-processor-system",
+    }[clean_kind]
     evidence = {
         "schema": "xarta.kanban.processor_prompt_variant.v1",
         "processor_kind": clean_kind,
         "route_id": route_id,
         "variant_available": variant_available,
         "selection": "model_variant" if variant_available else "generic_fallback",
-        "soul_prompt_id": f"kanban-{clean_kind}-{route_id}-soul",
-        "system_prompt_id": f"kanban-{clean_kind}-{route_id}-system",
+        "soul_prompt_id": (
+            f"kanban-{clean_kind}-{route_id}-soul" if soul_path.is_file() else generic_soul_id
+        ),
+        "system_prompt_id": (
+            f"kanban-{clean_kind}-{route_id}-system" if system_path.is_file() else generic_system_id
+        ),
         "soul_sha256": _sha256_text(soul),
         "system_sha256": _sha256_text(system),
         "instruction_sha256": _sha256_text(combined),
@@ -16731,6 +16941,71 @@ def _work_processor_prompt_variant(
         ),
     }
     return selected_messages, evidence
+
+
+def _work_blocker_processor_messages(
+    body: WorkBlockerProcessorCompletionRequest,
+) -> list[dict[str, str]]:
+    """Build the fixed completion-only blocker contract from bounded structured evidence."""
+    candidate_ref = _clean_short_text(body.candidate_ref, "", limit=260)
+    source_hash = _clean_short_text(body.source_hash, "", limit=180)
+    if not candidate_ref or not source_hash.startswith("sha256:"):
+        raise HTTPException(422, "candidate_ref and a sha256 source_hash are required")
+    source_context_json = json.dumps(
+        body.source_context,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    if len(source_context_json.encode("utf-8")) > 96 * 1024:
+        raise HTTPException(413, "blocker processor source_context exceeds 96 KiB")
+    evidence_refs = [
+        _clean_short_text(str(ref or ""), "", limit=300)
+        for ref in list(body.evidence_refs or [])[:64]
+        if _clean_short_text(str(ref or ""), "", limit=300)
+    ]
+    request = {
+        "schema": "xarta.kanban.blocker_processor.request.v1",
+        "task": "Decide the semantic outcome for this Kanban blocker candidate.",
+        "candidate_ref": candidate_ref,
+        "source_hash": source_hash,
+        "baseline_evidence_refs": evidence_refs,
+        "source_context": body.source_context,
+        "required_output": {
+            "decision_type": "unblocked|converted_to_todo|needs_operator",
+            "rationale": "specific rationale grounded in current evidence",
+            "confidence": "low|medium|medium-high|high",
+            "limitations": "remaining uncertainty or constraints",
+            "evidence_refs": ["refs relied on"],
+            "proof_refs": ["proof refs"],
+            "target_state": "todo|doing|blocked when applicable",
+            "todo_title": "required only for converted_to_todo",
+            "todo_body": "required only for converted_to_todo",
+        },
+        "semantic_rules": [
+            "Decide from the whole utterance-equivalent context plus structured current state.",
+            "Resolved, closed, and done blocker rows are history, not active gates.",
+            "Lexical matches, exact words, regexes, filenames, and ancestor vocabulary never decide meaning by themselves.",
+            "Do not use deterministic semantic fallback and do not invent hidden provider fallback.",
+        ],
+        "capabilities": {
+            "completion_only": True,
+            "file": False,
+            "terminal": False,
+            "web": False,
+            "delegation": False,
+            "skill_management": False,
+            "mounted_skills": False,
+        },
+    }
+    return [
+        {"role": "system", "content": BLOCKER_PROCESSOR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(request, ensure_ascii=True, sort_keys=True, indent=2),
+        },
+    ]
 
 
 def _work_review_processor_local_ai_messages(
