@@ -165,7 +165,3 @@ Run scans from nodes with appropriate access for the target network.
 After scanning, use the `blueprints-copilot-enrichment` skill to have
 Copilot review the findings, classify services, propose tags, suggest
 dependencies, and generate API calls for the Blueprints database.
-
-When asked to commit and push ALL repos always including the lone wolf repo.  Lone wolf repo is specific to each node and not distributed.  Sometimes you'll be asked to also commit and push each lone wolf repo on each node separately via ssh.  That is a separate concern to commit and push all repos.
-
-End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.

@@ -374,7 +374,3 @@ Separate HTML pages for DB schema viewing:
 - `gui-fallback/database-tables.html`  → uses `gui-db/database-tables.css`  + `gui-db/database-tables.js`
 
 These are standalone pages, not part of the main SPA.
-
-When asked to commit and push ALL repos always including the lone wolf repo.  Lone wolf repo is specific to each node and not distributed.  Sometimes you'll be asked to also commit and push each lone wolf repo on each node separately via ssh.  That is a separate concern to commit and push all repos.
-
-End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.

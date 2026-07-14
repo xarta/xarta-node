@@ -168,5 +168,3 @@ uv self update
 # Update ruff (installed via pip3)
 pip3 install --break-system-packages --upgrade ruff
 ```
-
-End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.

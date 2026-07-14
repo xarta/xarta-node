@@ -2,6 +2,21 @@
 
 set -euo pipefail
 
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+Usage: audit-skills.sh [skills-root]
+
+Check two-level SKILL.md front matter, line counts, referenced paths, and
+resource directories. Defaults to the public-root skill catalog.
+EOF
+  exit 0
+fi
+
+if [[ $# -gt 1 ]]; then
+  echo "ERROR: expected at most one skills-root" >&2
+  exit 2
+fi
+
 ROOT="${1:-/root/xarta-node/.claude/skills}"
 
 if [[ ! -d "$ROOT" ]]; then

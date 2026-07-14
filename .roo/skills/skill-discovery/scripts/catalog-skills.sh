@@ -1,76 +1,70 @@
 #!/usr/bin/env bash
-# catalog-skills.sh — Scan all Claude skills and produce a JSON catalog
-# Usage: bash catalog-skills.sh [base_dir]
-#   base_dir defaults to /root/xarta-node
-# Output: JSON array of {name, path, description, repo, type}
-
 set -euo pipefail
 
-BASE_DIR="${1:-/root/xarta-node}"
-OUTPUT_FORMAT="${2:-json}"
+usage() {
+  cat <<'EOF'
+Usage: catalog-skills.sh [options]
+       catalog-skills.sh [/root/xarta-node] [json|text]  # legacy form
 
-declare -a SKILLS=()
+List maintained canonical xarta-node skills through the shared p103 audit.
 
-scan_skills_dir() {
-  local dir="$1"
-  local repo="$2"
-  local type="$3"
+Options:
+  --name NAME       Exact front-matter name filter; may return root variants
+  --json            Print JSON (default; compatible with the former script)
+  --text            Print a compact name/role/path table
+  --output PATH     Full audit destination under /tmp
+  -h, --help        Show this help
 
-  for skill_dir in "$dir"/*/; do
-    [ -d "$skill_dir" ] || continue
-    local skill_md="$skill_dir/SKILL.md"
-    [ -f "$skill_md" ] || continue
-
-    local name
-    name=$(grep -m1 '^name:' "$skill_md" 2>/dev/null | sed 's/^name:[[:space:]]*//' | tr -d '\r' || echo "unknown")
-    local desc
-    desc=$(grep -m1 '^description:' "$skill_md" 2>/dev/null | sed 's/^description:[[:space:]]*//' | tr -d '\r' || echo "")
-    local rel_path
-    rel_path=$(realpath --relative-to="$BASE_DIR" "$skill_dir" 2>/dev/null || echo "$skill_dir")
-
-    SKILLS+=("{\"name\":\"$name\",\"path\":\"$rel_path\",\"description\":\"$desc\",\"repo\":\"$repo\",\"type\":\"$type\"}")
-  done
+The command collects metadata only. It does not select a skill semantically.
+EOF
 }
 
-# Scan private inner repo (p100)
-scan_skills_dir "$BASE_DIR/.xarta/.claude/skills" "p100" "private-inner"
+AUDIT=/root/xarta-node/.xarta/.agents/bin/xarta-skill-audit
+OUTPUT=/tmp/roo-skill-audit.json
+FORMAT=json
+NAME=
 
-# Scan public root skills (p201)
-scan_skills_dir "$BASE_DIR/.claude/skills" "p201" "public-root"
-
-# Scan public non-root skills (p301) — may not exist
-if [ -d "$BASE_DIR/.xarta-node/.claude/skills" ] 2>/dev/null || [ -d "/xarta-node/.claude/skills" ] 2>/dev/null; then
-  local_path="/xarta-node/.claude/skills"
-  if [ -d "$local_path" ]; then
-    scan_skills_dir "$local_path" "p301" "public-non-root"
-  fi
+# Preserve the former no-argument and BASE_DIR/format calling shapes.
+if [[ "${1:-}" == "/root/xarta-node" ]]; then
+  shift
+  case "${1:-}" in
+    ""|json) FORMAT=json; [[ $# -gt 0 ]] && shift ;;
+    text) FORMAT=text; shift ;;
+    *) echo "Unsupported legacy format: $1" >&2; exit 2 ;;
+  esac
 fi
 
-# Scan node-local private skills (p401)
-if [ -d "$BASE_DIR/.lone-wolf/.claude/skills" ]; then
-  scan_skills_dir "$BASE_DIR/.lone-wolf/.claude/skills" "p401" "node-local"
+while (($#)); do
+  case "$1" in
+    --name) NAME=${2:-}; shift 2 ;;
+    --json|json) FORMAT=json; shift ;;
+    --text|text) FORMAT=text; shift ;;
+    --output) OUTPUT=${2:-}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! -x "$AUDIT" ]]; then
+  echo "Maintained skill audit helper is unavailable: $AUDIT" >&2
+  exit 3
+fi
+if [[ "$OUTPUT" != /tmp/* ]]; then
+  echo "--output must be under /tmp" >&2
+  exit 2
 fi
 
-# Output JSON
-if [ "$OUTPUT_FORMAT" = "json" ]; then
-  echo "["
-  for i in "${!SKILLS[@]}"; do
-    if [ $i -lt $((${#SKILLS[@]} - 1)) ]; then
-      echo "  ${SKILLS[$i]},"
-    else
-      echo "  ${SKILLS[$i]}"
-    fi
-  done
-  echo "]"
+"$AUDIT" --maintained-workspace --output "$OUTPUT" --allow-findings >/dev/null
+
+FILTER='[.skills[] | select(.path_role | endswith("canonical"))'
+if [[ -n "$NAME" ]]; then
+  FILTER+=" | select(.name == \$name)"
+fi
+FILTER+='] | sort_by(.name,.path_role,.path)'
+
+if [[ "$FORMAT" == json ]]; then
+  jq -c --arg name "$NAME" "$FILTER | map({name,path,resolved_path,description,repo:(if .path_role == \"private-canonical\" then \"p100\" elif .path_role == \"public-root-canonical\" then \"p200\" elif .path_role == \"public-nonroot-canonical\" then \"p300\" else \"p400\" end),type:.path_role})" "$OUTPUT"
 else
-  # Human-readable table
-  printf "%-40s %-12s %-12s %s\n" "NAME" "PATH" "REPO" "TYPE"
-  printf "%-40s %-12s %-12s %s\n" "----" "----" "----" "----"
-  for s in "${SKILLS[@]}"; do
-    name=$(echo "$s" | grep -oP '"name":"\K[^"]+')
-    path=$(echo "$s" | grep -oP '"path":"\K[^"]+')
-    repo=$(echo "$s" | grep -oP '"repo":"\K[^"]+')
-    type=$(echo "$s" | grep -oP '"type":"\K[^"]+')
-    printf "%-40s %-12s %-12s %s\n" "$name" "$path" "$repo" "$type"
-  done
+  jq -r --arg name "$NAME" "$FILTER[] | [.name,.path_role,.path] | @tsv" "$OUTPUT"
+  printf 'raw_audit\t%s\n' "$OUTPUT"
 fi
