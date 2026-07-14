@@ -82,5 +82,3 @@ Avoid it when:
 Helpers can propose. The orchestrator decides. Keep API writes, filesystem
 edits, fleet operations, commits, pushes, and remediation behind deterministic
 checks and explicit workflow rules.
-
-End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.

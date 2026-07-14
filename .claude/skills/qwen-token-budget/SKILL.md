@@ -35,5 +35,3 @@ The script uses Hugging Face `tokenizer.json` through the `tokenizers` package. 
 ## Guardrail
 
 Never add silent source clipping because a count is large. If a workflow needs a cap, make it configurable, report the input size, report the model finish reason, and fail visibly when a generation is incomplete.
-
-End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.

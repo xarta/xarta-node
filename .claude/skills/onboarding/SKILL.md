@@ -178,7 +178,3 @@ ssh -i /root/.ssh/<deploy-key> root@<TARGET-IP> \
 | [references/ENV-TEMPLATE.md](references/ENV-TEMPLATE.md) | Full .env template with every value and substitution guide |
 | [references/FLEET-REGISTRY.md](references/FLEET-REGISTRY.md) | How to register a new node across all existing nodes |
 | [references/GOTCHAS.md](references/GOTCHAS.md) | Known failure modes and fixes from real onboardings |
-
-When asked to commit and push ALL repos always including the lone wolf repo.  Lone wolf repo is specific to each node and not distributed.  Sometimes you'll be asked to also commit and push each lone wolf repo on each node separately via ssh.  That is a separate concern to commit and push all repos.
-
-End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.

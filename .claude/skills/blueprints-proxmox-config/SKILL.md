@@ -266,5 +266,3 @@ sqlite3 /opt/blueprints/data/db/blueprints.db \
 Both `proxmox_config` and `proxmox_nets` are in `_ALLOWED_TABLES` and sync
 automatically to all peers via the standard gen-based protocol. The probe only
 needs to run on the node that has SSH access to PVE hosts (`PROXMOX_SSH_KEY`).
-
-End-of-turn TTS reminder: if you are Codex on xarta-node and have not already run active TTS this turn, run `python3 /root/.codex/skills/xarta-active-tts/scripts/say-active-tts.py "<short status>"` before your final response.
