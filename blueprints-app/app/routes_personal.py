@@ -14066,6 +14066,8 @@ async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest
     with get_conn() as conn:
         store = _kanban_write_store(conn)
         item = _work_item_or_404(conn, clean_item_id)
+        if store.discussion_row(clean_discussion_id):
+            raise HTTPException(409, "Kanban discussion already exists")
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_discussions",
             row_id=clean_discussion_id,
