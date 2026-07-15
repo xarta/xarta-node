@@ -10882,6 +10882,55 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
     assert "trigger_preprocessing_idle_scan" in audit_actions
 
 
+def test_work_queued_processor_markers_prioritize_item_urgency_before_queue_age(
+    monkeypatch,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    fixtures = [
+        ("work-old-low-review", "low", "review", "2026-07-15T08:00:00Z"),
+        ("work-new-critical-preprocess", "critical", "preprocessing", "2026-07-15T11:00:00Z"),
+        ("work-new-critical-review", "critical", "review", "2026-07-15T11:01:00Z"),
+    ]
+    for item_id, priority_id, processor_kind, queued_at in fixtures:
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    title=item_id,
+                    body="Bounded queue-order fixture.",
+                    state_id="todo",
+                    priority_id=priority_id,
+                    actor="codex-test",
+                    source_surface="pytest",
+                )
+            )
+        )
+        conn.execute(
+            """
+            INSERT INTO kanban_review_processor_markers (
+                marker_id, item_id, processor_kind, document_type,
+                document_source_hash, queued_at, status, provider_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, 'queued', 'required-hermes-kanban-llm')
+            """,
+            (
+                f"marker-{item_id}",
+                item_id,
+                processor_kind,
+                processor_kind,
+                f"sha256:{item_id}",
+                queued_at,
+            ),
+        )
+    conn.commit()
+
+    assert routes_personal._work_queued_processor_marker_ids(conn, []) == [
+        "marker-work-new-critical-review",
+        "marker-work-new-critical-preprocess",
+        "marker-work-old-low-review",
+    ]
+
+
 def test_work_preprocessing_idle_scan_cancels_non_todo_pending_marker(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
