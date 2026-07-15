@@ -5403,6 +5403,13 @@ def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[s
         JOIN kanban_items item ON item.item_id=marker.item_id
         {where}
         ORDER BY
+          CASE item.priority_id
+            WHEN 'critical' THEN 0
+            WHEN 'high' THEN 1
+            WHEN 'medium' THEN 2
+            WHEN 'low' THEN 3
+            ELSE 4
+          END,
           CASE marker.processor_kind
             WHEN 'review' THEN 0
             WHEN 'preprocessing' THEN 1
