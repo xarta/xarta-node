@@ -14835,6 +14835,199 @@ def test_preprocessing_preserves_tagged_operator_requests_and_steers_exactly(mon
     )
 
 
+def test_verbatim_operator_request_storage_preserves_long_text_and_crlf(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+
+    primary_request = "  primary\r\n" + ("Long request text.  " * 260) + "\r\nend  "
+    steering_request = "\tsteer\r\n" + ("Do exactly this.  " * 280) + "\r\n  "
+    assert len(primary_request) > 4000
+    assert len(steering_request) > 4000
+
+    created = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="verbatim-long-storage",
+                title="Verbatim long storage fixture",
+                body=primary_request,
+                tags=["kanban", "operator-request-verbatim-v1"],
+                actor="codex-test-fixture",
+                source_surface="pytest",
+            )
+        )
+    )["item"]
+    assert created["body_excerpt"] == primary_request
+
+    discussion = asyncio.run(
+        routes_personal.create_work_discussion(
+            created["item_id"],
+            routes_personal.WorkDiscussionCreateRequest(
+                discussion_id="operator-request-verbatim-002-long-crlf",
+                body=steering_request,
+                author="codex-test-fixture",
+                actor="codex-test-fixture",
+                source_surface="pytest",
+            ),
+        )
+    )["discussion"]
+    assert discussion["body_excerpt"] == steering_request
+    # Markdown rendering has its own LF convention; the database field is authoritative.
+    assert discussion["document"]["body"] == steering_request.replace("\r\n", "\n")
+
+    item_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id=?",
+        (created["item_id"],),
+    ).fetchone()
+    discussion_row = conn.execute(
+        "SELECT * FROM kanban_discussions WHERE discussion_id=?",
+        (discussion["discussion_id"],),
+    ).fetchone()
+    assert item_row["body_excerpt"] == primary_request
+    assert discussion_row["body_excerpt"] == steering_request
+
+    requests = routes_personal._work_preprocessing_original_operator_requests(
+        item_row,
+        [routes_personal._row_to_work_discussion(discussion_row, conn)],
+    )
+    assert [record["text"] for record in requests["records"]] == [
+        primary_request,
+        steering_request,
+    ]
+
+
+def test_verbatim_operator_request_storage_rejects_oversize_records(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    oversized = "x" * (routes_personal.KANBAN_VERBATIM_OPERATOR_REQUEST_MAX_CODEPOINTS + 1)
+
+    with pytest.raises(routes_personal.HTTPException) as item_error:
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id="verbatim-oversize-rejected",
+                    title="Verbatim oversize fixture",
+                    body=oversized,
+                    tags=["operator-request-verbatim-v1"],
+                    actor="codex-test-fixture",
+                    source_surface="pytest",
+                )
+            )
+        )
+    assert item_error.value.status_code == 413
+    assert "65536 Unicode-codepoint" in item_error.value.detail
+
+    parent = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="verbatim-oversize-parent",
+                title="Verbatim oversize parent fixture",
+                body="Within the explicit limit.",
+                tags=["operator-request-verbatim-v1"],
+                actor="codex-test-fixture",
+                source_surface="pytest",
+            )
+        )
+    )["item"]
+    with pytest.raises(routes_personal.HTTPException) as discussion_error:
+        asyncio.run(
+            routes_personal.create_work_discussion(
+                parent["item_id"],
+                routes_personal.WorkDiscussionCreateRequest(
+                    discussion_id="operator-request-verbatim-002-oversize",
+                    body=oversized,
+                    actor="codex-test-fixture",
+                    source_surface="pytest",
+                ),
+            )
+        )
+    assert discussion_error.value.status_code == 413
+    assert "65536 Unicode-codepoint" in discussion_error.value.detail
+
+
+def test_adding_verbatim_tag_requires_body_in_same_update(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    item = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="verbatim-tag-transition",
+                title="Verbatim tag transition fixture",
+                body="An ordinary body cannot later be certified without resubmission.",
+                actor="codex-test-fixture",
+                source_surface="pytest",
+            )
+        )
+    )["item"]
+
+    with pytest.raises(routes_personal.HTTPException) as missing_body_error:
+        asyncio.run(
+            routes_personal.update_work_item(
+                item["item_id"],
+                routes_personal.WorkItemUpdateRequest(
+                    tags=["operator-request-verbatim-v1"],
+                    actor="codex-test-fixture",
+                    source_surface="pytest",
+                ),
+            )
+        )
+    assert missing_body_error.value.status_code == 400
+    assert "complete Operator request" in missing_body_error.value.detail
+
+    exact = "  resubmitted\r\nrequest  "
+    updated = asyncio.run(
+        routes_personal.update_work_item(
+            item["item_id"],
+            routes_personal.WorkItemUpdateRequest(
+                body=exact,
+                tags=["operator-request-verbatim-v1"],
+                actor="codex-test-fixture",
+                source_surface="pytest",
+            ),
+        )
+    )["item"]
+    assert updated["body_excerpt"] == exact
+
+
+def test_verbatim_operator_request_storage_rejects_oversize_card_total(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    item = asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="verbatim-total-limit",
+                title="Verbatim total limit fixture",
+                body="p" * 40_000,
+                tags=["operator-request-verbatim-v1"],
+                actor="codex-test-fixture",
+                source_surface="pytest",
+            )
+        )
+    )["item"]
+
+    with pytest.raises(routes_personal.HTTPException) as total_error:
+        asyncio.run(
+            routes_personal.create_work_discussion(
+                item["item_id"],
+                routes_personal.WorkDiscussionCreateRequest(
+                    discussion_id="operator-request-verbatim-002-total-limit",
+                    body="s" * 30_000,
+                    actor="codex-test-fixture",
+                    source_surface="pytest",
+                ),
+            )
+        )
+    assert total_error.value.status_code == 413
+    assert "total limit" in total_error.value.detail
+
+
 def test_preprocessing_operator_request_assessment_accepts_aligned_comparison():
     original = {
         "required": True,
