@@ -7921,6 +7921,14 @@ def test_work_proposal_operator_response_creates_outcome_and_owned_follow_up(
         if entry["item_id"] == "proposal-fixture-entry"
     )
     assert processed_entry["proposal_status"] == "processed"
+    proposal_lifecycle = json.loads(
+        conn.execute(
+            "SELECT provenance_json FROM kanban_items WHERE item_id='proposal-fixture-entry'"
+        ).fetchone()["provenance_json"]
+    )["proposal_surface"]
+    assert proposal_lifecycle["status"] == "processed"
+    assert proposal_lifecycle["response_id"] == result["response_id"]
+    assert proposal_lifecycle["outcome_type"] == "accepted"
 
     superseding = asyncio.run(
         routes_personal.process_work_proposal_response(
