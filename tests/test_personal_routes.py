@@ -61,6 +61,8 @@ from app.kanban_datastore import (  # noqa: E402
     load_kanban_datastore_config,
 )
 
+VERBATIM_OPERATOR_REQUEST_FIXTURE = "I want you to set-up a subagent to check and if necessary update the pre-processing (Kanban) process so that whenever I ask you to do something and put it in the kanban cards, you'll include a verbatim copy of my request(s).  That should be in your kanban skill and the pre-processing to make sure that's the case.  And part of the implementation plans put into the kanban cards should always including checking outcomes against original verbatim requests.  While deviations might be allowed as implementations evolve, there should always be very very good reasons that do not violate the intent of the original request (verbatim) without Operator approval or necessity from because of contradictions or impossibilities etc. in the original request discovered during implementation phases if not caught during pre-processing seeking operator approval then.  This should be a relatively small change the subagent can test and verify and commit and push.  It should not take hours.  The operator will be away so you'll have to pose as the Operator for testing."
+
 
 def _preprocessing_contract_fields(
     *, recommended_mode: str = "serial", unit_title: str = "Implement the scoped leaf"
@@ -14763,3 +14765,157 @@ def test_personal_automation_signatures_and_skip_gate(monkeypatch, tmp_path):
         )
     signature_three = automation.source_signature(local_date="2026-06-18", kind="browser-links")
     assert signature_three != signature_one
+
+
+def test_preprocessing_preserves_tagged_operator_requests_and_steers_exactly(monkeypatch):
+    first_steer = "  Keep  two spaces.\nDo not censor FUCKING language.  "
+    second_steer = "Second steer\n\nwith a blank line."
+    item_payload = {
+        "item_id": "verbatim-fixture",
+        "tags": ["kanban", "operator-request-verbatim-v1"],
+        "created_at": "2026-07-15T10:00:00Z",
+        "updated_at": "2026-07-15T10:00:00Z",
+    }
+    monkeypatch.setattr(routes_personal, "_row_to_work_item", lambda item: item_payload)
+    item = {
+        "item_id": "verbatim-fixture",
+        "body_excerpt": VERBATIM_OPERATOR_REQUEST_FIXTURE,
+    }
+    discussions = [
+        {
+            "discussion_id": "operator-request-verbatim-003-second",
+            "created_at": "2026-07-15T10:03:00Z",
+            "author": "codex-test-fixture",
+            "document": {"body": second_steer},
+        },
+        {
+            "discussion_id": "operator-request-verbatim-002-first",
+            "created_at": "2026-07-15T10:01:00Z",
+            "author": "codex-test-fixture",
+            "document": {"body": first_steer},
+        },
+    ]
+
+    record = routes_personal._work_preprocessing_original_operator_requests(
+        item,
+        discussions,
+    )
+
+    assert [entry["sequence"] for entry in record["records"]] == [1, 2, 3]
+    assert [entry["text"] for entry in record["records"]] == [
+        VERBATIM_OPERATOR_REQUEST_FIXTURE,
+        first_steer,
+        second_steer,
+    ]
+    assert record["records"][0]["text"].encode() == VERBATIM_OPERATOR_REQUEST_FIXTURE.encode()
+    assert record["records"][1]["text"].encode() == first_steer.encode()
+
+    messages = routes_personal._work_preprocessing_local_ai_messages(
+        item=item,
+        source={"schema": "test-source"},
+        detail_document={"body": "Test-only implementation plan."},
+        review_document={"body": ""},
+        discussions=discussions,
+        recent_commits=[],
+        recent_decisions=[],
+        ancestor_context={},
+        marker={"marker_id": "test-marker", "document_source_hash": "test-hash"},
+    )
+    provider_payload = json.loads(messages[1]["content"])
+    assert [
+        entry["text"] for entry in provider_payload["original_operator_requests"]["records"]
+    ] == [
+        VERBATIM_OPERATOR_REQUEST_FIXTURE,
+        first_steer,
+        second_steer,
+    ]
+    assert (
+        provider_payload["original_operator_requests"]["records"][1]["text"].encode()
+        == first_steer.encode()
+    )
+
+
+def test_preprocessing_operator_request_assessment_accepts_aligned_comparison():
+    original = {
+        "required": True,
+        "records": [
+            {"source_ref": "kanban_items:verbatim-fixture:body"},
+            {"source_ref": "kanban_discussions:operator-request-verbatim-002-first"},
+        ],
+    }
+
+    assessment = routes_personal._work_preprocessing_operator_request_assessment(
+        {
+            "operator_request_assessment": {
+                "record_refs_in_order": [
+                    "kanban_items:verbatim-fixture:body",
+                    "kanban_discussions:operator-request-verbatim-002-first",
+                ],
+                "alignment": "aligned",
+                "comparison_summary": "Implementation and proof cover both exact requests.",
+                "deviations": [],
+            }
+        },
+        original,
+    )
+
+    assert assessment["alignment"] == "aligned"
+    assert assessment["requires_operator_input"] is False
+
+
+def test_preprocessing_rejects_unjustified_operator_request_deviation():
+    original = {
+        "required": True,
+        "records": [{"source_ref": "kanban_items:verbatim-fixture:body"}],
+    }
+
+    with pytest.raises(ValueError, match="lacks a valid request ref, description, or reason"):
+        routes_personal._work_preprocessing_operator_request_assessment(
+            {
+                "operator_request_assessment": {
+                    "record_refs_in_order": ["kanban_items:verbatim-fixture:body"],
+                    "alignment": "deviation_requires_approval",
+                    "comparison_summary": "A different implementation is proposed.",
+                    "deviations": [
+                        {
+                            "affected_request_ref": "kanban_items:verbatim-fixture:body",
+                            "description": "Replace the request with a summary.",
+                            "reason": "",
+                            "operator_approval_ref": "",
+                            "awaiting_operator": False,
+                        }
+                    ],
+                }
+            },
+            original,
+        )
+
+
+def test_preprocessing_routes_discovered_impossibility_for_operator_approval():
+    original = {
+        "required": True,
+        "records": [{"source_ref": "kanban_items:verbatim-fixture:body"}],
+    }
+
+    assessment = routes_personal._work_preprocessing_operator_request_assessment(
+        {
+            "operator_request_assessment": {
+                "record_refs_in_order": ["kanban_items:verbatim-fixture:body"],
+                "alignment": "impossibility_requires_approval",
+                "comparison_summary": "The API cannot preserve the requested storage form.",
+                "deviations": [
+                    {
+                        "affected_request_ref": "kanban_items:verbatim-fixture:body",
+                        "description": "Use the only storage form accepted by the API.",
+                        "reason": "The requested form is rejected by the authoritative API schema.",
+                        "operator_approval_ref": "",
+                        "awaiting_operator": True,
+                    }
+                ],
+            }
+        },
+        original,
+    )
+
+    assert assessment["requires_operator_input"] is True
+    assert assessment["deviations"][0]["awaiting_operator"] is True
