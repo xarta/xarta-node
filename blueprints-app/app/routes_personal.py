@@ -148,6 +148,9 @@ KANBAN_PROPOSAL_ENTRY_SCHEMA = "xarta.kanban.proposal_entry.v1"
 KANBAN_PROPOSAL_RESPONSE_SCHEMA = "xarta.kanban.proposal_response.v1"
 KANBAN_PROPOSAL_OUTCOME_SCHEMA = "xarta.kanban.proposal_outcome.v1"
 KANBAN_EXECUTION_DIRECTIVE_SCHEMA = "xarta.kanban.preprocessing.execution_directive.v1"
+KANBAN_ORIGINAL_OPERATOR_REQUESTS_SCHEMA = "xarta.kanban.original_operator_requests.v1"
+KANBAN_VERBATIM_OPERATOR_REQUEST_TAG = "operator-request-verbatim-v1"
+KANBAN_VERBATIM_OPERATOR_STEER_PREFIX = "operator-request-verbatim-"
 KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA = "xarta.kanban.automation.idle_worker.contract.v1"
 KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
@@ -18252,6 +18255,167 @@ def _work_preprocessing_guidance_selection(payload: dict[str, Any]) -> dict[str,
     }
 
 
+def _work_preprocessing_original_operator_requests(
+    item: Any,
+    discussions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    item_payload = _row_to_work_item(item)
+    tags = [str(tag) for tag in item_payload.get("tags") or []]
+    required = KANBAN_VERBATIM_OPERATOR_REQUEST_TAG in tags
+    if not required:
+        return {
+            "schema": KANBAN_ORIGINAL_OPERATOR_REQUESTS_SCHEMA,
+            "required": False,
+            "tag": KANBAN_VERBATIM_OPERATOR_REQUEST_TAG,
+            "record_count": 0,
+            "records": [],
+        }
+
+    item_id = str(item_payload.get("item_id") or "")
+    body = str(item["body_excerpt"] or "")
+    records: list[dict[str, Any]] = []
+    if body:
+        records.append(
+            {
+                "sequence": 1,
+                "source_ref": f"kanban_items:{item_id}:body",
+                "source_kind": "item_body",
+                "attribution": "operator_request_verbatim",
+                "created_at": item_payload.get("created_at") or "",
+                "updated_at": item_payload.get("updated_at") or "",
+                "text": body,
+                "text_length": len(body),
+                "content_sha256": _sha256_text(body),
+            }
+        )
+    steering = [
+        discussion
+        for discussion in discussions
+        if str(discussion.get("discussion_id") or "").startswith(
+            KANBAN_VERBATIM_OPERATOR_STEER_PREFIX
+        )
+    ]
+    steering.sort(
+        key=lambda discussion: (
+            str(discussion.get("created_at") or discussion.get("updated_at") or ""),
+            str(discussion.get("discussion_id") or ""),
+        )
+    )
+    for discussion in steering:
+        document = discussion.get("document") or {}
+        text = document.get("body") if isinstance(document.get("body"), str) else ""
+        discussion_id = str(discussion.get("discussion_id") or "")
+        records.append(
+            {
+                "sequence": len(records) + 1,
+                "source_ref": f"kanban_discussions:{discussion_id}",
+                "source_kind": "steering_discussion",
+                "attribution": "operator_steering_verbatim",
+                "captured_by": discussion.get("author") or "",
+                "created_at": discussion.get("created_at") or "",
+                "updated_at": discussion.get("updated_at") or "",
+                "text": text,
+                "text_length": len(text),
+                "content_sha256": _sha256_text(text),
+            }
+        )
+    return {
+        "schema": KANBAN_ORIGINAL_OPERATOR_REQUESTS_SCHEMA,
+        "required": True,
+        "tag": KANBAN_VERBATIM_OPERATOR_REQUEST_TAG,
+        "steering_discussion_id_prefix": KANBAN_VERBATIM_OPERATOR_STEER_PREFIX,
+        "record_count": len(records),
+        "records": records,
+    }
+
+
+def _work_preprocessing_operator_request_assessment(
+    payload: dict[str, Any],
+    original_requests: dict[str, Any],
+) -> dict[str, Any]:
+    if not original_requests.get("required"):
+        return {
+            "required": False,
+            "record_refs_in_order": [],
+            "alignment": "not_applicable",
+            "comparison_summary": "",
+            "deviations": [],
+            "requires_operator_input": False,
+        }
+    expected_refs = [
+        str(record.get("source_ref") or "") for record in original_requests.get("records") or []
+    ]
+    if not expected_refs:
+        raise ValueError("tagged verbatim-request card has no original request records")
+    raw = payload.get("operator_request_assessment")
+    if not isinstance(raw, dict):
+        raise ValueError("local AI response missing operator_request_assessment")
+    record_refs = [str(value) for value in raw.get("record_refs_in_order") or []]
+    if record_refs != expected_refs:
+        raise ValueError("operator_request_assessment must preserve every request ref in order")
+    alignment = _clean_short_text(str(raw.get("alignment") or ""), "", limit=80)
+    allowed = {
+        "aligned",
+        "deviation_requires_approval",
+        "contradiction_requires_approval",
+        "impossibility_requires_approval",
+        "necessary_constraint_requires_approval",
+    }
+    if alignment not in allowed:
+        raise ValueError("operator_request_assessment alignment is invalid")
+    comparison_summary = _body_excerpt(str(raw.get("comparison_summary") or ""), limit=4000).strip()
+    if not comparison_summary:
+        raise ValueError("operator_request_assessment comparison_summary is required")
+    raw_deviations = raw.get("deviations")
+    if not isinstance(raw_deviations, list):
+        raise ValueError("operator_request_assessment deviations must be a list")
+    deviations: list[dict[str, Any]] = []
+    for index, value in enumerate(raw_deviations[:12]):
+        if not isinstance(value, dict):
+            raise ValueError(f"operator_request_assessment deviations[{index}] must be an object")
+        affected_ref = _clean_short_text(
+            str(value.get("affected_request_ref") or ""), "", limit=260
+        )
+        description = _body_excerpt(str(value.get("description") or ""), limit=3000).strip()
+        reason = _body_excerpt(str(value.get("reason") or ""), limit=3000).strip()
+        approval_ref = _clean_short_text(
+            str(value.get("operator_approval_ref") or ""), "", limit=260
+        )
+        awaiting_operator = bool(value.get("awaiting_operator"))
+        if affected_ref not in expected_refs or not description or not reason:
+            raise ValueError(
+                f"operator_request_assessment deviations[{index}] lacks a valid request ref, description, or reason"
+            )
+        if not approval_ref and not awaiting_operator:
+            raise ValueError(
+                f"operator_request_assessment deviations[{index}] lacks approval or awaiting_operator"
+            )
+        deviations.append(
+            {
+                "affected_request_ref": affected_ref,
+                "description": description,
+                "reason": reason,
+                "operator_approval_ref": approval_ref,
+                "awaiting_operator": awaiting_operator,
+            }
+        )
+    if alignment == "aligned" and deviations:
+        raise ValueError("aligned operator_request_assessment cannot contain deviations")
+    if alignment != "aligned" and not deviations:
+        raise ValueError("deviation operator_request_assessment requires a specific deviation")
+    return {
+        "required": True,
+        "record_refs_in_order": record_refs,
+        "alignment": alignment,
+        "comparison_summary": comparison_summary,
+        "deviations": deviations,
+        "requires_operator_input": any(
+            deviation["awaiting_operator"] and not deviation["operator_approval_ref"]
+            for deviation in deviations
+        ),
+    }
+
+
 def _work_preprocessing_execution_directive(payload: dict[str, Any]) -> dict[str, Any]:
     raw = payload.get("execution_directive")
     if not isinstance(raw, dict):
@@ -18968,6 +19132,10 @@ def _work_preprocessing_local_ai_messages(
     ancestor_context: dict[str, Any],
     marker: dict[str, Any],
 ) -> list[dict[str, str]]:
+    original_operator_requests = _work_preprocessing_original_operator_requests(
+        item,
+        discussions,
+    )
     context = {
         "schema": "xarta.kanban.preprocessing.hermes_profile_input.v1",
         "task_kind": "kanban_preprocessing",
@@ -18997,6 +19165,7 @@ def _work_preprocessing_local_ai_messages(
                 for discussion in discussions[:6]
             ],
         },
+        "original_operator_requests": original_operator_requests,
         "evidence": {
             "recent_commits": recent_commits[:8],
             "recent_decisions": recent_decisions[:8],
@@ -19004,6 +19173,9 @@ def _work_preprocessing_local_ai_messages(
         },
         "engineering_guidance_catalog": _work_preprocessing_guidance_catalog_payload(),
         "hard_rules": [
+            "When original_operator_requests.required=true, compare the proposed decomposition, execution directive, implementation acceptance, and proof against every verbatim record in sequence. Never normalize, paraphrase, censor, or silently omit request text.",
+            "Return an operator_request_assessment for every tagged verbatim-request card. It must name every supplied source_ref in order and state whether the plan is aligned or proposes a deviation.",
+            "An intent-changing deviation needs a specific reason and durable explicit Operator approval. If a contradiction, impossibility, or necessary constraint is discovered without approval, return a lifecycle proposal entry, keep ready=false, and route the item to awaiting_operator before implementation.",
             "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
             "If the item lacks enough information to implement safely, ready must be false and decomposition_items must contain the concrete child work items needed to make progress.",
             "Preprocessing prepares the Kanban tree for agents; do not only list work in prose when child cards should be created.",
@@ -19076,6 +19248,20 @@ def _work_preprocessing_local_ai_messages(
                     "proof_refs": ["source/proof refs"],
                 }
             ],
+            "operator_request_assessment": {
+                "record_refs_in_order": ["kanban_items:<id>:body"],
+                "alignment": "aligned|deviation_requires_approval|contradiction_requires_approval|impossibility_requires_approval|necessary_constraint_requires_approval",
+                "comparison_summary": "how the proposed work and proof satisfy every verbatim request in sequence",
+                "deviations": [
+                    {
+                        "affected_request_ref": "source ref",
+                        "description": "specific deviation",
+                        "reason": "specific reason",
+                        "operator_approval_ref": "durable decision ref or empty",
+                        "awaiting_operator": True,
+                    }
+                ],
+            },
             "execution_directive": {
                 "recommended_mode": "serial|shared_worktree_parallel|isolated_worktrees|remote_node|delayed_overnight",
                 "rationale": "whole-context semantic rationale",
@@ -19613,7 +19799,19 @@ def _work_preprocessing_idle_marker_context_sync(item_id: str) -> dict[str, Any]
             """,
             (item_id,),
         ).fetchall()
-        discussions = [_row_to_work_discussion(row, conn) for row in discussion_rows]
+        verbatim_discussion_rows = conn.execute(
+            """
+            SELECT * FROM kanban_discussions
+            WHERE item_id=? AND status!='archived' AND discussion_id LIKE ?
+            ORDER BY created_at ASC, discussion_id ASC
+            LIMIT 64
+            """,
+            (item_id, f"{KANBAN_VERBATIM_OPERATOR_STEER_PREFIX}%"),
+        ).fetchall()
+        discussion_rows_by_id = {
+            str(row["discussion_id"]): row for row in [*discussion_rows, *verbatim_discussion_rows]
+        }
+        discussions = [_row_to_work_discussion(row, conn) for row in discussion_rows_by_id.values()]
         commit_rows = conn.execute(
             """
             SELECT * FROM kanban_item_commits
@@ -19839,6 +20037,20 @@ async def _process_work_preprocessing_idle_marker(
     engineering_guidance = _work_preprocessing_guidance_selection(payload)
     execution_directive = _work_preprocessing_execution_directive(payload)
     proposal_entries = _work_preprocessing_proposal_entries(payload)
+    original_operator_requests = _work_preprocessing_original_operator_requests(
+        item,
+        discussions,
+    )
+    operator_request_assessment = _work_preprocessing_operator_request_assessment(
+        payload,
+        original_operator_requests,
+    )
+    if operator_request_assessment["requires_operator_input"] and not any(
+        entry["lifecycle_required"] for entry in proposal_entries
+    ):
+        raise ValueError(
+            "operator_request_assessment awaiting_operator requires a lifecycle proposal entry"
+        )
     ready = bool(payload.get("ready"))
     raw_outcome_type = payload.get("outcome_type")
     outcome_type = _clean_short_text(
