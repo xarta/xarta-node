@@ -144,6 +144,10 @@ KANBAN_REVIEW_RETRY_BACKOFF_SECONDS = (
 KANBAN_PREPROCESSING_READINESS_CONTRACT_SCHEMA = "xarta.kanban.preprocessing.readiness_contract.v1"
 KANBAN_PREPROCESSING_QUEUE_SCHEMA = "xarta.kanban.preprocessing.queue.v1"
 KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contract.v1"
+KANBAN_PROPOSAL_ENTRY_SCHEMA = "xarta.kanban.proposal_entry.v1"
+KANBAN_PROPOSAL_RESPONSE_SCHEMA = "xarta.kanban.proposal_response.v1"
+KANBAN_PROPOSAL_OUTCOME_SCHEMA = "xarta.kanban.proposal_outcome.v1"
+KANBAN_EXECUTION_DIRECTIVE_SCHEMA = "xarta.kanban.preprocessing.execution_directive.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA = "xarta.kanban.automation.idle_worker.contract.v1"
 KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
@@ -1152,6 +1156,35 @@ class WorkReviewDecisionCreateRequest(BaseModel):
     metadata: dict[str, Any] = {}
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-api"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkProposalInboxCreateRequest(BaseModel):
+    entry_id: str | None = None
+    entry_type: str = "proposal"
+    title: str
+    summary: str
+    rationale: str
+    requested_operator_action: str
+    exact_decision_needed: str
+    source_item_refs: list[str]
+    semantic_owner_item_ref: str | None = None
+    proof_refs: list[str] = []
+    lifecycle_required: bool = True
+    priority_id: str = "high"
+    metadata: dict[str, Any] = {}
+    actor: str = "agent"
+    source_surface: str = "kanban-automation"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkProposalResponseRequest(BaseModel):
+    response_text: str
+    response_id: str | None = None
+    actor: str = "operator"
+    source_surface: str = "kanban-automation-status"
     request_id: str | None = None
     run_id: str | None = None
 
@@ -2555,7 +2588,11 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
     return {
         "schema": KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA,
         "status": "active",
-        "version": "2026-06-27",
+        "version": "2026-07-15",
+        "entry_schema": KANBAN_PROPOSAL_ENTRY_SCHEMA,
+        "response_schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+        "outcome_schema": KANBAN_PROPOSAL_OUTCOME_SCHEMA,
+        "execution_directive_schema": KANBAN_EXECUTION_DIRECTIVE_SCHEMA,
         "surface_root": {
             "item_id": KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
             "uri": _kanban_item_uri(KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID),
@@ -2581,8 +2618,11 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
                 "entry_type",
                 "title",
                 "summary",
+                "rationale",
                 "requested_operator_action",
+                "exact_decision_needed",
                 "source_item_refs",
+                "links",
                 "actor",
                 "created_at",
                 "status",
@@ -2628,6 +2668,11 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
         },
         "status_integration": {
             "automation_status_field": "proposal_surfaces",
+            "status_endpoint": "/api/v1/personal/kanban/automation/proposal-surfaces/status",
+            "producer_endpoint": "/api/v1/personal/kanban/automation/proposal-surfaces/inbox",
+            "response_endpoint_template": (
+                "/api/v1/personal/kanban/automation/proposal-surfaces/inbox/{item_id}/responses"
+            ),
             "operator_visible": True,
             "expected_surfaces": [
                 "automation status modal",
@@ -2639,8 +2684,1010 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
             "Proposal surfaces are interaction surfaces, not substitutes for implementation workstream cards.",
             "Autonomous decisions must be written in clear natural Kanban language with affected refs and proof refs.",
             "Code-producing outcomes are accepted only after pre-commit issues are fixed and explicit commit links exist.",
-            "Use local AI processing while the active processing policy is local.",
+            "Operator authority comes from the operator response surface; the classifier interprets scope but cannot manufacture authority.",
+            "Interpret approvals, choices, deferrals, and follow-ups from the whole utterance and bounded current state through the configured Hermes classifier; lexical matches never decide meaning.",
+            "Use the configured required Hermes Kanban profile and record route attempts; never substitute deterministic semantic fallback.",
         ],
+    }
+
+
+def _clean_work_proposal_entry_type(value: Any) -> str:
+    entry_type = _clean_short_text(str(value or ""), "proposal", limit=80).replace("-", "_")
+    allowed = {
+        "proposal",
+        "question",
+        "approval_request",
+        "review_processor_follow_up",
+        "operator_follow_up",
+    }
+    if entry_type not in allowed:
+        raise HTTPException(422, "Unsupported proposal INBOX entry_type")
+    return entry_type
+
+
+def _proposal_item_id_from_ref(value: Any) -> str:
+    clean = _clean_short_text(str(value or ""), "", limit=260)
+    return _kanban_item_id_from_share_ref(clean) or _clean_short_text(clean, "", limit=180)
+
+
+def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any]:
+    item = _row_to_work_item(row)
+    provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+    proposal = (
+        provenance.get("proposal_surface")
+        if isinstance(provenance.get("proposal_surface"), dict)
+        else {}
+    )
+    link_rows = conn.execute(
+        """
+        SELECT * FROM kanban_item_links
+        WHERE source_item_id=? OR target_item_id=?
+        ORDER BY updated_at DESC, link_id
+        """,
+        (row["item_id"], row["item_id"]),
+    ).fetchall()
+    source_refs: list[str] = list(proposal.get("source_item_refs") or [])
+    outcome_refs: list[str] = []
+    implementation_refs: list[str] = []
+    links: list[dict[str, Any]] = []
+    for link_row in link_rows:
+        metadata = _json_value(link_row["metadata_json"], {})
+        other_id = (
+            link_row["target_item_id"]
+            if link_row["source_item_id"] == row["item_id"]
+            else link_row["source_item_id"]
+        )
+        role = _clean_short_text(str(metadata.get("role") or ""), "", limit=100)
+        ref = _kanban_item_uri(other_id)
+        if role in {"processed_outcome", "outcome", "source_inbox"} and ref not in outcome_refs:
+            outcome_refs.append(ref)
+        if (
+            role
+            in {
+                "implementation_owner",
+                "accepted_implementation_owner",
+                "affected_work",
+                "semantic_owner",
+            }
+            and ref not in implementation_refs
+        ):
+            implementation_refs.append(ref)
+        if role in {"source_item", "source_context"} and ref not in source_refs:
+            source_refs.append(ref)
+        links.append(
+            {
+                "link_id": link_row["link_id"],
+                "item_ref": ref,
+                "link_type": link_row["link_type"],
+                "role": role,
+            }
+        )
+    decision_row = conn.execute(
+        """
+        SELECT * FROM kanban_review_decisions
+        WHERE item_id=? AND processor_kind IN ('proposal', 'proposal_response')
+        ORDER BY updated_at DESC, created_at DESC, decision_id
+        LIMIT 1
+        """,
+        (row["item_id"],),
+    ).fetchone()
+    decision_metadata = _json_value(decision_row["metadata_json"], {}) if decision_row else {}
+    response_state = (
+        decision_metadata.get("response_state")
+        if isinstance(decision_metadata.get("response_state"), dict)
+        else {}
+    )
+    processed = row["state_id"] == "done" or bool(proposal.get("processed_at"))
+    retry_state = _clean_short_text(
+        str(response_state.get("retry_state") or proposal.get("retry_state") or ""),
+        "",
+        limit=80,
+    )
+    return {
+        "item_id": row["item_id"],
+        "uri": _kanban_item_uri(row["item_id"]),
+        "title": row["title"],
+        "summary": proposal.get("summary") or row["body_excerpt"],
+        "state_id": row["state_id"],
+        "status": row["status"],
+        "entry_type": proposal.get("entry_type") or "",
+        "proposal_status": (
+            proposal.get("status")
+            or ("processed" if processed else ("failed" if retry_state else "pending"))
+        ),
+        "requested_operator_action": proposal.get("requested_operator_action") or "",
+        "exact_decision_needed": proposal.get("exact_decision_needed") or "",
+        "source_item_refs": source_refs,
+        "outcome_refs": outcome_refs,
+        "implementation_refs": implementation_refs,
+        "links": links,
+        "processed": processed,
+        "retry_state": retry_state,
+        "failure": response_state.get("failure") or proposal.get("failure") or "",
+        "latest_decision_id": decision_row["decision_id"] if decision_row else "",
+        "latest_decision_type": decision_row["decision_type"] if decision_row else "",
+        "updated_at": row["updated_at"],
+    }
+
+
+def _work_proposal_surfaces_status_sync(limit: int = 20) -> dict[str, Any]:
+    contract = _work_proposal_surfaces_contract()
+    with get_conn() as conn:
+        surfaces: dict[str, dict[str, Any]] = {}
+        for name, parent_id in (
+            ("inbox", KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID),
+            ("outbox", KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID),
+        ):
+            rows = conn.execute(
+                """
+                SELECT * FROM kanban_items
+                WHERE parent_item_id=? AND status != 'archived'
+                ORDER BY updated_at DESC, item_id
+                LIMIT ?
+                """,
+                (parent_id, max(1, min(int(limit or 20), 100))),
+            ).fetchall()
+            total_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM kanban_items WHERE parent_item_id=? AND status != 'archived'",
+                (parent_id,),
+            ).fetchone()
+            entries = [_work_proposal_surface_item_projection(conn, row) for row in rows]
+            surfaces[name] = {
+                **dict(contract[name]),
+                "count": int(total_row["count"] if total_row else 0),
+                "open_count": sum(1 for entry in entries if not entry["processed"]),
+                "processed_count": sum(1 for entry in entries if entry["processed"]),
+                "failed_count": sum(1 for entry in entries if entry["failure"]),
+                "retry_count": sum(1 for entry in entries if entry["retry_state"]),
+                "entries": entries,
+            }
+    return {
+        **_compact_work_contract_header(contract),
+        "surface_root": contract["surface_root"],
+        "workstream": contract["workstream"],
+        "inbox": surfaces["inbox"],
+        "outbox": surfaces["outbox"],
+        "producer_endpoint": contract["status_integration"]["producer_endpoint"],
+        "response_endpoint_template": contract["status_integration"]["response_endpoint_template"],
+        "generated_at": _utc_now_iso(),
+    }
+
+
+def _proposal_markdown_body(
+    *,
+    entry_type: str,
+    summary: str,
+    rationale: str,
+    requested_operator_action: str,
+    exact_decision_needed: str,
+    source_item_refs: list[str],
+) -> str:
+    refs = "\n".join(f"- `{ref}`" for ref in source_item_refs)
+    return (
+        f"Proposal type: `{entry_type}`\n\n"
+        f"{summary}\n\n"
+        f"Rationale: {rationale}\n\n"
+        f"Requested operator action: {requested_operator_action}\n\n"
+        f"Exact decision needed: {exact_decision_needed}\n\n"
+        f"Source items:\n{refs}"
+    )
+
+
+def _create_work_proposal_inbox_sync(body: WorkProposalInboxCreateRequest) -> dict[str, Any]:
+    entry_type = _clean_work_proposal_entry_type(body.entry_type)
+    title = _clean_short_text(body.title, "", limit=180)
+    summary = _body_excerpt(body.summary, limit=6000).strip()
+    rationale = _body_excerpt(body.rationale, limit=6000).strip()
+    requested_action = _body_excerpt(body.requested_operator_action, limit=4000).strip()
+    exact_decision = _body_excerpt(body.exact_decision_needed, limit=4000).strip()
+    source_refs = _clean_event_list(body.source_item_refs, limit=32)
+    if not title or not summary or not rationale or not source_refs:
+        raise HTTPException(
+            422, "Proposal title, summary, rationale, and source_item_refs are required"
+        )
+    if body.lifecycle_required and (not requested_action or not exact_decision):
+        raise HTTPException(
+            422,
+            "Lifecycle-bearing proposal entries require requested_operator_action and exact_decision_needed",
+        )
+    semantic_owner_id = _proposal_item_id_from_ref(body.semantic_owner_item_ref)
+    forbidden_owners = {
+        KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
+        KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+        KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID,
+    }
+    if semantic_owner_id in forbidden_owners:
+        raise HTTPException(422, "INBOX and OUTBOX surfaces cannot own implementation work")
+    source_hash = _hash_json_payload(
+        {
+            "schema": KANBAN_PROPOSAL_ENTRY_SCHEMA,
+            "entry_type": entry_type,
+            "title": title,
+            "summary": summary,
+            "rationale": rationale,
+            "requested_operator_action": requested_action,
+            "exact_decision_needed": exact_decision,
+            "source_item_refs": source_refs,
+            "semantic_owner_item_id": semantic_owner_id,
+            "lifecycle_required": bool(body.lifecycle_required),
+            "metadata": dict(body.metadata or {}),
+        }
+    )
+    digest = source_hash.removeprefix("sha256:")
+    if not body.lifecycle_required:
+        discussion_id = _clean_work_id(
+            body.entry_id or f"kanban-discussion-proposal-note-{digest[:20]}",
+            "kanban-discussion-proposal-note",
+        )
+        note_body = f"{title}\n\n{summary}\n\nSource: {', '.join(source_refs)}"
+        try:
+            result = _create_work_discussion_sync(
+                KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+                WorkDiscussionCreateRequest(
+                    discussion_id=discussion_id,
+                    body=note_body,
+                    author=body.actor,
+                    status="closed",
+                    actor=body.actor,
+                    source_surface=body.source_surface,
+                    request_id=body.request_id,
+                    run_id=body.run_id,
+                ),
+            )
+            replay = False
+        except HTTPException as exc:
+            if exc.status_code != 409:
+                raise
+            with get_conn() as conn:
+                existing = conn.execute(
+                    "SELECT * FROM kanban_discussions WHERE discussion_id=?",
+                    (discussion_id,),
+                ).fetchone()
+            if not existing or existing["body_excerpt"] != _body_excerpt(note_body, limit=4000):
+                raise HTTPException(409, "Proposal note identity conflicts with existing content")
+            result = {"ok": True, "discussion": _row_to_work_discussion(existing)}
+            replay = True
+        return {
+            "ok": True,
+            "kind": "discussion",
+            "idempotent_replay": replay,
+            "source_hash": source_hash,
+            **result,
+        }
+
+    item_id = _clean_work_id(
+        body.entry_id or f"kanban-inbox-{entry_type}-{digest[:20]}",
+        "kanban-inbox",
+    )
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    with get_conn() as conn:
+        _work_item_or_404(conn, KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID)
+        resolved_source_ids: list[str] = []
+        for ref in source_refs:
+            source_id = _proposal_item_id_from_ref(ref)
+            if not source_id:
+                raise HTTPException(422, f"Proposal source ref is not a Kanban item: {ref}")
+            _work_item_or_404(conn, source_id)
+            resolved_source_ids.append(source_id)
+        if semantic_owner_id:
+            _work_item_or_404(conn, semantic_owner_id)
+        existing = conn.execute(
+            "SELECT * FROM kanban_items WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        if existing:
+            proposal = _json_value(existing["provenance_json"], {}).get("proposal_surface", {})
+            if proposal.get("source_hash") != source_hash:
+                raise HTTPException(409, "Proposal entry identity conflicts with existing content")
+            item_row = existing
+            idempotent_replay = True
+        else:
+            request = WorkItemCreateRequest(
+                item_id=item_id,
+                parent_item_id=KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+                title=title,
+                body=_proposal_markdown_body(
+                    entry_type=entry_type,
+                    summary=summary,
+                    rationale=rationale,
+                    requested_operator_action=requested_action,
+                    exact_decision_needed=exact_decision,
+                    source_item_refs=source_refs,
+                ),
+                state_id="todo",
+                priority_id=body.priority_id,
+                automation_excluded=True,
+                tags=["proposal-surface", "inbox", entry_type, "awaiting-operator"],
+                actor=body.actor,
+                source_surface=body.source_surface,
+                request_id=body.request_id,
+                run_id=body.run_id,
+            )
+            payload = _work_item_payload(conn, request)
+            payload["provenance"]["proposal_surface"] = {
+                "schema": KANBAN_PROPOSAL_ENTRY_SCHEMA,
+                "entry_type": entry_type,
+                "status": "pending",
+                "summary": summary,
+                "rationale": rationale,
+                "requested_operator_action": requested_action,
+                "exact_decision_needed": exact_decision,
+                "source_item_refs": source_refs,
+                "semantic_owner_item_id": semantic_owner_id,
+                "proof_refs": _clean_event_list(body.proof_refs, limit=32),
+                "source_hash": source_hash,
+                "metadata": dict(body.metadata or {}),
+                "created_at": now,
+            }
+            payload["source_hash"] = _hash_json_payload(payload)
+            item_row, audit_row = _insert_work_item(
+                conn,
+                payload,
+                action="create_proposal_inbox_entry",
+                audit_id=audit_id,
+                now=now,
+            )
+            gen = _kanban_table_sync_gen(conn, "kanban-proposal-inbox")
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(item_row), gen)
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+            idempotent_replay = False
+    links: list[dict[str, Any]] = []
+    for source_id in resolved_source_ids:
+        links.append(
+            _create_work_item_link_sync(
+                item_id,
+                WorkItemLinkCreateRequest(
+                    target_item_id=source_id,
+                    link_type="references",
+                    metadata={"role": "source_item", "proposal_source_hash": source_hash},
+                    actor=body.actor,
+                    source_surface=body.source_surface,
+                    request_id=body.request_id,
+                    run_id=body.run_id,
+                ),
+            )["link"]
+        )
+    if semantic_owner_id:
+        links.append(
+            _create_work_item_link_sync(
+                item_id,
+                WorkItemLinkCreateRequest(
+                    target_item_id=semantic_owner_id,
+                    link_type="references",
+                    metadata={"role": "semantic_owner", "proposal_source_hash": source_hash},
+                    actor=body.actor,
+                    source_surface=body.source_surface,
+                    request_id=body.request_id,
+                    run_id=body.run_id,
+                ),
+            )["link"]
+        )
+    return {
+        "ok": True,
+        "kind": "item",
+        "item": _row_to_work_item(item_row),
+        "source_hash": source_hash,
+        "links": links,
+        "idempotent_replay": idempotent_replay,
+    }
+
+
+def _prepare_work_proposal_response_sync(
+    item_id: str, body: WorkProposalResponseRequest
+) -> dict[str, Any]:
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    response_text = _normalise_markdown_document_body(body.response_text).strip()
+    if not response_text:
+        raise HTTPException(422, "Operator response_text is required")
+    with get_conn() as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        if item["parent_item_id"] != KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID:
+            raise HTTPException(422, "Operator responses are accepted only for INBOX entries")
+        provenance = _json_value(item["provenance_json"], {})
+        proposal = (
+            provenance.get("proposal_surface")
+            if isinstance(provenance.get("proposal_surface"), dict)
+            else {}
+        )
+        if not proposal:
+            proposal = {
+                "schema": KANBAN_PROPOSAL_ENTRY_SCHEMA,
+                "entry_type": "approval_request",
+                "status": "pending",
+                "summary": item["body_excerpt"] or item["title"],
+                "rationale": "Legacy proposal entry migrated by the response consumer.",
+                "requested_operator_action": "Respond to this INBOX entry.",
+                "exact_decision_needed": item["title"],
+                "source_item_refs": [],
+                "semantic_owner_item_id": "",
+                "source_hash": item["source_hash"],
+            }
+        source_hash = _hash_json_payload(
+            {
+                "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+                "item_id": clean_item_id,
+                "proposal_source_hash": proposal.get("source_hash") or item["source_hash"],
+                "response_text": response_text,
+                "authority": "operator",
+            }
+        )
+        digest = source_hash.removeprefix("sha256:")
+        response_id = _clean_work_id(
+            body.response_id or f"proposal-response-{clean_item_id}-{digest[:16]}",
+            "proposal-response",
+        )
+        decision_id = _clean_work_id(
+            f"kanban-decision-{response_id}",
+            "kanban-decision-proposal-response",
+        )
+        discussion_id = _clean_work_id(f"kanban-discussion-{response_id}", "kanban-discussion")
+        existing_decision = conn.execute(
+            "SELECT * FROM kanban_review_decisions WHERE decision_id=?",
+            (decision_id,),
+        ).fetchone()
+        existing_discussion = conn.execute(
+            "SELECT * FROM kanban_discussions WHERE discussion_id=?",
+            (discussion_id,),
+        ).fetchone()
+        if existing_decision:
+            existing_metadata = _json_value(existing_decision["metadata_json"], {})
+            if existing_metadata.get("response_source_hash") != source_hash:
+                raise HTTPException(
+                    409, "Proposal response_id conflicts with a different operator response"
+                )
+        if existing_discussion and existing_discussion["body_excerpt"] != _body_excerpt(
+            response_text, limit=4000
+        ):
+            raise HTTPException(
+                409, "Proposal response_id discussion conflicts with different content"
+            )
+        linked_rows = conn.execute(
+            """
+            SELECT linked.* FROM kanban_item_links link
+            JOIN kanban_items linked ON linked.item_id = CASE
+              WHEN link.source_item_id=? THEN link.target_item_id ELSE link.source_item_id END
+            WHERE link.source_item_id=? OR link.target_item_id=?
+            ORDER BY linked.updated_at DESC, linked.item_id
+            LIMIT 24
+            """,
+            (clean_item_id, clean_item_id, clean_item_id),
+        ).fetchall()
+        prior_decisions = conn.execute(
+            """
+            SELECT * FROM kanban_review_decisions
+            WHERE item_id=? AND processor_kind='proposal_response'
+            ORDER BY updated_at DESC, decision_id
+            LIMIT 12
+            """,
+            (clean_item_id,),
+        ).fetchall()
+    try:
+        _create_work_discussion_sync(
+            clean_item_id,
+            WorkDiscussionCreateRequest(
+                discussion_id=discussion_id,
+                body=response_text,
+                author="operator",
+                status="closed",
+                actor=body.actor,
+                source_surface=body.source_surface,
+                request_id=body.request_id,
+                run_id=body.run_id,
+            ),
+        )
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+    return {
+        "item": _row_to_work_item(item),
+        "proposal": proposal,
+        "response_text": response_text,
+        "response_id": response_id,
+        "discussion_id": discussion_id,
+        "source_hash": source_hash,
+        "decision_id": decision_id,
+        "existing_decision": (
+            _row_to_work_review_decision(existing_decision, []) if existing_decision else None
+        ),
+        "linked_items": [_row_to_work_item(row) for row in linked_rows],
+        "prior_decisions": [_row_to_work_review_decision(row, []) for row in prior_decisions],
+    }
+
+
+def _work_proposal_response_classifier_messages(prepared: dict[str, Any]) -> list[dict[str, str]]:
+    context = {
+        "schema": "xarta.kanban.proposal_response_classifier_input.v1",
+        "task_kind": "proposal_response_classification",
+        "authority": {
+            "kind": "operator",
+            "established_by": "server-owned operator response endpoint",
+            "rule": "Interpret scope only; never infer or expand authority beyond the response and proposal.",
+        },
+        "proposal_item": prepared["item"],
+        "proposal_contract": prepared["proposal"],
+        "operator_response": prepared["response_text"],
+        "linked_items": prepared["linked_items"],
+        "prior_response_decisions": prepared["prior_decisions"],
+        "hard_rules": [
+            "Use the whole utterance, proposal context, linked current state, and prior decisions.",
+            "Words and regex matches are weak lexical evidence and may never decide the outcome by themselves.",
+            "Distinguish explicit operator authority from agent inference.",
+            "Record exact selected choices and bounded best-judgment choices with evidence.",
+            "Do not parent implementation work under INBOX or OUTBOX.",
+            "If the response is ambiguous, return deferred or partial with remaining_questions; do not guess authority.",
+        ],
+        "required_output": {
+            "outcome_type": "accepted|partial|rejected|deferred|follow_up",
+            "title": "short outcome title",
+            "summary": "plain-language interpretation",
+            "rationale": "whole-context reasoning",
+            "confidence": "low|medium|high",
+            "uncertainty": "remaining uncertainty",
+            "selected_choices": [{"choice": "exact choice", "evidence": "response evidence"}],
+            "best_judgment_authorized": False,
+            "agent_choices": [{"choice": "bounded choice", "evidence": "why allowed"}],
+            "remaining_questions": ["exact unresolved question"],
+            "implementation_actions": [
+                {
+                    "title": "bounded follow-up work",
+                    "body": "scope and acceptance",
+                    "requires_new_card": True,
+                    "priority_id": "critical|high|medium|low",
+                }
+            ],
+            "affected_item_refs": ["xarta-kanban:item:<id>"],
+            "proof_refs": ["durable proof ref"],
+        },
+    }
+    return [
+        {"role": "system", "content": PREPROCESSING_SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(context, ensure_ascii=True, sort_keys=True)},
+    ]
+
+
+def _normalize_work_proposal_response_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    outcome_type = _clean_short_text(str(payload.get("outcome_type") or ""), "", limit=40).replace(
+        "-", "_"
+    )
+    if outcome_type not in {"accepted", "partial", "rejected", "deferred", "follow_up"}:
+        raise ValueError("proposal response classifier returned invalid outcome_type")
+    summary = _local_ai_required_text(payload, "summary", limit=8000)
+    rationale = _local_ai_required_text(payload, "rationale", limit=12000)
+
+    def clean_object_list(key: str, *, limit: int = 24) -> list[dict[str, Any]]:
+        values = payload.get(key)
+        if not isinstance(values, list):
+            return []
+        return [dict(value) for value in values[:limit] if isinstance(value, dict)]
+
+    actions: list[dict[str, Any]] = []
+    for raw in clean_object_list("implementation_actions", limit=12):
+        title = _clean_short_text(str(raw.get("title") or ""), "", limit=180)
+        body = _body_excerpt(str(raw.get("body") or ""), limit=6000)
+        if not title or not body:
+            continue
+        priority = _clean_short_text(str(raw.get("priority_id") or "medium"), "medium", limit=20)
+        if priority not in {"critical", "high", "medium", "low"}:
+            priority = "medium"
+        actions.append(
+            {
+                "title": title,
+                "body": body,
+                "requires_new_card": bool(raw.get("requires_new_card")),
+                "priority_id": priority,
+            }
+        )
+    remaining = (
+        [
+            _body_excerpt(str(value or ""), limit=2000)
+            for value in (payload.get("remaining_questions") or [])[:12]
+            if _body_excerpt(str(value or ""), limit=2000)
+        ]
+        if isinstance(payload.get("remaining_questions"), list)
+        else []
+    )
+    if outcome_type in {"partial", "follow_up"} and not remaining and not actions:
+        raise ValueError("partial/follow_up response requires an action or remaining question")
+    if outcome_type in {"rejected", "deferred"} and any(
+        action["requires_new_card"] for action in actions
+    ):
+        raise ValueError("rejected/deferred response cannot create implementation work")
+    return {
+        "outcome_type": outcome_type,
+        "title": _clean_short_text(str(payload.get("title") or summary), summary[:180], limit=180),
+        "summary": summary,
+        "rationale": rationale,
+        "confidence": _clean_short_text(str(payload.get("confidence") or ""), "", limit=40),
+        "uncertainty": _body_excerpt(str(payload.get("uncertainty") or ""), limit=4000),
+        "selected_choices": clean_object_list("selected_choices"),
+        "best_judgment_authorized": bool(payload.get("best_judgment_authorized")),
+        "agent_choices": clean_object_list("agent_choices"),
+        "remaining_questions": remaining,
+        "implementation_actions": actions,
+        "affected_item_refs": _local_ai_ref_list(payload, "affected_item_refs"),
+        "proof_refs": _local_ai_ref_list(payload, "proof_refs"),
+    }
+
+
+def _ensure_work_proposal_artifact_item_sync(
+    *,
+    item_id: str,
+    parent_item_id: str,
+    title: str,
+    body: str,
+    state_id: str,
+    priority_id: str,
+    tags: list[str],
+    provenance_key: str,
+    provenance_payload: dict[str, Any],
+    actor: str,
+    source_surface: str,
+    request_id: str | None,
+    run_id: str | None,
+) -> tuple[dict[str, Any], bool]:
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        _work_item_or_404(conn, parent_item_id)
+        existing = conn.execute(
+            "SELECT * FROM kanban_items WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        source_hash = str(provenance_payload.get("source_hash") or "")
+        if existing:
+            existing_meta = _json_value(existing["provenance_json"], {}).get(provenance_key, {})
+            if (
+                not isinstance(existing_meta, dict)
+                or existing_meta.get("source_hash") != source_hash
+            ):
+                raise HTTPException(
+                    409, "Proposal artifact identity conflicts with existing content"
+                )
+            return _row_to_work_item(existing), True
+        request = WorkItemCreateRequest(
+            item_id=item_id,
+            parent_item_id=parent_item_id,
+            title=title,
+            body=body,
+            state_id=state_id,
+            priority_id=priority_id,
+            automation_excluded=parent_item_id
+            in {KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID, KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID},
+            tags=tags,
+            actor=actor,
+            source_surface=source_surface,
+            request_id=request_id,
+            run_id=run_id,
+        )
+        payload = _work_item_payload(conn, request)
+        payload["provenance"][provenance_key] = dict(provenance_payload)
+        payload["source_hash"] = _hash_json_payload(payload)
+        audit_id = f"audit-{uuid.uuid4().hex}"
+        item_row, audit_row = _insert_work_item(
+            conn,
+            payload,
+            action=f"create_{provenance_key}",
+            audit_id=audit_id,
+            now=now,
+        )
+        gen = _kanban_table_sync_gen(conn, "kanban-proposal-artifact")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(item_row), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        return _row_to_work_item(item_row), False
+
+
+def _materialize_work_proposal_response_sync(
+    prepared: dict[str, Any],
+    interpreted: dict[str, Any],
+    ai: dict[str, Any],
+    body: WorkProposalResponseRequest,
+) -> dict[str, Any]:
+    item_id = prepared["item"]["item_id"]
+    source_hash = prepared["source_hash"]
+    response_id = prepared["response_id"]
+    outcome_type = interpreted["outcome_type"]
+    semantic_owner_id = _proposal_item_id_from_ref(
+        prepared["proposal"].get("semantic_owner_item_id")
+    )
+    forbidden = {
+        KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
+        KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+        KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID,
+    }
+    if semantic_owner_id in forbidden:
+        raise HTTPException(422, "Proposal semantic owner cannot be an interaction surface")
+    if outcome_type in {"accepted", "partial", "follow_up"} and not semantic_owner_id:
+        raise HTTPException(
+            422,
+            "Accepted proposal work requires a durable semantic_owner_item_ref",
+        )
+    if semantic_owner_id:
+        with get_conn() as conn:
+            _work_item_or_404(conn, semantic_owner_id)
+
+    digest = source_hash.removeprefix("sha256:")
+    created_work: list[dict[str, Any]] = []
+    for index, action in enumerate(interpreted["implementation_actions"]):
+        if not action["requires_new_card"]:
+            continue
+        action_hash = _hash_json_payload(
+            {"response_source_hash": source_hash, "index": index, "action": action}
+        ).removeprefix("sha256:")
+        action_id = _work_preprocessing_child_id(
+            semantic_owner_id,
+            action["title"],
+            attempt=int(action_hash[:4], 16),
+        )
+        action_provenance = {
+            "schema": "xarta.kanban.proposal_follow_up.v1",
+            "source_hash": _hash_json_payload(
+                {"proposal_response": source_hash, "action": action, "parent": semantic_owner_id}
+            ),
+            "source_inbox_item_id": item_id,
+            "response_id": response_id,
+            "outcome_type": outcome_type,
+            "created_at": _utc_now_iso(),
+        }
+        action_item, replay = _ensure_work_proposal_artifact_item_sync(
+            item_id=action_id,
+            parent_item_id=semantic_owner_id,
+            title=action["title"],
+            body=action["body"],
+            state_id="todo",
+            priority_id=action["priority_id"],
+            tags=["proposal-follow-up", "operator-approved", "bounded-work"],
+            provenance_key="proposal_follow_up",
+            provenance_payload=action_provenance,
+            actor=body.actor,
+            source_surface=body.source_surface,
+            request_id=body.request_id,
+            run_id=body.run_id,
+        )
+        created_work.append({**action_item, "idempotent_replay": replay})
+
+    follow_up_inbox: list[dict[str, Any]] = []
+    if interpreted["remaining_questions"] and outcome_type in {"partial", "follow_up"}:
+        follow_hash = _hash_json_payload(
+            {"response_source_hash": source_hash, "questions": interpreted["remaining_questions"]}
+        ).removeprefix("sha256:")
+        follow_result = _create_work_proposal_inbox_sync(
+            WorkProposalInboxCreateRequest(
+                entry_id=f"kanban-inbox-operator-follow-up-{follow_hash[:20]}",
+                entry_type="operator_follow_up",
+                title=f"Follow-up: {prepared['item']['title']}",
+                summary=interpreted["summary"],
+                rationale=interpreted["rationale"],
+                requested_operator_action="Answer the remaining bounded questions.",
+                exact_decision_needed="\n".join(interpreted["remaining_questions"]),
+                source_item_refs=[_kanban_item_uri(item_id)],
+                semantic_owner_item_ref=_kanban_item_uri(semantic_owner_id),
+                proof_refs=interpreted["proof_refs"],
+                priority_id=prepared["item"]["priority_id"],
+                metadata={"source_response_id": response_id, "supersedes_question_on": item_id},
+                actor=body.actor,
+                source_surface=body.source_surface,
+                request_id=body.request_id,
+                run_id=body.run_id,
+            )
+        )
+        follow_up_inbox.append(follow_result["item"])
+
+    outbox_entry_type = {
+        "accepted": "accepted_plan",
+        "partial": "accepted_plan",
+        "rejected": "declined_proposal",
+        "deferred": "completed_decision",
+        "follow_up": "completed_decision",
+    }[outcome_type]
+    outbox_id = _clean_work_id(
+        f"kanban-outbox-{_work_slug_fragment(item_id, limit=80)}-{digest[:16]}",
+        "kanban-outbox",
+    )
+    affected_refs = list(interpreted["affected_item_refs"])
+    for affected_id in [semantic_owner_id, *[item["item_id"] for item in created_work]]:
+        if affected_id:
+            ref = _kanban_item_uri(affected_id)
+            if ref not in affected_refs:
+                affected_refs.append(ref)
+    outcome_provenance = {
+        "schema": KANBAN_PROPOSAL_OUTCOME_SCHEMA,
+        "source_hash": source_hash,
+        "entry_type": outbox_entry_type,
+        "outcome_type": outcome_type,
+        "source_inbox_refs": [_kanban_item_uri(item_id)],
+        "affected_item_refs": affected_refs,
+        "proof_refs": interpreted["proof_refs"],
+        "commit_link_ids": [],
+        "response_id": response_id,
+        "authority": "operator",
+        "created_at": _utc_now_iso(),
+    }
+    outbox_body = (
+        f"Outcome: `{outcome_type}`\n\n{interpreted['summary']}\n\n"
+        f"Rationale: {interpreted['rationale']}\n\n"
+        f"Source INBOX: `{_kanban_item_uri(item_id)}`"
+    )
+    outbox_item, outbox_replay = _ensure_work_proposal_artifact_item_sync(
+        item_id=outbox_id,
+        parent_item_id=KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID,
+        title=interpreted["title"],
+        body=outbox_body,
+        state_id="done",
+        priority_id=prepared["item"]["priority_id"],
+        tags=["proposal-surface", "outbox", outbox_entry_type, outcome_type],
+        provenance_key="proposal_surface",
+        provenance_payload=outcome_provenance,
+        actor=body.actor,
+        source_surface=body.source_surface,
+        request_id=body.request_id,
+        run_id=body.run_id,
+    )
+
+    link_targets = [
+        (outbox_id, item_id, "source_inbox"),
+        (item_id, outbox_id, "processed_outcome"),
+    ]
+    for affected_id in [semantic_owner_id, *[item["item_id"] for item in created_work]]:
+        if affected_id:
+            link_targets.append((outbox_id, affected_id, "affected_work"))
+    links = []
+    for source_id, target_id, role in link_targets:
+        links.append(
+            _create_work_item_link_sync(
+                source_id,
+                WorkItemLinkCreateRequest(
+                    target_item_id=target_id,
+                    link_type="references",
+                    metadata={"role": role, "proposal_response_source_hash": source_hash},
+                    actor=body.actor,
+                    source_surface=body.source_surface,
+                    request_id=body.request_id,
+                    run_id=body.run_id,
+                ),
+            )["link"]
+        )
+
+    superseded_ids: list[str] = []
+    with get_conn() as conn:
+        store = _kanban_write_store(conn)
+        previous_rows = conn.execute(
+            """
+            SELECT * FROM kanban_review_decisions
+            WHERE item_id=? AND processor_kind='proposal_response' AND decision_id != ?
+              AND status != 'superseded'
+            """,
+            (item_id, prepared["decision_id"]),
+        ).fetchall()
+        gen = _kanban_table_sync_gen(conn, "kanban-proposal-response-supersession")
+        for previous in previous_rows:
+            previous_payload = dict(previous)
+            previous_payload["status"] = "superseded"
+            previous_payload["updated_at"] = _utc_now_iso()
+            saved = store.upsert_review_decision_row(previous_payload)
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_decisions",
+                saved["decision_id"],
+                dict(saved),
+                gen,
+            )
+            superseded_ids.append(saved["decision_id"])
+
+    decision_status = {
+        "accepted": "accepted",
+        "partial": "accepted",
+        "rejected": "declined",
+        "deferred": "pending",
+        "follow_up": "accepted",
+    }[outcome_type]
+    decision = _record_work_item_review_decision_sync(
+        item_id,
+        WorkReviewDecisionCreateRequest(
+            decision_id=prepared["decision_id"],
+            processor_kind="proposal_response",
+            decision_type=outcome_type,
+            title=interpreted["title"],
+            summary=interpreted["summary"],
+            rationale=interpreted["rationale"],
+            affected_refs=[
+                f"kanban_items:{item_id}",
+                f"kanban_items:{outbox_id}",
+                *[f"kanban_items:{item['item_id']}" for item in created_work],
+            ],
+            confidence=interpreted["confidence"],
+            uncertainty=interpreted["uncertainty"],
+            proof_refs=[
+                f"kanban_discussions:{prepared['discussion_id']}",
+                *interpreted["proof_refs"],
+            ],
+            status=decision_status,
+            provider_mode=KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+            metadata={
+                "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+                "authority": {
+                    "kind": "operator",
+                    "established_by": "server-owned operator response endpoint",
+                    "actor_is_audit_identity_only": True,
+                },
+                "response_id": response_id,
+                "response_source_hash": source_hash,
+                "response_discussion_id": prepared["discussion_id"],
+                "outbox_item_id": outbox_id,
+                "semantic_owner_item_id": semantic_owner_id,
+                "selected_choices": interpreted["selected_choices"],
+                "best_judgment_authorized": interpreted["best_judgment_authorized"],
+                "agent_choices": interpreted["agent_choices"],
+                "remaining_questions": interpreted["remaining_questions"],
+                "superseded_decision_ids": superseded_ids,
+                "response_state": {"retry_state": "", "failure": ""},
+                "model_routing": _work_automation_ai_routing_evidence(ai),
+            },
+            actor=body.actor,
+            source_surface=body.source_surface,
+            request_id=body.request_id,
+            run_id=body.run_id,
+        ),
+    )
+
+    processed = outcome_type != "deferred"
+    if processed:
+        current_tags = list(prepared["item"].get("tags") or [])
+        for tag in ("processed", f"outcome-{outcome_type}"):
+            if tag not in current_tags:
+                current_tags.append(tag)
+        _update_work_item_sync(
+            item_id,
+            WorkItemUpdateRequest(
+                state_id="done",
+                automation_excluded=True,
+                tags=current_tags,
+                actor=body.actor,
+                source_surface=body.source_surface,
+                request_id=body.request_id,
+                run_id=body.run_id,
+            ),
+        )
+
+    if semantic_owner_id and outcome_type in {"accepted", "partial", "follow_up"}:
+        note_id = _clean_work_id(
+            f"kanban-discussion-proposal-context-{digest[:20]}",
+            "kanban-discussion-proposal-context",
+        )
+        with suppress(HTTPException):
+            _create_work_discussion_sync(
+                semantic_owner_id,
+                WorkDiscussionCreateRequest(
+                    discussion_id=note_id,
+                    body=(
+                        f"Operator proposal response `{response_id}` materially updated context.\n\n"
+                        f"{interpreted['summary']}\n\nOutcome: `{outcome_type}`."
+                    ),
+                    author="proposal-response-processor",
+                    status="closed",
+                    actor=body.actor,
+                    source_surface=body.source_surface,
+                    request_id=body.request_id,
+                    run_id=body.run_id,
+                ),
+            )
+    return {
+        "ok": True,
+        "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+        "item_id": item_id,
+        "response_id": response_id,
+        "source_hash": source_hash,
+        "outcome_type": outcome_type,
+        "processed": processed,
+        "decision": decision["decision"],
+        "outbox_item": outbox_item,
+        "outbox_idempotent_replay": outbox_replay,
+        "implementation_items": created_work,
+        "follow_up_inbox_items": follow_up_inbox,
+        "links": links,
+        "superseded_decision_ids": superseded_ids,
+        "readiness_refresh_requested": bool(semantic_owner_id and processed),
+        "model_routing": _work_automation_ai_routing_evidence(ai),
     }
 
 
@@ -4001,6 +5048,8 @@ def _work_preprocessing_context_source(
         reason = "readiness_marker_item_mismatch"
     elif context_fingerprint_drift or changed_refs or new_refs or missing_refs or count_drift:
         reason = "readiness_marker_stale"
+    elif marker.get("ready") is False:
+        reason = "awaiting_operator_input"
     else:
         reason = "ready"
     classification = _work_preprocessing_source_classification(
@@ -4054,7 +5103,8 @@ def _work_preprocessing_context_source(
         "document_updated_at": max(ref["updated_at"] for ref in source_refs),
         "document_source_hash": source_hash,
         "ready": reason == "ready",
-        "needs_preprocessing": reason != "ready" and bool(classification.get("eligible", True)),
+        "needs_preprocessing": reason not in {"ready", "awaiting_operator_input"}
+        and bool(classification.get("eligible", True)),
     }
 
 
@@ -14080,6 +15130,10 @@ def _append_work_item_review_feedback_sync(
 
 @router.post("/kanban/items/{item_id}/discussions")
 async def create_work_discussion(item_id: str, body: WorkDiscussionCreateRequest) -> dict[str, Any]:
+    return await _run_personal_sync_work(_create_work_discussion_sync, item_id, body)
+
+
+def _create_work_discussion_sync(item_id: str, body: WorkDiscussionCreateRequest) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
@@ -15979,6 +17033,12 @@ def _list_work_item_review_decisions_sync(
 async def record_work_item_review_decision(
     item_id: str, body: WorkReviewDecisionCreateRequest
 ) -> dict[str, Any]:
+    return await _run_personal_sync_work(_record_work_item_review_decision_sync, item_id, body)
+
+
+def _record_work_item_review_decision_sync(
+    item_id: str, body: WorkReviewDecisionCreateRequest
+) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-{uuid.uuid4().hex}"
     meta = _work_request_meta(body)
@@ -16452,11 +17512,15 @@ async def _work_automation_local_ai_json_completion(
     messages: list[dict[str, str]],
     run_id: str,
     processor_kind: str = "review",
+    source_hash: str = "",
+    state_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return await _work_automation_processor_profile_json_completion(
         messages=messages,
         run_id=run_id,
         processor_kind=processor_kind,
+        source_hash=source_hash,
+        state_identity=state_identity,
     )
 
 
@@ -16818,6 +17882,234 @@ def _work_preprocessing_guidance_selection(payload: dict[str, Any]) -> dict[str,
     }
 
 
+def _work_preprocessing_execution_directive(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = payload.get("execution_directive")
+    if not isinstance(raw, dict):
+        raise ValueError("local AI response missing required object: execution_directive")
+    mode = _clean_short_text(str(raw.get("recommended_mode") or ""), "", limit=80).replace("-", "_")
+    allowed_modes = {
+        "serial",
+        "shared_worktree_parallel",
+        "isolated_worktrees",
+        "remote_node",
+        "delayed_overnight",
+    }
+    if mode not in allowed_modes:
+        raise ValueError("execution_directive recommended_mode is invalid")
+    rationale = _body_excerpt(str(raw.get("rationale") or ""), limit=5000).strip()
+    if not rationale:
+        raise ValueError("execution_directive rationale is required")
+    raw_units = raw.get("work_units")
+    if not isinstance(raw_units, list) or not raw_units:
+        raise ValueError("execution_directive requires at least one bounded work unit")
+    units: list[dict[str, Any]] = []
+    for index, value in enumerate(raw_units[:16]):
+        if not isinstance(value, dict):
+            raise ValueError(f"execution_directive work_units[{index}] must be an object")
+        unit_id = _clean_short_text(str(value.get("unit_id") or f"unit-{index + 1}"), "", limit=100)
+        title = _clean_short_text(str(value.get("title") or ""), "", limit=180)
+        scope = _body_excerpt(str(value.get("scope") or ""), limit=4000).strip()
+        if not unit_id or not title or not scope:
+            raise ValueError(
+                f"execution_directive work_units[{index}] requires unit_id, title, and scope"
+            )
+        units.append(
+            {
+                "unit_id": unit_id,
+                "title": title,
+                "scope": scope,
+                "depends_on": _clean_event_list(value.get("depends_on") or [], limit=16),
+                "repo_paths": _clean_event_list(value.get("repo_paths") or [], limit=16),
+                "write_scopes": _clean_event_list(value.get("write_scopes") or [], limit=32),
+                "required_skills": _clean_event_list(value.get("required_skills") or [], limit=24),
+                "proof_expected": _clean_event_list(value.get("proof_expected") or [], limit=24),
+            }
+        )
+
+    def text_list(key: str, limit: int = 24) -> list[str]:
+        values = raw.get(key)
+        return _clean_event_list(values if isinstance(values, list) else [], limit=limit)
+
+    return {
+        "schema": KANBAN_EXECUTION_DIRECTIVE_SCHEMA,
+        "recommended_mode": mode,
+        "rationale": rationale,
+        "work_units": units,
+        "isolation_requirements": text_list("isolation_requirements"),
+        "candidate_nodes": text_list("candidate_nodes", 12),
+        "resource_requirements": text_list("resource_requirements"),
+        "required_context": text_list("required_context"),
+        "merge_reconciliation_owner": _clean_short_text(
+            str(raw.get("merge_reconciliation_owner") or "owning agent"),
+            "owning agent",
+            limit=180,
+        ),
+        "timeout_checkin_failure_behavior": _body_excerpt(
+            str(raw.get("timeout_checkin_failure_behavior") or ""), limit=4000
+        ),
+        "cleanup_criteria": text_list("cleanup_criteria"),
+        "evidence": text_list("evidence", 32),
+        "semantic_assessment": True,
+        "lexical_trigger_used": False,
+    }
+
+
+def _work_preprocessing_proposal_entries(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_entries = payload.get("proposal_entries")
+    if raw_entries is None:
+        raise ValueError("local AI response missing required list: proposal_entries")
+    if not isinstance(raw_entries, list):
+        raise ValueError("local AI response field proposal_entries must be a list")
+    entries: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_entries[:8]):
+        if not isinstance(raw, dict):
+            raise ValueError(f"proposal_entries[{index}] must be an object")
+        entry_type = _clean_work_proposal_entry_type(raw.get("entry_type"))
+        title = _clean_short_text(str(raw.get("title") or ""), "", limit=180)
+        summary = _body_excerpt(str(raw.get("summary") or ""), limit=6000).strip()
+        rationale = _body_excerpt(str(raw.get("rationale") or ""), limit=6000).strip()
+        requested_action = _body_excerpt(
+            str(raw.get("requested_operator_action") or ""), limit=4000
+        ).strip()
+        exact_decision = _body_excerpt(
+            str(raw.get("exact_decision_needed") or ""), limit=4000
+        ).strip()
+        lifecycle_required = bool(raw.get("lifecycle_required", True))
+        if not title or not summary or not rationale:
+            raise ValueError(f"proposal_entries[{index}] lacks title, summary, or rationale")
+        if lifecycle_required and (not requested_action or not exact_decision):
+            raise ValueError(
+                f"proposal_entries[{index}] lifecycle request lacks exact operator action/decision"
+            )
+        entries.append(
+            {
+                "entry_type": entry_type,
+                "title": title,
+                "summary": summary,
+                "rationale": rationale,
+                "requested_operator_action": requested_action,
+                "exact_decision_needed": exact_decision,
+                "lifecycle_required": lifecycle_required,
+                "proof_refs": _clean_event_list(raw.get("proof_refs") or [], limit=24),
+            }
+        )
+    return entries
+
+
+def _materialize_work_review_proposal_entries_sync(
+    *,
+    item_id: str,
+    marker_id: str,
+    entries: list[dict[str, Any]],
+    actor: str,
+    run_id: str,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    source_ref = _kanban_item_uri(item_id)
+    for entry in entries:
+        result = _create_work_proposal_inbox_sync(
+            WorkProposalInboxCreateRequest(
+                entry_type=entry["entry_type"],
+                title=entry["title"],
+                summary=entry["summary"],
+                rationale=entry["rationale"],
+                requested_operator_action=entry["requested_operator_action"],
+                exact_decision_needed=entry["exact_decision_needed"],
+                source_item_refs=[source_ref],
+                semantic_owner_item_ref=source_ref,
+                proof_refs=[
+                    f"kanban_review_processor_markers:{marker_id}",
+                    *entry["proof_refs"],
+                ],
+                lifecycle_required=entry["lifecycle_required"],
+                metadata={
+                    "producer": "review_processor",
+                    "source_marker_id": marker_id,
+                },
+                actor=actor,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-review-proposal-{marker_id}",
+                run_id=run_id,
+            )
+        )
+        results.append(result)
+    return results
+
+
+def _materialize_work_review_follow_up_card_sync(
+    *,
+    item_id: str,
+    marker_id: str,
+    document_source_hash: str,
+    decision_type: str,
+    output_payload: Any,
+    actor: str,
+    run_id: str,
+) -> dict[str, Any] | None:
+    if decision_type != "follow_up_card":
+        return None
+    if not isinstance(output_payload, dict):
+        raise ValueError("follow_up_card decision requires output_payload")
+    title = _clean_short_text(str(output_payload.get("title") or ""), "", limit=180)
+    body = _body_excerpt(str(output_payload.get("body") or ""), limit=8000).strip()
+    reason = _body_excerpt(str(output_payload.get("reason") or ""), limit=4000).strip()
+    parent_id = _proposal_item_id_from_ref(output_payload.get("parent_ref"))
+    state_id = _clean_short_text(
+        str(output_payload.get("lane") or "todo"), "todo", limit=40
+    ).lower()
+    priority_id = _clean_short_text(
+        str(output_payload.get("priority") or "medium"), "medium", limit=40
+    ).lower()
+    if not title or not body or not reason or not parent_id:
+        raise ValueError(
+            "follow_up_card output_payload requires title, body, reason, and parent_ref"
+        )
+    if state_id not in {"todo", "backlog", "blocked"}:
+        raise ValueError("follow_up_card lane must be todo, backlog, or blocked")
+    if priority_id not in {"critical", "high", "medium", "low"}:
+        raise ValueError("follow_up_card priority is invalid")
+    if parent_id in {
+        KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
+        KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+        KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID,
+    }:
+        raise ValueError("Review follow-up implementation cannot be owned by proposal surfaces")
+    source_hash = _hash_json_payload(
+        {
+            "schema": "xarta.kanban.review_follow_up.v1",
+            "source_item_id": item_id,
+            "marker_id": marker_id,
+            "document_source_hash": document_source_hash,
+            "output_payload": output_payload,
+        }
+    )
+    follow_up_id = _work_preprocessing_child_id(parent_id, title)
+    item, replay = _ensure_work_proposal_artifact_item_sync(
+        item_id=follow_up_id,
+        parent_item_id=parent_id,
+        title=title,
+        body=f"{body}\n\nReview follow-up reason: {reason}",
+        state_id=state_id,
+        priority_id=priority_id,
+        tags=["review-follow-up", "bounded-work", "review-processor"],
+        provenance_key="review_follow_up",
+        provenance_payload={
+            "schema": "xarta.kanban.review_follow_up.v1",
+            "source_hash": source_hash,
+            "source_item_id": item_id,
+            "source_marker_id": marker_id,
+            "document_source_hash": document_source_hash,
+            "reason": reason,
+            "created_at": _utc_now_iso(),
+        },
+        actor=actor,
+        source_surface="kanban-automation-idle-worker",
+        request_id=f"{run_id}-review-follow-up-{marker_id}",
+        run_id=run_id,
+    )
+    return {"item": item, "idempotent_replay": replay, "source_hash": source_hash}
+
+
 KANBAN_PROMPT_ROOT = (
     Path(
         os.environ.get(
@@ -16836,18 +18128,20 @@ REVIEW_PROCESSOR_SYSTEM_PROMPT = (
 )
 PREPROCESSING_SYSTEM_PROMPT = (
     "You are the provider-neutral Blueprints Kanban preprocessing fallback. Return "
-    "only one strict JSON object. Do not use markdown. Decide whether the "
-    "current card context is ready for an agent to start implementation. "
+    "only one strict JSON object. Do not use markdown. Follow task_kind in the "
+    "user JSON. For kanban_preprocessing, decide whether the current card context "
+    "is ready and produce semantic operator-input and execution directives. For "
+    "proposal_response_classification, interpret the whole operator utterance and "
+    "bounded state without keyword rules. "
     "The queue_source reason may be missing_readiness_marker or "
     "readiness_marker_stale; treat that as the scheduling reason, not a failure. "
     "If the card is an actionable leaf whose next step is an audit, file "
     "inspection, command run, or implementation task, mark it ready even "
     "when that work has not been completed yet. "
-    "When a required route, API, provider, proof path, or operator decision "
-    "is missing, set ready=false and return decomposition_items for the "
-    "smallest child work items that should be created, using blocked items "
-    "for true operator questions or external blockers. Do not invent "
-    "deterministic substitute work."
+    "When an operator decision needs its own lifecycle, return a proposal_entries "
+    "INBOX request and never make INBOX the implementation parent. Use a small "
+    "non-lifecycle proposal note only for a genuine status note. Do not invent "
+    "deterministic substitute work or deterministic semantic fallback."
 )
 BLOCKER_PROCESSOR_SYSTEM_PROMPT = (
     "You are the provider-neutral Blueprints Kanban Blocker Processor. Return only one "
@@ -17074,7 +18368,28 @@ def _work_review_processor_local_ai_messages(
             "status": "recorded|pending|accepted|declined|failed",
             "affected_refs": ["kanban_items:<id>", "xarta-kanban:item:<id>"],
             "proof_refs": ["source/proof refs"],
+            "output_payload": {
+                "note": "Structured payload required by the selected output-contract type; use {} when not applicable."
+            },
+            "proposal_entries": [
+                {
+                    "entry_type": "review_processor_follow_up|question|approval_request|proposal",
+                    "title": "operator-visible title",
+                    "summary": "bounded request",
+                    "rationale": "why operator input is required",
+                    "requested_operator_action": "the requested action",
+                    "exact_decision_needed": "the exact decision",
+                    "lifecycle_required": True,
+                    "proof_refs": ["source/proof refs"],
+                }
+            ],
         },
+        "proposal_rules": [
+            "Return proposal_entries=[] when no operator decision lifecycle is needed.",
+            "Use lifecycle_required=false only for a genuinely small status note.",
+            "The processor creates INBOX entries; INBOX never owns implementation work.",
+            "When decision_type=follow_up_card, output_payload must contain title, body, parent_ref, lane, priority, and reason; the backend materializes it under that semantic parent.",
+        ],
     }
     return [
         # The editable generic/model prompt is selected inside
@@ -17138,6 +18453,41 @@ async def _process_work_review_idle_marker(
     uncertainty = _local_ai_optional_text(payload, "uncertainty", limit=3000)
     confidence = _clean_short_text(str(payload.get("confidence") or "medium"), "medium", limit=40)
     status = _clean_review_decision_status(str(payload.get("status") or "recorded"))
+    proposal_entries = _work_preprocessing_proposal_entries(
+        {"proposal_entries": payload.get("proposal_entries", [])}
+    )
+    proposal_results = await _run_personal_sync_work(
+        _materialize_work_review_proposal_entries_sync,
+        item_id=item_id,
+        marker_id=marker["marker_id"],
+        entries=proposal_entries,
+        actor=holder_id,
+        run_id=run_id,
+    )
+    proposal_refs = [
+        (
+            f"kanban_items:{result['item']['item_id']}"
+            if result.get("kind") == "item"
+            else f"kanban_discussions:{result['discussion']['discussion_id']}"
+        )
+        for result in proposal_results
+    ]
+    affected_refs.extend(ref for ref in proposal_refs if ref not in affected_refs)
+    output_payload = payload.get("output_payload")
+    follow_up_card = await _run_personal_sync_work(
+        _materialize_work_review_follow_up_card_sync,
+        item_id=item_id,
+        marker_id=marker["marker_id"],
+        document_source_hash=marker["document_source_hash"],
+        decision_type=decision_type,
+        output_payload=output_payload,
+        actor=holder_id,
+        run_id=run_id,
+    )
+    if follow_up_card:
+        follow_up_ref = f"kanban_items:{follow_up_card['item']['item_id']}"
+        if follow_up_ref not in affected_refs:
+            affected_refs.append(follow_up_ref)
     decision_id = _clean_work_id(
         f"kanban-decision-hermes-review-{item_id}-{marker['document_source_hash'][-12:]}",
         "kanban-decision",
@@ -17175,6 +18525,9 @@ async def _process_work_review_idle_marker(
                 "model_routing": _work_automation_ai_routing_evidence(ai),
                 "marker_id": marker["marker_id"],
                 "document_source_hash": marker["document_source_hash"],
+                "proposal_results": proposal_results,
+                "output_payload": output_payload if isinstance(output_payload, dict) else {},
+                "follow_up_card": follow_up_card,
                 "llm_payload": payload,
                 "llm_content_excerpt": ai["content_excerpt"],
             },
@@ -17228,6 +18581,8 @@ async def _process_work_review_idle_marker(
         "model_attempt_count": len(ai.get("model_attempts") or []),
         "latency_ms": ai.get("latency_ms", 0),
         "fallback_reason": ai.get("fallback_reason", ""),
+        "proposal_results": proposal_results,
+        "follow_up_card": follow_up_card,
     }
 
 
@@ -17245,6 +18600,7 @@ def _work_preprocessing_local_ai_messages(
 ) -> list[dict[str, str]]:
     context = {
         "schema": "xarta.kanban.preprocessing.hermes_profile_input.v1",
+        "task_kind": "kanban_preprocessing",
         "item": _row_to_work_item(item),
         "canonical_item_ref": f"xarta-kanban:item:{item['item_id']}",
         "marker": {
@@ -17281,7 +18637,8 @@ def _work_preprocessing_local_ai_messages(
             "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
             "If the item lacks enough information to implement safely, ready must be false and decomposition_items must contain the concrete child work items needed to make progress.",
             "Preprocessing prepares the Kanban tree for agents; do not only list work in prose when child cards should be created.",
-            "When missing context is really an operator question or external blocker, create a blocked decomposition item with the exact question/blocker at the smallest useful scope.",
+            "When missing context is really an operator question or approval that needs its own decision lifecycle, return a proposal_entries INBOX request linked to this item; never use INBOX as the implementation card.",
+            "Use a proposal entry with lifecycle_required=false only for a genuinely small status note that belongs as a Discussion.",
             "Use ancestor_context before reporting missing_parent_content or creating a child that only retrieves parent content; ancestor_context includes the rootward chain up to the Kanban depth limit, so block for parent content only when the needed parent or ancestor is absent or the supplied excerpts are insufficient.",
             "Failed preprocessing decisions from older source hashes are durable history, not current blockers.",
             "If there are open blockers, ready must be false.",
@@ -17305,6 +18662,8 @@ def _work_preprocessing_local_ai_messages(
             "Select engineering guidance semantically from engineering_guidance_catalog only when it materially applies to this leaf or an explicit dependency. Never select it from a filename, isolated keyword, or broad ancestor topic.",
             "The unattended processor must not browse arbitrary skills or run implementation tools. The supplied catalog is the bounded skill-derived context; implementation cards may point the later implementation agent to its source_refs.",
             "For decomposition, put guidance_ids only on the child whose deliverable needs those patterns. Do not add database, HTTP, permission, browser, or event-loop work to unrelated children.",
+            "Semantically assess execution candidacy from the whole deliverable and current state. Exact words such as parallel, branch, worktree, subagent, overnight, or node never decide recommended_mode.",
+            "Return proposal_entries=[] when no operator input is warranted; do not create INBOX noise for ordinary implementation uncertainty.",
         ],
         "required_output": {
             "ready": True,
@@ -17335,6 +18694,42 @@ def _work_preprocessing_local_ai_messages(
                     "guidance_ids": ["only catalog guidance ids applicable to this specific child"],
                 }
             ],
+            "proposal_entries": [
+                {
+                    "entry_type": "proposal|question|approval_request|review_processor_follow_up|operator_follow_up",
+                    "title": "operator-visible title",
+                    "summary": "bounded proposal or question",
+                    "rationale": "why operator input is required",
+                    "requested_operator_action": "what the operator should do",
+                    "exact_decision_needed": "the exact decision",
+                    "lifecycle_required": True,
+                    "proof_refs": ["source/proof refs"],
+                }
+            ],
+            "execution_directive": {
+                "recommended_mode": "serial|shared_worktree_parallel|isolated_worktrees|remote_node|delayed_overnight",
+                "rationale": "whole-context semantic rationale",
+                "work_units": [
+                    {
+                        "unit_id": "stable bounded id",
+                        "title": "bounded unit",
+                        "scope": "deliverable and stopping condition",
+                        "depends_on": [],
+                        "repo_paths": [],
+                        "write_scopes": [],
+                        "required_skills": [],
+                        "proof_expected": [],
+                    }
+                ],
+                "isolation_requirements": [],
+                "candidate_nodes": [],
+                "resource_requirements": [],
+                "required_context": [],
+                "merge_reconciliation_owner": "owning agent",
+                "timeout_checkin_failure_behavior": "bounded behavior",
+                "cleanup_criteria": [],
+                "evidence": [],
+            },
             "affected_refs": ["kanban_items:<id>", "xarta-kanban:item:<id>"],
             "proof_refs": ["source/proof refs"],
         },
@@ -17760,6 +19155,8 @@ def _preprocessing_readiness_marker(
     processor_route: dict[str, Any] | None = None,
     outcome: str = "ready",
     decomposition: dict[str, Any] | None = None,
+    execution_directive: dict[str, Any] | None = None,
+    proposal_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     next_actions = ai_payload.get("recommended_next_actions")
     if not isinstance(next_actions, list):
@@ -17774,6 +19171,14 @@ def _preprocessing_readiness_marker(
         source.get("context_manifest") if isinstance(source.get("context_manifest"), dict) else {}
     )
     engineering_guidance = _work_preprocessing_guidance_selection(ai_payload)
+    proposal_results = proposal_results if isinstance(proposal_results, list) else []
+    open_questions = [
+        str((result.get("item") or {}).get("item_id") or "")
+        for result in proposal_results
+        if isinstance(result, dict)
+        and result.get("kind") == "item"
+        and str((result.get("item") or {}).get("item_id") or "")
+    ]
     return {
         "schema": "xarta.kanban.context_readiness_marker.v1",
         "context_packet_schema": source["schema"],
@@ -17803,6 +19208,10 @@ def _preprocessing_readiness_marker(
         "processor_primary_provider": route.get("primary_provider", ""),
         "processor_primary_model": route.get("primary_model", ""),
         "preprocessing_outcome": outcome,
+        "ready": outcome not in {"awaiting_operator", "blocked"},
+        "open_questions": open_questions,
+        "proposal_entry_ids": open_questions,
+        "execution_directive": dict(execution_directive or {}),
         "decomposition_item_ids": [
             str(item.get("item_id") or "")
             for item in decomposition.get("items", [])
@@ -17895,6 +19304,65 @@ def _work_preprocessing_updated_context_sync(item_id: str) -> dict[str, Any]:
         "updated_source": updated_source,
         "updated_hints": updated_hints,
     }
+
+
+def _retarget_work_preprocessing_marker_source_sync(
+    marker_id: str,
+    *,
+    original_source_hash: str,
+    updated_source: dict[str, Any],
+) -> dict[str, Any]:
+    """Retarget one active attempt after its own deterministic tree/context writes."""
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+            (marker_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "Preprocessing marker not found")
+        if row["processor_kind"] != "preprocessing" or row["status"] != "processing":
+            raise HTTPException(409, "Only an active preprocessing marker can be retargeted")
+        if row["document_source_hash"] != original_source_hash:
+            raise HTTPException(409, "Preprocessing marker source changed during materialization")
+        metadata = _json_value(row["metadata_json"], {})
+        metadata["self_mutation_retarget"] = {
+            "schema": "xarta.kanban.preprocessing.self_mutation_retarget.v1",
+            "original_source_hash": original_source_hash,
+            "updated_source_hash": updated_source["document_source_hash"],
+            "retargeted_at": now,
+        }
+        conn.execute(
+            """
+            UPDATE kanban_review_processor_markers
+            SET document_ref=?, document_updated_at=?, document_source_hash=?,
+                last_seen_at=?, metadata_json=?, updated_at=?
+            WHERE marker_id=?
+            """,
+            (
+                updated_source["document_ref"],
+                updated_source["document_updated_at"],
+                updated_source["document_source_hash"],
+                now,
+                json.dumps(metadata, ensure_ascii=True, sort_keys=True),
+                now,
+                marker_id,
+            ),
+        )
+        saved = conn.execute(
+            "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+            (marker_id,),
+        ).fetchone()
+        gen = _kanban_table_sync_gen(conn, "kanban-preprocessing-self-retarget")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_review_processor_markers",
+            marker_id,
+            dict(saved),
+            gen,
+        )
+    return _row_to_work_review_processor_marker(saved)
 
 
 async def _process_work_preprocessing_idle_marker(
@@ -17999,14 +19467,17 @@ async def _process_work_preprocessing_idle_marker(
     ai = _work_automation_processor_ai_defaults(ai, "preprocessing")
     payload = ai["payload"]
     engineering_guidance = _work_preprocessing_guidance_selection(payload)
+    execution_directive = _work_preprocessing_execution_directive(payload)
+    proposal_entries = _work_preprocessing_proposal_entries(payload)
     ready = bool(payload.get("ready"))
+    raw_outcome_type = payload.get("outcome_type")
     outcome_type = _clean_short_text(
-        str(payload.get("outcome_type") or ("ready" if ready else "decompose")),
+        str(raw_outcome_type or ("ready" if ready else "decompose")),
         "ready" if ready else "decompose",
         limit=40,
     ).lower()
     if outcome_type not in {"ready", "decompose", "blocked", "duplicate", "superseded"}:
-        outcome_type = "ready" if ready else "decompose"
+        raise ValueError("preprocessing model returned invalid outcome_type")
     canonical_item_ref = _clean_short_text(
         str(payload.get("canonical_item_ref") or ""), "", limit=260
     )
@@ -18047,6 +19518,171 @@ async def _process_work_preprocessing_idle_marker(
     ):
         ready = False
         hard_blocking_codes.append("missing_canonical_item_ref")
+
+    proposal_results: list[dict[str, Any]] = []
+    for index, proposal_entry in enumerate(proposal_entries):
+        proposal_hash = _hash_json_payload(
+            {
+                "source_hash": source["document_source_hash"],
+                "index": index,
+                "proposal_entry": proposal_entry,
+            }
+        ).removeprefix("sha256:")
+        proposal_results.append(
+            await _run_personal_sync_work(
+                _create_work_proposal_inbox_sync,
+                WorkProposalInboxCreateRequest(
+                    entry_id=(
+                        f"kanban-inbox-preprocess-{item_id}-{proposal_hash[:16]}"
+                        if proposal_entry["lifecycle_required"]
+                        else f"kanban-discussion-preprocess-{item_id}-{proposal_hash[:16]}"
+                    ),
+                    entry_type=proposal_entry["entry_type"],
+                    title=proposal_entry["title"],
+                    summary=proposal_entry["summary"],
+                    rationale=proposal_entry["rationale"],
+                    requested_operator_action=proposal_entry["requested_operator_action"],
+                    exact_decision_needed=proposal_entry["exact_decision_needed"],
+                    source_item_refs=[f"xarta-kanban:item:{item_id}"],
+                    semantic_owner_item_ref=f"xarta-kanban:item:{item_id}",
+                    proof_refs=proposal_entry["proof_refs"],
+                    lifecycle_required=proposal_entry["lifecycle_required"],
+                    priority_id=str(item["priority_id"] or "medium"),
+                    metadata={
+                        "producer": "hermes-kanban-preprocessor",
+                        "processor_marker_id": marker["marker_id"],
+                        "processor_source_hash": source["document_source_hash"],
+                    },
+                    actor=holder_id,
+                    source_surface="kanban-automation-idle-worker",
+                    request_id=f"{run_id}-proposal-{index}-{marker['marker_id']}",
+                    run_id=run_id,
+                ),
+            )
+        )
+    lifecycle_proposals = [result for result in proposal_results if result.get("kind") == "item"]
+    if lifecycle_proposals:
+        updated_context = await _run_personal_sync_work(
+            _work_preprocessing_updated_context_sync,
+            item_id,
+        )
+        updated_source = updated_context["updated_source"]
+        updated_hints = updated_context["updated_hints"]
+        readiness_marker = _preprocessing_readiness_marker(
+            item_id=item_id,
+            source=updated_source,
+            marker=marker,
+            actor=holder_id,
+            now=now,
+            ai_payload=payload,
+            processor_route=ai,
+            outcome="awaiting_operator",
+            execution_directive=execution_directive,
+            proposal_results=proposal_results,
+        )
+        metadata = dict(updated_hints.get("metadata") or {})
+        metadata["context_readiness_marker"] = readiness_marker
+        metadata["execution_directive"] = execution_directive
+        required_skills = list(
+            dict.fromkeys(
+                skill
+                for unit in execution_directive["work_units"]
+                for skill in unit["required_skills"]
+            )
+        )
+        await update_work_item_agent_hints(
+            item_id,
+            WorkAgentHintsUpdateRequest(
+                required_skills=required_skills,
+                routing_notes=(
+                    f"Execution mode: {execution_directive['recommended_mode']}. "
+                    f"{execution_directive['rationale']}"
+                ),
+                metadata=metadata,
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-operator-input-readiness-{marker['marker_id']}",
+                run_id=run_id,
+            ),
+        )
+        proposal_item_ids = [result["item"]["item_id"] for result in lifecycle_proposals]
+        decision_id = _clean_work_id(
+            f"kanban-decision-hermes-preprocess-awaiting-operator-{item_id}-{updated_source['document_source_hash'][-12:]}",
+            "kanban-decision",
+        )
+        decision = await record_work_item_review_decision(
+            item_id,
+            WorkReviewDecisionCreateRequest(
+                decision_id=decision_id,
+                processor_kind="preprocessing",
+                decision_type="preprocessing_awaiting_operator",
+                title=title,
+                summary=summary,
+                rationale=rationale,
+                affected_refs=[
+                    f"kanban_items:{item_id}",
+                    f"kanban_agent_hints:{item_id}",
+                    *[f"kanban_items:{proposal_id}" for proposal_id in proposal_item_ids],
+                ],
+                confidence=confidence,
+                uncertainty=uncertainty,
+                proof_refs=[
+                    f"kanban_review_processor_markers:{marker['marker_id']}",
+                    *[f"kanban_items:{proposal_id}" for proposal_id in proposal_item_ids],
+                ],
+                status="pending",
+                provider_mode=KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.operator_input.v1",
+                    "proposal_item_ids": proposal_item_ids,
+                    "execution_directive": execution_directive,
+                    "model_routing": _work_automation_ai_routing_evidence(ai),
+                    "readiness_marker": readiness_marker,
+                },
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-operator-input-decision-{marker['marker_id']}",
+                run_id=run_id,
+            ),
+        )
+        await _run_personal_sync_work(
+            _retarget_work_preprocessing_marker_source_sync,
+            marker["marker_id"],
+            original_source_hash=marker["document_source_hash"],
+            updated_source=updated_source,
+        )
+        complete = await complete_work_review_processor_marker(
+            marker["marker_id"],
+            WorkReviewProcessorMarkerCompleteRequest(
+                holder_id=holder_id,
+                lease_token=lease_token,
+                document_source_hash=updated_source["document_source_hash"],
+                decision_id=decision["decision"]["decision_id"],
+                status="processed",
+                actor=holder_id,
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"{run_id}-operator-input-complete-{marker['marker_id']}",
+                run_id=run_id,
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.operator_input.v1",
+                    "proposal_item_ids": proposal_item_ids,
+                    "readiness_marker_context_hash": readiness_marker["context_hash"],
+                    "model_routing": _work_automation_ai_routing_evidence(ai),
+                },
+            ),
+        )
+        return {
+            "ok": True,
+            "processor_kind": "preprocessing",
+            "item_id": item_id,
+            "marker_id": marker["marker_id"],
+            "decision_id": decision["decision"]["decision_id"],
+            "status": complete.get("marker", {}).get("status", "processed"),
+            "outcome_type": "awaiting_operator",
+            "proposal_item_ids": proposal_item_ids,
+            "execution_directive": execution_directive,
+            "model_routing": _work_automation_ai_routing_evidence(ai),
+        }
 
     decomposition_result: dict[str, Any] = {
         "schema": "xarta.kanban.preprocessing.decomposition_result.v1",
@@ -18102,15 +19738,10 @@ async def _process_work_preprocessing_idle_marker(
                 blocking_codes.append("missing_decomposition_items")
                 hard_blocking_codes.append("llm_reported_not_ready")
             else:
-                ready = True
-                readiness_outcome = "ready_leaf_no_decomposition"
-                readiness_normalization = {
-                    "schema": "xarta.kanban.preprocessing.readiness_normalization.v1",
-                    "reason": "model_reported_not_ready_without_blocker_or_decomposition",
-                    "model_ready": False,
-                    "model_decomposition_count": 0,
-                    "model_blocking_code_count": 0,
-                }
+                raise ValueError(
+                    "preprocessing model returned ready=false without a blocker, "
+                    "decomposition item, or proposal entry"
+                )
 
     if not ready and int(decomposition_result.get("total_count") or 0) <= 0:
         if "missing_decomposition_items" not in blocking_codes:
@@ -18255,12 +19886,27 @@ async def _process_work_preprocessing_idle_marker(
             processor_route=ai,
             outcome="decomposed",
             decomposition=decomposition_result,
+            execution_directive=execution_directive,
+            proposal_results=proposal_results,
         )
         metadata = dict(updated_hints.get("metadata") or {})
         metadata["context_readiness_marker"] = readiness_marker
+        metadata["execution_directive"] = execution_directive
+        required_skills = list(
+            dict.fromkeys(
+                skill
+                for unit in execution_directive["work_units"]
+                for skill in unit["required_skills"]
+            )
+        )
         await update_work_item_agent_hints(
             item_id,
             WorkAgentHintsUpdateRequest(
+                required_skills=required_skills,
+                routing_notes=(
+                    f"Execution mode: {execution_directive['recommended_mode']}. "
+                    f"{execution_directive['rationale']}"
+                ),
                 metadata=metadata,
                 actor=holder_id,
                 source_surface="kanban-automation-idle-worker",
@@ -18323,6 +19969,7 @@ async def _process_work_preprocessing_idle_marker(
                     "document_source_hash": updated_source["document_source_hash"],
                     "readiness_marker": readiness_marker,
                     "engineering_guidance": engineering_guidance,
+                    "execution_directive": execution_directive,
                     "decomposition": decomposition_result,
                     "parent_lane_update": {
                         "from_state_id": item["state_id"],
@@ -18342,12 +19989,18 @@ async def _process_work_preprocessing_idle_marker(
                 run_id=run_id,
             ),
         )
+        await _run_personal_sync_work(
+            _retarget_work_preprocessing_marker_source_sync,
+            marker["marker_id"],
+            original_source_hash=marker["document_source_hash"],
+            updated_source=updated_source,
+        )
         complete = await complete_work_review_processor_marker(
             marker["marker_id"],
             WorkReviewProcessorMarkerCompleteRequest(
                 holder_id=holder_id,
                 lease_token=lease_token,
-                document_source_hash=marker["document_source_hash"],
+                document_source_hash=updated_source["document_source_hash"],
                 decision_id=decision["decision"]["decision_id"],
                 status="processed",
                 actor=holder_id,
@@ -18412,12 +20065,25 @@ async def _process_work_preprocessing_idle_marker(
         ai_payload=payload,
         processor_route=ai,
         outcome=readiness_outcome,
+        execution_directive=execution_directive,
+        proposal_results=proposal_results,
     )
     metadata = dict(hints.get("metadata") or {})
     metadata["context_readiness_marker"] = readiness_marker
+    metadata["execution_directive"] = execution_directive
+    required_skills = list(
+        dict.fromkeys(
+            skill for unit in execution_directive["work_units"] for skill in unit["required_skills"]
+        )
+    )
     await update_work_item_agent_hints(
         item_id,
         WorkAgentHintsUpdateRequest(
+            required_skills=required_skills,
+            routing_notes=(
+                f"Execution mode: {execution_directive['recommended_mode']}. "
+                f"{execution_directive['rationale']}"
+            ),
             metadata=metadata,
             actor=holder_id,
             source_surface="kanban-automation-idle-worker",
@@ -18476,6 +20142,7 @@ async def _process_work_preprocessing_idle_marker(
                 "document_source_hash": source["document_source_hash"],
                 "readiness_marker": readiness_marker,
                 "engineering_guidance": engineering_guidance,
+                "execution_directive": execution_directive,
                 "readiness_normalization": readiness_normalization or None,
                 "outcome_type": outcome_type,
                 "canonical_item_ref": canonical_item_ref,
@@ -19333,8 +21000,14 @@ def _trigger_work_preprocessing_idle_scan_sync(
             item_rows = conn.execute(
                 f"""
                 SELECT item.* FROM kanban_items item
+                LEFT JOIN kanban_agent_hints hints ON hints.item_id=item.item_id
                 {where}
                 ORDER BY
+                  CASE
+                    WHEN hints.hint_id IS NULL
+                      OR COALESCE(json_extract(hints.metadata_json, '$.context_readiness_marker.schema'), '')=''
+                    THEN 0 ELSE 1
+                  END,
                   CASE item.priority_id
                     WHEN 'critical' THEN 0
                     WHEN 'high' THEN 1
@@ -19342,7 +21015,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                     WHEN 'low' THEN 3
                     ELSE 4
                   END,
-                  item.updated_at ASC,
+                  item.updated_at DESC,
                   item.item_id
                 LIMIT ?
                 """,
@@ -20637,6 +22310,134 @@ async def get_work_proposal_surfaces_contract() -> dict[str, Any]:
     }
 
 
+@router.get("/kanban/automation/proposal-surfaces/status")
+async def get_work_proposal_surfaces_status(
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "proposal_surfaces": await _run_personal_sync_work(
+            _work_proposal_surfaces_status_sync, limit
+        ),
+    }
+
+
+@router.post("/kanban/automation/proposal-surfaces/inbox")
+async def create_work_proposal_inbox(
+    body: WorkProposalInboxCreateRequest,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_create_work_proposal_inbox_sync, body)
+
+
+@router.post("/kanban/automation/proposal-surfaces/inbox/{item_id}/responses")
+async def process_work_proposal_response(
+    item_id: str,
+    body: WorkProposalResponseRequest,
+) -> dict[str, Any]:
+    prepared = await _run_personal_sync_work(
+        _prepare_work_proposal_response_sync,
+        item_id,
+        body,
+    )
+    existing = prepared.get("existing_decision")
+    if isinstance(existing, dict) and existing.get("status") not in {"failed", "hook_failed"}:
+        return {
+            "ok": True,
+            "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+            "item_id": prepared["item"]["item_id"],
+            "response_id": prepared["response_id"],
+            "source_hash": prepared["source_hash"],
+            "decision": existing,
+            "idempotent_replay": True,
+            "proposal_surfaces": await _run_personal_sync_work(
+                _work_proposal_surfaces_status_sync, 20
+            ),
+        }
+    run_id = _clean_short_text(
+        body.run_id or f"proposal-response-{uuid.uuid4().hex[:12]}",
+        "proposal-response",
+        limit=180,
+    )
+    try:
+        ai = await _work_automation_local_ai_json_completion(
+            messages=_work_proposal_response_classifier_messages(prepared),
+            run_id=run_id,
+            processor_kind="preprocessing",
+            source_hash=prepared["source_hash"],
+            state_identity={
+                "item_id": prepared["item"]["item_id"],
+                "response_id": prepared["response_id"],
+                "task_kind": "proposal_response_classification",
+            },
+        )
+        interpreted = _normalize_work_proposal_response_payload(dict(ai.get("payload") or {}))
+    except Exception as exc:
+        attempts = list(exc.attempts) if isinstance(exc, WorkProcessorRoutesExhausted) else []
+        routing = {
+            "schema": KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
+            "attempts": attempts,
+            "source_hash": prepared["source_hash"],
+            "final_outcome": "all_routes_failed" if attempts else "invalid_response",
+        }
+        failure = await _run_personal_sync_work(
+            _record_work_item_review_decision_sync,
+            prepared["item"]["item_id"],
+            WorkReviewDecisionCreateRequest(
+                decision_id=prepared["decision_id"],
+                processor_kind="proposal_response",
+                decision_type="classification_failed",
+                title="Proposal response classification needs retry",
+                summary="The exact operator response was preserved, but no valid semantic outcome was produced.",
+                rationale=_body_excerpt(str(exc), limit=4000),
+                affected_refs=[f"kanban_items:{prepared['item']['item_id']}"],
+                proof_refs=[f"kanban_discussions:{prepared['discussion_id']}"],
+                status="failed",
+                provider_mode=KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+                metadata={
+                    "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+                    "authority": {
+                        "kind": "operator",
+                        "established_by": "server-owned operator response endpoint",
+                    },
+                    "response_id": prepared["response_id"],
+                    "response_source_hash": prepared["source_hash"],
+                    "response_discussion_id": prepared["discussion_id"],
+                    "response_state": {
+                        "retry_state": "retryable",
+                        "failure": _work_processor_route_error_class(exc),
+                    },
+                    "model_routing": routing,
+                },
+                actor=body.actor,
+                source_surface=body.source_surface,
+                request_id=body.request_id,
+                run_id=run_id,
+            ),
+        )
+        raise HTTPException(
+            503,
+            {
+                "code": "proposal_response_classification_failed",
+                "retryable": True,
+                "response_id": prepared["response_id"],
+                "decision_id": failure["decision"]["decision_id"],
+                "error_class": _work_processor_route_error_class(exc),
+            },
+        ) from exc
+    result = await _run_personal_sync_work(
+        _materialize_work_proposal_response_sync,
+        prepared,
+        interpreted,
+        ai,
+        body,
+    )
+    result["idempotent_replay"] = False
+    result["proposal_surfaces"] = await _run_personal_sync_work(
+        _work_proposal_surfaces_status_sync, 20
+    )
+    return result
+
+
 @router.get("/kanban/automation/review-processor/lease")
 async def get_work_review_processor_lease() -> dict[str, Any]:
     with get_conn() as conn:
@@ -21292,7 +23093,10 @@ def _get_work_automation_status_sync(
             metadata_contract,
         )
         preprocessing_contract = _work_preprocessing_readiness_contract(raw_processing_policy)
-        proposal_surfaces = _work_proposal_surfaces_contract()
+        proposal_surfaces_contract = _work_proposal_surfaces_contract()
+        proposal_surfaces = _work_proposal_surfaces_status_sync(limit)
+        if include_contracts:
+            proposal_surfaces["contract"] = proposal_surfaces_contract
         idle_worker_contract = _work_automation_idle_worker_contract()
         return {
             "ok": True,
@@ -21315,11 +23119,7 @@ def _get_work_automation_status_sync(
                 else _compact_work_contract_header(preprocessing_contract)
             ),
             "processing_policy": processing_policy,
-            "proposal_surfaces": (
-                proposal_surfaces
-                if include_contracts
-                else _compact_work_proposal_surfaces(proposal_surfaces)
-            ),
+            "proposal_surfaces": (proposal_surfaces if include_contracts else proposal_surfaces),
             "idle_worker_contract": (
                 idle_worker_contract
                 if include_contracts

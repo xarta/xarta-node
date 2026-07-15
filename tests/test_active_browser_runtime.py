@@ -447,6 +447,17 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
             "automation_processing_policy_schema": "xarta.kanban.review_processor.policy.v1",
             "automation_processing_policy_active_mode": "cloud-first",
             "automation_processing_policy_local_gate": "structured-job-packets-required",
+            "automation_proposal_surface_schema": "xarta.kanban.proposal_surfaces.contract.v1",
+            "automation_proposal_inbox_item_id": "kanban-inbox",
+            "automation_proposal_outbox_item_id": "kanban-outbox",
+            "automation_proposal_inbox_entry_count": 7,
+            "automation_proposal_outbox_entry_count": 5,
+            "automation_proposal_inbox_open_count": 2,
+            "automation_proposal_outbox_processed_count": 5,
+            "automation_proposal_response_busy": True,
+            "automation_proposal_response_busy_item_id": "kanban-request",
+            "automation_proposal_response_error_count": 1,
+            "automation_proposal_response_text": "must never be projected",
             "model_settings_visible": True,
             "model_settings_surface": "desktop-portrait-sidecar",
             "model_settings_route_count": 12,
@@ -476,6 +487,19 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
     )
     assert cleaned["automation_processing_policy_active_mode"] == "cloud-first"
     assert cleaned["automation_processing_policy_local_gate"] == "structured-job-packets-required"
+    assert cleaned["automation_proposal_surface_schema"] == (
+        "xarta.kanban.proposal_surfaces.contract.v1"
+    )
+    assert cleaned["automation_proposal_inbox_item_id"] == "kanban-inbox"
+    assert cleaned["automation_proposal_outbox_item_id"] == "kanban-outbox"
+    assert cleaned["automation_proposal_inbox_entry_count"] == 7
+    assert cleaned["automation_proposal_outbox_entry_count"] == 5
+    assert cleaned["automation_proposal_inbox_open_count"] == 2
+    assert cleaned["automation_proposal_outbox_processed_count"] == 5
+    assert cleaned["automation_proposal_response_busy"] is True
+    assert cleaned["automation_proposal_response_busy_item_id"] == "kanban-request"
+    assert cleaned["automation_proposal_response_error_count"] == 1
+    assert "automation_proposal_response_text" not in cleaned
     assert cleaned["model_settings_visible"] is True
     assert cleaned["model_settings_surface"] == "desktop-portrait-sidecar"
     assert cleaned["model_settings_route_count"] == 12
@@ -1204,6 +1228,16 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "automation_processing_policy_schema": "",
         "automation_processing_policy_active_mode": "",
         "automation_processing_policy_local_gate": "",
+        "automation_proposal_surface_schema": "",
+        "automation_proposal_inbox_item_id": "",
+        "automation_proposal_outbox_item_id": "",
+        "automation_proposal_inbox_entry_count": 0,
+        "automation_proposal_outbox_entry_count": 0,
+        "automation_proposal_inbox_open_count": 0,
+        "automation_proposal_outbox_processed_count": 0,
+        "automation_proposal_response_busy": False,
+        "automation_proposal_response_busy_item_id": "",
+        "automation_proposal_response_error_count": 0,
         "model_settings_visible": False,
         "model_settings_surface": "",
         "model_settings_route_count": 0,
