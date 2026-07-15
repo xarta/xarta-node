@@ -3478,6 +3478,90 @@ def _mark_work_proposal_outbox_superseded_sync(
         return _row_to_work_item(saved)
 
 
+def _mark_work_proposal_inbox_processed_sync(
+    item_id: str,
+    *,
+    response_id: str,
+    outcome_type: str,
+    actor: str,
+    source_surface: str,
+    request_id: str | None,
+    run_id: str | None,
+) -> dict[str, Any]:
+    """Persist the processed lifecycle on the INBOX artifact itself."""
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    with get_conn() as conn:
+        existing = _work_item_or_404(conn, item_id)
+        provenance = _json_value(existing["provenance_json"], {})
+        proposal = (
+            provenance.get("proposal_surface")
+            if isinstance(provenance.get("proposal_surface"), dict)
+            else {}
+        )
+        if (
+            proposal.get("status") == "processed"
+            and proposal.get("response_id") == response_id
+            and proposal.get("outcome_type") == outcome_type
+        ):
+            return _row_to_work_item(existing)
+        proposal.update(
+            {
+                "status": "processed",
+                "processed_at": now,
+                "response_id": response_id,
+                "outcome_type": outcome_type,
+            }
+        )
+        provenance["proposal_surface"] = proposal
+        payload = {
+            "item_id": item_id,
+            "title": existing["title"],
+            "body_excerpt": existing["body_excerpt"],
+            "item_type": existing["item_type"],
+            "state_id": existing["state_id"],
+            "priority_id": existing["priority_id"],
+            "sort_order": int(existing["sort_order"]),
+            "status": existing["status"],
+            "goal_flag": bool(existing["goal_flag"]),
+            "automation_excluded": bool(existing["automation_excluded"]),
+            "tags": _json_value(existing["tags_json"], []),
+            "related_event_ids": _json_value(existing["related_event_ids_json"], []),
+            "related_task_ids": _json_value(existing["related_task_ids_json"], []),
+            "related_issue_ids": _json_value(existing["related_issue_ids_json"], []),
+            "search_text": existing["search_text"],
+            "search_metadata": _json_value(existing["search_metadata_json"], {}),
+            "vector_index_key": existing["vector_index_key"],
+            "provenance": provenance,
+        }
+        payload["source_hash"] = _hash_json_payload(payload)
+        saved = _kanban_write_store(conn).update_item_row(item_id, payload, now=now)
+        audit = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action="mark_work_proposal_inbox_processed",
+            target_ref=f"kanban_items:{item_id}",
+            item_id=item_id,
+            parent_item_id=saved["parent_item_id"] or "",
+            created_at=now,
+            request_id=request_id or f"proposal-response-{response_id}",
+            run_id=run_id or request_id or f"proposal-response-{response_id}",
+            result="ok",
+            source_hash=payload["source_hash"],
+            metadata={
+                "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+                "response_id": response_id,
+                "outcome_type": outcome_type,
+            },
+        )
+        gen = _kanban_table_sync_gen(conn, "kanban-proposal-inbox-processed")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(saved), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit, gen)
+        return _row_to_work_item(saved)
+
+
 def _materialize_work_proposal_response_sync(
     prepared: dict[str, Any],
     interpreted: dict[str, Any],
@@ -3765,6 +3849,15 @@ def _materialize_work_proposal_response_sync(
                 request_id=body.request_id,
                 run_id=body.run_id,
             ),
+        )
+        _mark_work_proposal_inbox_processed_sync(
+            item_id,
+            response_id=response_id,
+            outcome_type=outcome_type,
+            actor=body.actor,
+            source_surface=body.source_surface,
+            request_id=body.request_id,
+            run_id=body.run_id,
         )
 
     readiness_refresh: dict[str, Any] = {
@@ -22621,6 +22714,22 @@ async def process_work_proposal_response(
         existing_metadata = (
             existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
         )
+        if existing.get("status") != "superseded" and existing.get("decision_type") in {
+            "accepted",
+            "partial",
+            "rejected",
+            "follow_up",
+        }:
+            await _run_personal_sync_work(
+                _mark_work_proposal_inbox_processed_sync,
+                prepared["item"]["item_id"],
+                response_id=prepared["response_id"],
+                outcome_type=str(existing["decision_type"]),
+                actor=body.actor,
+                source_surface=body.source_surface,
+                request_id=body.request_id,
+                run_id=body.run_id,
+            )
         readiness_refresh = {
             "requested": False,
             "state": "not_applicable",
