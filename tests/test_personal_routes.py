@@ -7953,6 +7953,93 @@ def test_work_proposal_operator_response_creates_outcome_and_owned_follow_up(
     assert previous_outbox["superseded_by_response_id"] == superseding["response_id"]
 
 
+def test_work_proposal_response_durably_queues_material_context_refresh(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-proposal-refresh-leaf",
+                title="Refresh proposal-owned implementation context",
+                body="A bounded Todo leaf whose implementation context depends on operator input.",
+                state_id="todo",
+                priority_id="high",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_proposal_inbox(
+            _proposal_request(
+                entry_id="proposal-refresh-entry",
+                source_item_refs=["xarta-kanban:item:work-proposal-refresh-leaf"],
+                semantic_owner_item_ref="xarta-kanban:item:work-proposal-refresh-leaf",
+            )
+        )
+    )
+
+    async def fake_classifier(**kwargs):
+        return {
+            "payload": {
+                "outcome_type": "accepted",
+                "title": "Bounded choice accepted",
+                "summary": "The operator selected the bounded choice for this leaf.",
+                "rationale": "The complete response supplies the missing implementation context.",
+                "confidence": "high",
+                "uncertainty": "",
+                "selected_choices": [{"choice": "bounded path", "evidence": "whole response"}],
+                "best_judgment_authorized": True,
+                "agent_choices": [
+                    {"choice": "smallest safe batch", "evidence": "bounded authority"}
+                ],
+                "remaining_questions": [],
+                "implementation_actions": [],
+                "affected_item_refs": ["xarta-kanban:item:work-proposal-refresh-leaf"],
+                "proof_refs": ["pytest:proposal-refresh"],
+            },
+            "model_alias": "TEST-HERMES",
+            "model_attempts": [{"route_id": "semantic-test", "status": "success"}],
+            "chosen_route_id": "semantic-test",
+            "chosen_model": "test-model",
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        fake_classifier,
+    )
+    body = routes_personal.WorkProposalResponseRequest(
+        response_text="Approve the bounded path and use best judgment only inside this leaf.",
+        response_id="proposal-response-refresh-fixed",
+    )
+    result = asyncio.run(
+        routes_personal.process_work_proposal_response("proposal-refresh-entry", body)
+    )
+    replay = asyncio.run(
+        routes_personal.process_work_proposal_response("proposal-refresh-entry", body)
+    )
+
+    assert result["readiness_refresh_requested"] is True
+    assert result["readiness_refresh"]["state"] == "queued"
+    assert result["readiness_refresh"]["idempotent_replay"] is False
+    assert replay["idempotent_replay"] is True
+    assert replay["readiness_refresh_requested"] is True
+    assert replay["readiness_refresh"]["state"] == "queued"
+    assert replay["readiness_refresh"]["idempotent_replay"] is True
+    marker = conn.execute(
+        "SELECT * FROM kanban_review_processor_markers WHERE item_id=? "
+        "AND processor_kind='preprocessing'",
+        ("work-proposal-refresh-leaf",),
+    ).fetchone()
+    marker_metadata = json.loads(marker["metadata_json"])
+    assert marker["status"] == "queued"
+    assert marker_metadata["reason"] == "proposal_response_material_context_change"
+    assert marker_metadata["proposal_response_id"] == "proposal-response-refresh-fixed"
+    assert marker_metadata["queue_source"] == "proposal_response"
+
+
 @pytest.mark.parametrize(
     ("outcome_type", "remaining_questions", "implementation_actions", "processed"),
     [
