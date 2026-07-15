@@ -18440,6 +18440,7 @@ def _work_preprocessing_original_operator_requests(
 def _work_preprocessing_operator_request_assessment(
     payload: dict[str, Any],
     original_requests: dict[str, Any],
+    execution_directive: dict[str, Any],
 ) -> dict[str, Any]:
     if not original_requests.get("required"):
         return {
@@ -18447,6 +18448,8 @@ def _work_preprocessing_operator_request_assessment(
             "record_refs_in_order": [],
             "alignment": "not_applicable",
             "comparison_summary": "",
+            "intent_summary": "",
+            "intent_components": [],
             "deviations": [],
             "requires_operator_input": False,
         }
@@ -18474,6 +18477,9 @@ def _work_preprocessing_operator_request_assessment(
     comparison_summary = _body_excerpt(str(raw.get("comparison_summary") or ""), limit=4000).strip()
     if not comparison_summary:
         raise ValueError("operator_request_assessment comparison_summary is required")
+    intent_summary = _body_excerpt(str(raw.get("intent_summary") or ""), limit=4000).strip()
+    if not intent_summary:
+        raise ValueError("operator_request_assessment intent_summary is required")
     raw_deviations = raw.get("deviations")
     if not isinstance(raw_deviations, list):
         raise ValueError("operator_request_assessment deviations must be a list")
@@ -18511,11 +18517,134 @@ def _work_preprocessing_operator_request_assessment(
         raise ValueError("aligned operator_request_assessment cannot contain deviations")
     if alignment != "aligned" and not deviations:
         raise ValueError("deviation operator_request_assessment requires a specific deviation")
+
+    allowed_ownership_refs = {
+        f"work_unit:{unit['unit_id']}"
+        for unit in execution_directive.get("work_units") or []
+        if isinstance(unit, dict) and unit.get("unit_id")
+    }
+    for value in payload.get("decomposition_items") or []:
+        if isinstance(value, dict):
+            title = _clean_short_text(str(value.get("title") or ""), "", limit=180)
+            if title:
+                allowed_ownership_refs.add(f"decomposition:{title}")
+    raw_components = raw.get("intent_components")
+    if not isinstance(raw_components, list) or not raw_components:
+        raise ValueError("operator_request_assessment intent_components must be a nonempty list")
+    intent_components: list[dict[str, Any]] = []
+    seen_component_ids: set[str] = set()
+    covered_request_refs: set[str] = set()
+    ambiguity_refs: set[str] = set()
+    for index, value in enumerate(raw_components[:32]):
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"operator_request_assessment intent_components[{index}] must be an object"
+            )
+        component_id = _clean_short_text(str(value.get("component_id") or ""), "", limit=100)
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", component_id):
+            raise ValueError(
+                f"operator_request_assessment intent_components[{index}] component_id is invalid"
+            )
+        if component_id in seen_component_ids:
+            raise ValueError("operator_request_assessment intent component ids must be unique")
+        seen_component_ids.add(component_id)
+        request_refs = [str(ref) for ref in value.get("request_refs") or []]
+        if (
+            not request_refs
+            or len(request_refs) != len(set(request_refs))
+            or any(ref not in expected_refs for ref in request_refs)
+        ):
+            raise ValueError(
+                f"operator_request_assessment intent_components[{index}] request_refs are invalid"
+            )
+        covered_request_refs.update(request_refs)
+        specification = _body_excerpt(str(value.get("specification") or ""), limit=3000).strip()
+        why_it_matters = _body_excerpt(str(value.get("why_it_matters") or ""), limit=3000).strip()
+        if not specification or not why_it_matters:
+            raise ValueError(
+                f"operator_request_assessment intent_components[{index}] requires specification and why_it_matters"
+            )
+        importance = _clean_short_text(str(value.get("importance") or ""), "", limit=40).lower()
+        if importance not in {"low", "medium", "high", "critical"}:
+            raise ValueError(
+                f"operator_request_assessment intent_components[{index}] importance is invalid"
+            )
+
+        def component_text_list(field: str) -> list[str]:
+            raw_values = value.get(field)
+            if not isinstance(raw_values, list) or not raw_values:
+                raise ValueError(
+                    f"operator_request_assessment intent_components[{index}] {field} must be a nonempty list"
+                )
+            cleaned = [
+                _body_excerpt(str(entry or ""), limit=2000).strip() for entry in raw_values[:16]
+            ]
+            if not cleaned or any(not entry for entry in cleaned):
+                raise ValueError(
+                    f"operator_request_assessment intent_components[{index}] {field} contains an empty value"
+                )
+            return cleaned
+
+        implementation_consequences = component_text_list("implementation_consequences")
+        acceptance_implications = component_text_list("acceptance_implications")
+        planned_ownership = [
+            _clean_short_text(str(ref or ""), "", limit=260)
+            for ref in value.get("planned_ownership") or []
+        ]
+        if (
+            not planned_ownership
+            or len(planned_ownership) != len(set(planned_ownership))
+            or any(ref not in allowed_ownership_refs for ref in planned_ownership)
+        ):
+            raise ValueError(
+                f"operator_request_assessment intent_components[{index}] planned_ownership must resolve to an execution work unit or exact decomposition title"
+            )
+        confidence = _clean_short_text(str(value.get("confidence") or ""), "", limit=40).lower()
+        if confidence not in {"low", "medium", "medium-high", "high"}:
+            raise ValueError(
+                f"operator_request_assessment intent_components[{index}] confidence is invalid"
+            )
+        inference_kind = _clean_short_text(
+            str(value.get("inference_kind") or ""), "", limit=80
+        ).lower()
+        if inference_kind not in {"explicit", "necessary_consequence", "material_ambiguity"}:
+            raise ValueError(
+                f"operator_request_assessment intent_components[{index}] inference_kind is invalid"
+            )
+        if inference_kind == "material_ambiguity":
+            ambiguity_refs.update(request_refs)
+        intent_components.append(
+            {
+                "component_id": component_id,
+                "request_refs": request_refs,
+                "specification": specification,
+                "importance": importance,
+                "why_it_matters": why_it_matters,
+                "implementation_consequences": implementation_consequences,
+                "acceptance_implications": acceptance_implications,
+                "planned_ownership": planned_ownership,
+                "confidence": confidence,
+                "inference_kind": inference_kind,
+            }
+        )
+    if covered_request_refs != set(expected_refs):
+        raise ValueError(
+            "operator_request_assessment intent_components must cover every original request ref"
+        )
+    resolved_deviation_refs = {deviation["affected_request_ref"] for deviation in deviations}
+    if ambiguity_refs and (
+        alignment == "aligned" or not ambiguity_refs.issubset(resolved_deviation_refs)
+    ):
+        raise ValueError(
+            "material_ambiguity intent components require matching deviation approval or awaiting_operator resolution"
+        )
     return {
         "required": True,
         "record_refs_in_order": record_refs,
         "alignment": alignment,
         "comparison_summary": comparison_summary,
+        "intent_summary": intent_summary,
+        "intent_components": intent_components,
         "deviations": deviations,
         "requires_operator_input": any(
             deviation["awaiting_operator"] and not deviation["operator_approval_ref"]
@@ -18783,7 +18912,11 @@ PREPROCESSING_SYSTEM_PROMPT = (
     "When an operator decision needs its own lifecycle, return a proposal_entries "
     "INBOX request and never make INBOX the implementation parent. Use a small "
     "non-lifecycle proposal note only for a genuine status note. Do not invent "
-    "deterministic substitute work or deterministic semantic fallback."
+    "deterministic substitute work or deterministic semantic fallback. For tagged "
+    "verbatim Operator requests, preserve every request ref, derive explicit intent "
+    "components with rationale, consequences, acceptance, and resolvable work-unit "
+    "or child-card ownership. Material ambiguity must use the approval or "
+    "awaiting_operator lifecycle and must never be silently treated as ready."
 )
 BLOCKER_PROCESSOR_SYSTEM_PROMPT = (
     "You are the provider-neutral Blueprints Kanban Blocker Processor. Return only one "
@@ -19283,6 +19416,9 @@ def _work_preprocessing_local_ai_messages(
         "hard_rules": [
             "When original_operator_requests.required=true, compare the proposed decomposition, execution directive, implementation acceptance, and proof against every verbatim record in sequence. Never normalize, paraphrase, censor, or silently omit request text.",
             "Return an operator_request_assessment for every tagged verbatim-request card. It must name every supplied source_ref in order and state whether the plan is aligned or proposes a deviation.",
+            "For every tagged verbatim-request card, decompose every request record into meaningful intent_components. Each component must explain why the stated specification matters, assign importance, derive concrete implementation consequences and acceptance implications, and map them to an exact execution work unit or decomposition child title.",
+            "Every original request source_ref must be covered by at least one intent component. Do not invent broader scope: necessary consequences may preserve explicit intent, but a material ambiguity that changes implementation meaning requires a matching deviation with durable Operator approval or awaiting_operator lifecycle handling.",
+            "Planned ownership is a contract, not commentary. A self-contained Dockge stack request must keep its application code, Compose/deployment assets, and app-layer bind/volume design in work units or child cards that own that stack boundary; do not introduce a second canonical source tree or image-baked app without an approved deviation.",
             "An intent-changing deviation needs a specific reason and durable explicit Operator approval. If a contradiction, impossibility, or necessary constraint is discovered without approval, return a lifecycle proposal entry, keep ready=false, and route the item to awaiting_operator before implementation.",
             "If required provider/API wiring is missing, ask or block; do not substitute a fallback.",
             "If the item lacks enough information to implement safely, ready must be false and decomposition_items must contain the concrete child work items needed to make progress.",
@@ -19360,6 +19496,23 @@ def _work_preprocessing_local_ai_messages(
                 "record_refs_in_order": ["kanban_items:<id>:body"],
                 "alignment": "aligned|deviation_requires_approval|contradiction_requires_approval|impossibility_requires_approval|necessary_constraint_requires_approval",
                 "comparison_summary": "how the proposed work and proof satisfy every verbatim request in sequence",
+                "intent_summary": "concise whole-request intent without adding scope",
+                "intent_components": [
+                    {
+                        "component_id": "stable-lowercase-id",
+                        "request_refs": ["kanban_items:<id>:body"],
+                        "specification": "the meaningful stated requirement",
+                        "importance": "low|medium|high|critical",
+                        "why_it_matters": "why the Operator deliberately specified it",
+                        "implementation_consequences": ["required implementation consequence"],
+                        "acceptance_implications": ["observable acceptance implication"],
+                        "planned_ownership": [
+                            "work_unit:<unit_id>|decomposition:<exact child title>"
+                        ],
+                        "confidence": "low|medium|medium-high|high",
+                        "inference_kind": "explicit|necessary_consequence|material_ambiguity",
+                    }
+                ],
                 "deviations": [
                     {
                         "affected_request_ref": "source ref",
@@ -19820,6 +19973,7 @@ def _preprocessing_readiness_marker(
     outcome: str = "ready",
     decomposition: dict[str, Any] | None = None,
     execution_directive: dict[str, Any] | None = None,
+    operator_request_assessment: dict[str, Any] | None = None,
     proposal_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     next_actions = ai_payload.get("recommended_next_actions")
@@ -19876,6 +20030,7 @@ def _preprocessing_readiness_marker(
         "open_questions": open_questions,
         "proposal_entry_ids": open_questions,
         "execution_directive": dict(execution_directive or {}),
+        "operator_request_assessment": dict(operator_request_assessment or {}),
         "decomposition_item_ids": [
             str(item.get("item_id") or "")
             for item in decomposition.get("items", [])
@@ -20152,6 +20307,7 @@ async def _process_work_preprocessing_idle_marker(
     operator_request_assessment = _work_preprocessing_operator_request_assessment(
         payload,
         original_operator_requests,
+        execution_directive,
     )
     if operator_request_assessment["requires_operator_input"] and not any(
         entry["lifecycle_required"] for entry in proposal_entries
@@ -20268,6 +20424,7 @@ async def _process_work_preprocessing_idle_marker(
             processor_route=ai,
             outcome="awaiting_operator",
             execution_directive=execution_directive,
+            operator_request_assessment=operator_request_assessment,
             proposal_results=proposal_results,
         )
         metadata = dict(updated_hints.get("metadata") or {})
@@ -20326,6 +20483,7 @@ async def _process_work_preprocessing_idle_marker(
                     "schema": "xarta.kanban.preprocessing.operator_input.v1",
                     "proposal_item_ids": proposal_item_ids,
                     "execution_directive": execution_directive,
+                    "operator_request_assessment": operator_request_assessment,
                     "model_routing": _work_automation_ai_routing_evidence(ai),
                     "readiness_marker": readiness_marker,
                 },
@@ -20487,6 +20645,7 @@ async def _process_work_preprocessing_idle_marker(
                     "document_source_hash": source["document_source_hash"],
                     "blocking_codes": all_blocking_codes,
                     "engineering_guidance": engineering_guidance,
+                    "operator_request_assessment": operator_request_assessment,
                     "decomposition": decomposition_result,
                     "source": source,
                     "llm_payload": payload,
@@ -20577,6 +20736,7 @@ async def _process_work_preprocessing_idle_marker(
             outcome="decomposed",
             decomposition=decomposition_result,
             execution_directive=execution_directive,
+            operator_request_assessment=operator_request_assessment,
             proposal_results=proposal_results,
         )
         metadata = dict(updated_hints.get("metadata") or {})
@@ -20660,6 +20820,7 @@ async def _process_work_preprocessing_idle_marker(
                     "readiness_marker": readiness_marker,
                     "engineering_guidance": engineering_guidance,
                     "execution_directive": execution_directive,
+                    "operator_request_assessment": operator_request_assessment,
                     "decomposition": decomposition_result,
                     "parent_lane_update": {
                         "from_state_id": item["state_id"],
@@ -20756,6 +20917,7 @@ async def _process_work_preprocessing_idle_marker(
         processor_route=ai,
         outcome=readiness_outcome,
         execution_directive=execution_directive,
+        operator_request_assessment=operator_request_assessment,
         proposal_results=proposal_results,
     )
     metadata = dict(hints.get("metadata") or {})
@@ -20833,6 +20995,7 @@ async def _process_work_preprocessing_idle_marker(
                 "readiness_marker": readiness_marker,
                 "engineering_guidance": engineering_guidance,
                 "execution_directive": execution_directive,
+                "operator_request_assessment": operator_request_assessment,
                 "readiness_normalization": readiness_normalization or None,
                 "outcome_type": outcome_type,
                 "canonical_item_ref": canonical_item_ref,

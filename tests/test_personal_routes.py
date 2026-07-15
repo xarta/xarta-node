@@ -15028,32 +15028,142 @@ def test_verbatim_operator_request_storage_rejects_oversize_card_total(monkeypat
     assert "total limit" in total_error.value.detail
 
 
-def test_preprocessing_operator_request_assessment_accepts_aligned_comparison():
-    original = {
-        "required": True,
-        "records": [
-            {"source_ref": "kanban_items:verbatim-fixture:body"},
-            {"source_ref": "kanban_discussions:operator-request-verbatim-002-first"},
-        ],
+def _operator_assessment_execution_directive(*unit_ids):
+    return {
+        "work_units": [
+            {"unit_id": unit_id, "title": unit_id, "scope": unit_id} for unit_id in unit_ids
+        ]
     }
 
-    assessment = routes_personal._work_preprocessing_operator_request_assessment(
-        {
-            "operator_request_assessment": {
-                "record_refs_in_order": [
-                    "kanban_items:verbatim-fixture:body",
-                    "kanban_discussions:operator-request-verbatim-002-first",
-                ],
-                "alignment": "aligned",
-                "comparison_summary": "Implementation and proof cover both exact requests.",
-                "deviations": [],
+
+def _operator_assessment_payload(refs, *, components=None, alignment="aligned", deviations=None):
+    if components is None:
+        components = [
+            {
+                "component_id": "preserve-request",
+                "request_refs": list(refs),
+                "specification": "Preserve the stated Operator requirement.",
+                "importance": "high",
+                "why_it_matters": "The Operator stated this to constrain the implementation.",
+                "implementation_consequences": ["Implement the requirement without substitution."],
+                "acceptance_implications": ["Proof compares the outcome with the stated request."],
+                "planned_ownership": ["work_unit:implementation"],
+                "confidence": "high",
+                "inference_kind": "explicit",
             }
+        ]
+    return {
+        "operator_request_assessment": {
+            "record_refs_in_order": list(refs),
+            "alignment": alignment,
+            "comparison_summary": "Implementation and proof cover every exact request.",
+            "intent_summary": "Preserve the Operator's bounded implementation intent.",
+            "intent_components": components,
+            "deviations": list(deviations or []),
+        }
+    }
+
+
+def test_preprocessing_operator_request_assessment_keeps_self_contained_scheduler_ownership():
+    request_ref = "kanban_items:scheduler-fixture:body"
+    original = {"required": True, "records": [{"source_ref": request_ref}]}
+    components = [
+        {
+            "component_id": "first-class-stack-boundary",
+            "request_refs": [request_ref],
+            "specification": "xarta-scheduler is a first-class xarta-node Dockge stack.",
+            "importance": "critical",
+            "why_it_matters": "The deployable stack is the service's canonical ownership boundary.",
+            "implementation_consequences": [
+                "Keep application code and Compose/deployment assets inside the Dockge stack."
+            ],
+            "acceptance_implications": [
+                "The stack is self-contained and has no second canonical source tree."
+            ],
+            "planned_ownership": ["work_unit:stack-app", "work_unit:stack-compose"],
+            "confidence": "high",
+            "inference_kind": "necessary_consequence",
         },
+        {
+            "component_id": "mounted-app-layer",
+            "request_refs": [request_ref],
+            "specification": "Use a bind mount or volume for the application layer.",
+            "importance": "high",
+            "why_it_matters": "The Operator explicitly rejected an image-baked application layer.",
+            "implementation_consequences": ["Compose owns the app-layer bind/volume mount design."],
+            "acceptance_implications": ["Runtime proof shows the mounted application layer."],
+            "planned_ownership": ["work_unit:stack-mount"],
+            "confidence": "high",
+            "inference_kind": "explicit",
+        },
+    ]
+    directive = _operator_assessment_execution_directive(
+        "stack-app", "stack-compose", "stack-mount"
+    )
+
+    assessment = routes_personal._work_preprocessing_operator_request_assessment(
+        _operator_assessment_payload([request_ref], components=components),
         original,
+        directive,
     )
 
     assert assessment["alignment"] == "aligned"
     assert assessment["requires_operator_input"] is False
+    assert assessment["intent_components"][0]["importance"] == "critical"
+    assert assessment["intent_components"][0]["planned_ownership"] == [
+        "work_unit:stack-app",
+        "work_unit:stack-compose",
+    ]
+    assert assessment["intent_components"][1]["planned_ownership"] == ["work_unit:stack-mount"]
+
+
+def test_preprocessing_rejects_uncovered_operator_request_ref():
+    refs = ["kanban_items:fixture:body", "kanban_discussions:operator-request-verbatim-002"]
+    original = {"required": True, "records": [{"source_ref": ref} for ref in refs]}
+    payload = _operator_assessment_payload(refs)
+    payload["operator_request_assessment"]["intent_components"][0]["request_refs"] = [refs[0]]
+
+    with pytest.raises(ValueError, match="cover every original request ref"):
+        routes_personal._work_preprocessing_operator_request_assessment(
+            payload,
+            original,
+            _operator_assessment_execution_directive("implementation"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("why_it_matters", "", "requires specification and why_it_matters"),
+        ("implementation_consequences", [], "must be a nonempty list"),
+    ],
+)
+def test_preprocessing_rejects_empty_intent_rationale_or_consequences(field, value, error):
+    ref = "kanban_items:fixture:body"
+    payload = _operator_assessment_payload([ref])
+    payload["operator_request_assessment"]["intent_components"][0][field] = value
+
+    with pytest.raises(ValueError, match=error):
+        routes_personal._work_preprocessing_operator_request_assessment(
+            payload,
+            {"required": True, "records": [{"source_ref": ref}]},
+            _operator_assessment_execution_directive("implementation"),
+        )
+
+
+def test_preprocessing_rejects_unresolved_intent_ownership():
+    ref = "kanban_items:fixture:body"
+    payload = _operator_assessment_payload([ref])
+    payload["operator_request_assessment"]["intent_components"][0]["planned_ownership"] = [
+        "work_unit:not-defined"
+    ]
+
+    with pytest.raises(ValueError, match="planned_ownership must resolve"):
+        routes_personal._work_preprocessing_operator_request_assessment(
+            payload,
+            {"required": True, "records": [{"source_ref": ref}]},
+            _operator_assessment_execution_directive("implementation"),
+        )
 
 
 def test_preprocessing_rejects_unjustified_operator_request_deviation():
@@ -15081,33 +15191,52 @@ def test_preprocessing_rejects_unjustified_operator_request_deviation():
                 }
             },
             original,
+            _operator_assessment_execution_directive("implementation"),
         )
 
 
-def test_preprocessing_routes_discovered_impossibility_for_operator_approval():
+def test_preprocessing_material_ambiguity_cannot_be_treated_as_aligned_ready_work():
+    ref = "kanban_items:verbatim-fixture:body"
+    original = {"required": True, "records": [{"source_ref": ref}]}
+    payload = _operator_assessment_payload([ref])
+    payload["operator_request_assessment"]["intent_components"][0]["inference_kind"] = (
+        "material_ambiguity"
+    )
+
+    with pytest.raises(ValueError, match="material_ambiguity.*require matching deviation"):
+        routes_personal._work_preprocessing_operator_request_assessment(
+            payload,
+            original,
+            _operator_assessment_execution_directive("implementation"),
+        )
+
+
+def test_preprocessing_routes_material_ambiguity_for_operator_approval():
     original = {
         "required": True,
         "records": [{"source_ref": "kanban_items:verbatim-fixture:body"}],
     }
-
-    assessment = routes_personal._work_preprocessing_operator_request_assessment(
-        {
-            "operator_request_assessment": {
-                "record_refs_in_order": ["kanban_items:verbatim-fixture:body"],
-                "alignment": "impossibility_requires_approval",
-                "comparison_summary": "The API cannot preserve the requested storage form.",
-                "deviations": [
-                    {
-                        "affected_request_ref": "kanban_items:verbatim-fixture:body",
-                        "description": "Use the only storage form accepted by the API.",
-                        "reason": "The requested form is rejected by the authoritative API schema.",
-                        "operator_approval_ref": "",
-                        "awaiting_operator": True,
-                    }
-                ],
+    request_ref = "kanban_items:verbatim-fixture:body"
+    payload = _operator_assessment_payload(
+        [request_ref],
+        alignment="impossibility_requires_approval",
+        deviations=[
+            {
+                "affected_request_ref": request_ref,
+                "description": "Use the only storage form accepted by the API.",
+                "reason": "The requested form is rejected by the authoritative API schema.",
+                "operator_approval_ref": "",
+                "awaiting_operator": True,
             }
-        },
+        ],
+    )
+    payload["operator_request_assessment"]["intent_components"][0]["inference_kind"] = (
+        "material_ambiguity"
+    )
+    assessment = routes_personal._work_preprocessing_operator_request_assessment(
+        payload,
         original,
+        _operator_assessment_execution_directive("implementation"),
     )
 
     assert assessment["requires_operator_input"] is True
