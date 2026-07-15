@@ -2611,9 +2611,14 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
                 "proposal",
                 "question",
                 "approval_request",
+                "review_follow_up",
                 "review_processor_follow_up",
                 "operator_follow_up",
             ],
+            "entry_type_aliases": {
+                "review-follow-up": "review_processor_follow_up",
+                "review_follow_up": "review_processor_follow_up",
+            },
             "required_fields": [
                 "entry_type",
                 "title",
@@ -2693,6 +2698,8 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
 
 def _clean_work_proposal_entry_type(value: Any) -> str:
     entry_type = _clean_short_text(str(value or ""), "proposal", limit=80).replace("-", "_")
+    if entry_type == "review_follow_up":
+        entry_type = "review_processor_follow_up"
     allowed = {
         "proposal",
         "question",
@@ -2777,6 +2784,8 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         if isinstance(decision_metadata.get("response_state"), dict)
         else {}
     )
+    tags = _json_value(row["tags_json"], [])
+    superseded = proposal.get("status") == "superseded" or "superseded" in tags
     processed = row["state_id"] == "done" or bool(proposal.get("processed_at"))
     retry_state = _clean_short_text(
         str(response_state.get("retry_state") or proposal.get("retry_state") or ""),
@@ -2792,8 +2801,13 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         "status": row["status"],
         "entry_type": proposal.get("entry_type") or "",
         "proposal_status": (
-            proposal.get("status")
-            or ("processed" if processed else ("failed" if retry_state else "pending"))
+            "superseded"
+            if superseded
+            else (
+                "processed"
+                if processed
+                else ("failed" if retry_state else proposal.get("status") or "pending")
+            )
         ),
         "requested_operator_action": proposal.get("requested_operator_action") or "",
         "exact_decision_needed": proposal.get("exact_decision_needed") or "",
@@ -2802,6 +2816,9 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         "implementation_refs": implementation_refs,
         "links": links,
         "processed": processed,
+        "superseded": superseded,
+        "superseded_at": proposal.get("superseded_at") or "",
+        "superseded_by_response_id": proposal.get("superseded_by_response_id") or "",
         "retry_state": retry_state,
         "failure": response_state.get("failure") or proposal.get("failure") or "",
         "latest_decision_id": decision_row["decision_id"] if decision_row else "",
@@ -3376,6 +3393,91 @@ def _ensure_work_proposal_artifact_item_sync(
         return _row_to_work_item(item_row), False
 
 
+def _mark_work_proposal_outbox_superseded_sync(
+    outbox_item_id: str,
+    *,
+    superseded_by_response_id: str,
+    actor: str,
+    source_surface: str,
+    request_id: str | None,
+    run_id: str | None,
+) -> dict[str, Any]:
+    """Make supersession visible on the durable OUTBOX artifact, not only its decision."""
+    now = _utc_now_iso()
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    effective_request_id = request_id or f"proposal-response-{superseded_by_response_id}"
+    effective_run_id = run_id or effective_request_id
+    with get_conn() as conn:
+        existing = _work_item_or_404(conn, outbox_item_id)
+        provenance = _json_value(existing["provenance_json"], {})
+        proposal = (
+            provenance.get("proposal_surface")
+            if isinstance(provenance.get("proposal_surface"), dict)
+            else {}
+        )
+        if (
+            proposal.get("status") == "superseded"
+            and proposal.get("superseded_by_response_id") == superseded_by_response_id
+        ):
+            return _row_to_work_item(existing)
+        proposal.update(
+            {
+                "status": "superseded",
+                "superseded_at": now,
+                "superseded_by_response_id": superseded_by_response_id,
+            }
+        )
+        provenance["proposal_surface"] = proposal
+        tags = _json_value(existing["tags_json"], [])
+        if "superseded" not in tags:
+            tags.append("superseded")
+        payload = {
+            "item_id": outbox_item_id,
+            "title": existing["title"],
+            "body_excerpt": existing["body_excerpt"],
+            "item_type": existing["item_type"],
+            "state_id": existing["state_id"],
+            "priority_id": existing["priority_id"],
+            "sort_order": int(existing["sort_order"]),
+            "status": existing["status"],
+            "goal_flag": bool(existing["goal_flag"]),
+            "automation_excluded": bool(existing["automation_excluded"]),
+            "tags": tags,
+            "related_event_ids": _json_value(existing["related_event_ids_json"], []),
+            "related_task_ids": _json_value(existing["related_task_ids_json"], []),
+            "related_issue_ids": _json_value(existing["related_issue_ids_json"], []),
+            "search_text": existing["search_text"],
+            "search_metadata": _json_value(existing["search_metadata_json"], {}),
+            "vector_index_key": existing["vector_index_key"],
+            "provenance": provenance,
+        }
+        payload["source_hash"] = _hash_json_payload(payload)
+        saved = _kanban_write_store(conn).update_item_row(outbox_item_id, payload, now=now)
+        audit = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=actor,
+            source_surface=source_surface,
+            action="supersede_work_proposal_outbox",
+            target_ref=f"kanban_items:{outbox_item_id}",
+            item_id=outbox_item_id,
+            parent_item_id=saved["parent_item_id"] or "",
+            created_at=now,
+            request_id=effective_request_id,
+            run_id=effective_run_id,
+            result="ok",
+            source_hash=payload["source_hash"],
+            metadata={
+                "schema": KANBAN_PROPOSAL_OUTCOME_SCHEMA,
+                "superseded_by_response_id": superseded_by_response_id,
+            },
+        )
+        gen = _kanban_table_sync_gen(conn, "kanban-proposal-outbox-supersession")
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_items", outbox_item_id, dict(saved), gen)
+        enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit, gen)
+        return _row_to_work_item(saved)
+
+
 def _materialize_work_proposal_response_sync(
     prepared: dict[str, Any],
     interpreted: dict[str, Any],
@@ -3548,6 +3650,7 @@ def _materialize_work_proposal_response_sync(
         )
 
     superseded_ids: list[str] = []
+    superseded_outbox_ids: list[str] = []
     with get_conn() as conn:
         store = _kanban_write_store(conn)
         previous_rows = conn.execute(
@@ -3560,6 +3663,10 @@ def _materialize_work_proposal_response_sync(
         ).fetchall()
         gen = _kanban_table_sync_gen(conn, "kanban-proposal-response-supersession")
         for previous in previous_rows:
+            previous_metadata = _json_value(previous["metadata_json"], {})
+            previous_outbox_id = _proposal_item_id_from_ref(previous_metadata.get("outbox_item_id"))
+            if previous_outbox_id and previous_outbox_id not in superseded_outbox_ids:
+                superseded_outbox_ids.append(previous_outbox_id)
             previous_payload = dict(previous)
             previous_payload["status"] = "superseded"
             previous_payload["updated_at"] = _utc_now_iso()
@@ -3573,6 +3680,16 @@ def _materialize_work_proposal_response_sync(
                 gen,
             )
             superseded_ids.append(saved["decision_id"])
+
+    for previous_outbox_id in superseded_outbox_ids:
+        _mark_work_proposal_outbox_superseded_sync(
+            previous_outbox_id,
+            superseded_by_response_id=response_id,
+            actor=body.actor,
+            source_surface=body.source_surface,
+            request_id=body.request_id,
+            run_id=body.run_id,
+        )
 
     decision_status = {
         "accepted": "accepted",
@@ -3620,6 +3737,7 @@ def _materialize_work_proposal_response_sync(
                 "agent_choices": interpreted["agent_choices"],
                 "remaining_questions": interpreted["remaining_questions"],
                 "superseded_decision_ids": superseded_ids,
+                "superseded_outbox_item_ids": superseded_outbox_ids,
                 "response_state": {"retry_state": "", "failure": ""},
                 "model_routing": _work_automation_ai_routing_evidence(ai),
             },
@@ -3686,6 +3804,7 @@ def _materialize_work_proposal_response_sync(
         "follow_up_inbox_items": follow_up_inbox,
         "links": links,
         "superseded_decision_ids": superseded_ids,
+        "superseded_outbox_item_ids": superseded_outbox_ids,
         "readiness_refresh_requested": bool(semantic_owner_id and processed),
         "model_routing": _work_automation_ai_routing_evidence(ai),
     }

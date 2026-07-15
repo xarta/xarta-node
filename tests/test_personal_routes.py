@@ -843,23 +843,25 @@ def _create_proposal_surface_fixture() -> None:
 
 
 def _proposal_request(
-    *, lifecycle_required: bool = True
+    *, lifecycle_required: bool = True, **overrides
 ) -> routes_personal.WorkProposalInboxCreateRequest:
-    return routes_personal.WorkProposalInboxCreateRequest(
-        entry_id=("proposal-fixture-entry" if lifecycle_required else "proposal-fixture-note"),
-        entry_type="approval_request",
-        title="Choose the bounded release behavior",
-        summary="The implementation has two safe behaviors with different rollout costs.",
-        rationale="Current evidence does not grant the agent authority to select the rollout.",
-        requested_operator_action="Approve one behavior or authorize bounded best judgment.",
-        exact_decision_needed="Choose staged rollout, immediate rollout, or defer.",
-        source_item_refs=["xarta-kanban:item:work-proposal-semantic-owner"],
-        semantic_owner_item_ref="xarta-kanban:item:work-proposal-semantic-owner",
-        proof_refs=["pytest:proposal-surface"],
-        lifecycle_required=lifecycle_required,
-        actor="codex-test",
-        source_surface="pytest",
-    )
+    values = {
+        "entry_id": ("proposal-fixture-entry" if lifecycle_required else "proposal-fixture-note"),
+        "entry_type": "approval_request",
+        "title": "Choose the bounded release behavior",
+        "summary": "The implementation has two safe behaviors with different rollout costs.",
+        "rationale": "Current evidence does not grant the agent authority to select the rollout.",
+        "requested_operator_action": "Approve one behavior or authorize bounded best judgment.",
+        "exact_decision_needed": "Choose staged rollout, immediate rollout, or defer.",
+        "source_item_refs": ["xarta-kanban:item:work-proposal-semantic-owner"],
+        "semantic_owner_item_ref": "xarta-kanban:item:work-proposal-semantic-owner",
+        "proof_refs": ["pytest:proposal-surface"],
+        "lifecycle_required": lifecycle_required,
+        "actor": "codex-test",
+        "source_surface": "pytest",
+    }
+    values.update(overrides)
+    return routes_personal.WorkProposalInboxCreateRequest(**values)
 
 
 def _patch_kanban_backup_env(monkeypatch, tmp_path: Path, conn: sqlite3.Connection) -> Path:
@@ -7747,6 +7749,22 @@ def test_work_proposal_inbox_producer_is_replay_safe_and_uses_discussion_for_sma
     assert proposal["status"] == "pending"
     assert proposal["exact_decision_needed"].startswith("Choose staged rollout")
 
+    review_follow_up = asyncio.run(
+        routes_personal.create_work_proposal_inbox(
+            _proposal_request(
+                entry_id="proposal-review-follow-up-alias",
+                entry_type="review-follow-up",
+            )
+        )
+    )
+    review_follow_up_provenance = json.loads(
+        conn.execute(
+            "SELECT provenance_json FROM kanban_items WHERE item_id=?",
+            (review_follow_up["item"]["item_id"],),
+        ).fetchone()["provenance_json"]
+    )["proposal_surface"]
+    assert review_follow_up_provenance["entry_type"] == "review_processor_follow_up"
+
     note = asyncio.run(
         routes_personal.create_work_proposal_inbox(_proposal_request(lifecycle_required=False))
     )
@@ -7766,12 +7784,12 @@ def test_work_proposal_inbox_producer_is_replay_safe_and_uses_discussion_for_sma
             "SELECT COUNT(*) AS count FROM kanban_items WHERE parent_item_id=?",
             (routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,),
         ).fetchone()["count"]
-        == 1
+        == 2
     )
 
     status = asyncio.run(routes_personal.get_work_proposal_surfaces_status())["proposal_surfaces"]
-    assert status["inbox"]["count"] == 1
-    assert status["inbox"]["open_count"] == 1
+    assert status["inbox"]["count"] == 2
+    assert status["inbox"]["open_count"] == 2
     assert status["inbox"]["entries"][0]["requested_operator_action"].startswith("Approve")
 
 
@@ -7897,6 +7915,12 @@ def test_work_proposal_operator_response_creates_outcome_and_owned_follow_up(
     assert "Use your best judgment" in discussion["body_excerpt"]
     assert result["proposal_surfaces"]["inbox"]["processed_count"] == 1
     assert result["proposal_surfaces"]["outbox"]["processed_count"] == 1
+    processed_entry = next(
+        entry
+        for entry in result["proposal_surfaces"]["inbox"]["entries"]
+        if entry["item_id"] == "proposal-fixture-entry"
+    )
+    assert processed_entry["proposal_status"] == "processed"
 
     superseding = asyncio.run(
         routes_personal.process_work_proposal_response(
@@ -7910,6 +7934,7 @@ def test_work_proposal_operator_response_creates_outcome_and_owned_follow_up(
     )
     assert superseding["outcome_type"] == "rejected"
     assert superseding["superseded_decision_ids"] == [decision["decision_id"]]
+    assert superseding["superseded_outbox_item_ids"] == [result["outbox_item"]["item_id"]]
     assert (
         conn.execute(
             "SELECT status FROM kanban_review_decisions WHERE decision_id=?",
@@ -7918,6 +7943,112 @@ def test_work_proposal_operator_response_creates_outcome_and_owned_follow_up(
         == "superseded"
     )
     assert superseding["proposal_surfaces"]["outbox"]["count"] == 2
+    previous_outbox = next(
+        entry
+        for entry in superseding["proposal_surfaces"]["outbox"]["entries"]
+        if entry["item_id"] == result["outbox_item"]["item_id"]
+    )
+    assert previous_outbox["proposal_status"] == "superseded"
+    assert previous_outbox["superseded"] is True
+    assert previous_outbox["superseded_by_response_id"] == superseding["response_id"]
+
+
+@pytest.mark.parametrize(
+    ("outcome_type", "remaining_questions", "implementation_actions", "processed"),
+    [
+        (
+            "partial",
+            ["Confirm whether the second bounded phase may start."],
+            [
+                {
+                    "title": "Record the approved first phase",
+                    "body": "Record the bounded first-phase decision without expanding scope.",
+                    "requires_new_card": False,
+                    "priority_id": "medium",
+                }
+            ],
+            True,
+        ),
+        (
+            "follow_up",
+            ["Choose the remaining bounded proof window."],
+            [
+                {
+                    "title": "Prepare the accepted proof context",
+                    "body": "Prepare only the accepted context while the final window remains open.",
+                    "requires_new_card": False,
+                    "priority_id": "medium",
+                }
+            ],
+            True,
+        ),
+        ("deferred", ["Revisit after the named dependency is proven."], [], False),
+    ],
+)
+def test_work_proposal_response_materializes_partial_deferred_and_follow_up(
+    monkeypatch,
+    outcome_type,
+    remaining_questions,
+    implementation_actions,
+    processed,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
+    asyncio.run(routes_personal.create_work_proposal_inbox(_proposal_request()))
+
+    async def fake_classifier(**kwargs):
+        return {
+            "payload": {
+                "outcome_type": outcome_type,
+                "title": f"Proposal response: {outcome_type}",
+                "summary": f"The whole response produced the {outcome_type} outcome.",
+                "rationale": "The bounded current state and complete operator response support it.",
+                "confidence": "high",
+                "uncertainty": "",
+                "selected_choices": [],
+                "best_judgment_authorized": False,
+                "agent_choices": [],
+                "remaining_questions": remaining_questions,
+                "implementation_actions": implementation_actions,
+                "affected_item_refs": ["xarta-kanban:item:work-proposal-semantic-owner"],
+                "proof_refs": [f"pytest:{outcome_type}"],
+            },
+            "model_alias": "TEST-HERMES",
+            "model_attempts": [{"route_id": "semantic-test", "status": "success"}],
+            "chosen_route_id": "semantic-test",
+            "chosen_model": "test-model",
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        fake_classifier,
+    )
+    result = asyncio.run(
+        routes_personal.process_work_proposal_response(
+            "proposal-fixture-entry",
+            routes_personal.WorkProposalResponseRequest(
+                response_text=f"Whole semantic response for {outcome_type}."
+            ),
+        )
+    )
+
+    assert result["outcome_type"] == outcome_type
+    assert result["processed"] is processed
+    assert result["decision"]["decision_type"] == outcome_type
+    assert result["outbox_item"]["state_id"] == "done"
+    assert conn.execute(
+        "SELECT state_id FROM kanban_items WHERE item_id='proposal-fixture-entry'"
+    ).fetchone()["state_id"] == ("done" if processed else "todo")
+    if outcome_type in {"partial", "follow_up"}:
+        assert len(result["follow_up_inbox_items"]) == 1
+        assert (
+            result["follow_up_inbox_items"][0]["parent_item_id"]
+            == routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID
+        )
+    else:
+        assert result["follow_up_inbox_items"] == []
 
 
 def test_work_proposal_response_failure_is_retryable_without_invented_semantics(
