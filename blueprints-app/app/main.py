@@ -33,6 +33,11 @@ from .auth import compute_token
 from .cors import DynamicCORSMiddleware
 from .events import bus as events_bus
 from .middleware_auth import AuthMiddleware
+from .personal_search_scheduler import router as personal_search_scheduler_router
+from .personal_search_scheduler import (
+    start_personal_search_scheduler,
+    stop_personal_search_scheduler,
+)
 from .routes_active_browser_runtime import router as active_browser_runtime_router
 from .routes_ai_project_assignments import router as ai_project_assignments_router
 from .routes_ai_providers import router as ai_providers_router
@@ -312,11 +317,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Fan Matrix /sync updates into the existing browser SSE stream.
     await start_matrix_chat_sync_workers()
 
+    # Typed provider for scheduler-owned Personal Search index refreshes.
+    await start_personal_search_scheduler()
+
     log.info("blueprints node ready — peers: %s", list(cfg.PEER_SYNC_URLS) or "(none)")
 
     yield  # application is running
 
     # Shutdown — stop producers, then close SSE bus so clients receive the sentinel
+    await stop_personal_search_scheduler()
     await stop_matrix_chat_sync_workers()
     await close_matrix_chat_e2ee_clients()
     await events_bus.close_all()
@@ -572,6 +581,7 @@ def create_app() -> FastAPI:
     application.include_router(playwright_router, prefix="/api/v1")
     application.include_router(events_router, prefix="/api/v1")
     application.include_router(personal_router, prefix="/api/v1")
+    application.include_router(personal_search_scheduler_router, prefix="/api/v1")
     application.include_router(pim_email_router, prefix="/api/v1")
     application.include_router(personal_prompts_router, prefix="/api/v1")
 
