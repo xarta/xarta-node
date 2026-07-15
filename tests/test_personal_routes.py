@@ -62,6 +62,40 @@ from app.kanban_datastore import (  # noqa: E402
 )
 
 
+def _preprocessing_contract_fields(
+    *, recommended_mode: str = "serial", unit_title: str = "Implement the scoped leaf"
+) -> dict:
+    return {
+        "proposal_entries": [],
+        "execution_directive": {
+            "recommended_mode": recommended_mode,
+            "rationale": (
+                "The whole bounded fixture has one owner and no independent conflicting write scope."
+            ),
+            "work_units": [
+                {
+                    "unit_id": "scoped-unit",
+                    "title": unit_title,
+                    "scope": "Complete only the current fixture and stop when its asserted proof passes.",
+                    "depends_on": [],
+                    "repo_paths": [],
+                    "write_scopes": [],
+                    "required_skills": [],
+                    "proof_expected": ["Focused behavioral assertion passes"],
+                }
+            ],
+            "isolation_requirements": [],
+            "candidate_nodes": [],
+            "resource_requirements": [],
+            "required_context": [],
+            "merge_reconciliation_owner": "owning test agent",
+            "timeout_checkin_failure_behavior": "Stop and report a failing assertion.",
+            "cleanup_criteria": [],
+            "evidence": ["bounded fixture state"],
+        },
+    }
+
+
 def _minutes_turn_event(
     *,
     created_at: str,
@@ -767,6 +801,64 @@ def _patch_conn(monkeypatch, conn: sqlite3.Connection) -> None:
     monkeypatch.setenv(
         routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
         routes_personal._work_automation_current_node_id(),
+    )
+
+
+def _create_proposal_surface_fixture() -> None:
+    items = [
+        (
+            routes_personal.KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
+            None,
+            "Proposal surfaces",
+            "doing",
+        ),
+        (
+            routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+            routes_personal.KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
+            "INBOX",
+            "doing",
+        ),
+        (
+            routes_personal.KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID,
+            routes_personal.KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
+            "OUTBOX",
+            "doing",
+        ),
+        ("work-proposal-semantic-owner", None, "Semantic implementation owner", "doing"),
+    ]
+    for item_id, parent_item_id, title, state_id in items:
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    parent_item_id=parent_item_id,
+                    title=title,
+                    body=f"Durable fixture for {title}.",
+                    state_id=state_id,
+                    actor="codex-test",
+                    source_surface="pytest",
+                )
+            )
+        )
+
+
+def _proposal_request(
+    *, lifecycle_required: bool = True
+) -> routes_personal.WorkProposalInboxCreateRequest:
+    return routes_personal.WorkProposalInboxCreateRequest(
+        entry_id=("proposal-fixture-entry" if lifecycle_required else "proposal-fixture-note"),
+        entry_type="approval_request",
+        title="Choose the bounded release behavior",
+        summary="The implementation has two safe behaviors with different rollout costs.",
+        rationale="Current evidence does not grant the agent authority to select the rollout.",
+        requested_operator_action="Approve one behavior or authorize bounded best judgment.",
+        exact_decision_needed="Choose staged rollout, immediate rollout, or defer.",
+        source_item_refs=["xarta-kanban:item:work-proposal-semantic-owner"],
+        semantic_owner_item_ref="xarta-kanban:item:work-proposal-semantic-owner",
+        proof_refs=["pytest:proposal-surface"],
+        lifecycle_required=lifecycle_required,
+        actor="codex-test",
+        source_surface="pytest",
     )
 
 
@@ -3292,6 +3384,7 @@ def test_kanban_idle_worker_no_root_scans_automatic_todo_leaves(monkeypatch, tmp
             "run_id": run_id,
             "content_excerpt": "{}",
             "payload": {
+                **_preprocessing_contract_fields(unit_title="Process the automatic ToDo leaf"),
                 "ready": True,
                 "title": "Context ready",
                 "summary": "The automatic ToDo leaf was preprocessed.",
@@ -7626,6 +7719,266 @@ def test_work_proposal_surfaces_contract_endpoint():
     )
 
 
+def test_work_proposal_inbox_producer_is_replay_safe_and_uses_discussion_for_small_note(
+    monkeypatch,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
+
+    created = asyncio.run(routes_personal.create_work_proposal_inbox(_proposal_request()))
+    replay = asyncio.run(routes_personal.create_work_proposal_inbox(_proposal_request()))
+    assert created["kind"] == "item"
+    assert created["idempotent_replay"] is False
+    assert replay["idempotent_replay"] is True
+    assert (
+        created["item"]["parent_item_id"] == routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID
+    )
+    assert created["item"]["state_id"] == "todo"
+    assert {link["metadata"]["role"] for link in created["links"]} == {
+        "source_item",
+        "semantic_owner",
+    }
+    proposal = json.loads(
+        conn.execute(
+            "SELECT provenance_json FROM kanban_items WHERE item_id='proposal-fixture-entry'"
+        ).fetchone()["provenance_json"]
+    )["proposal_surface"]
+    assert proposal["status"] == "pending"
+    assert proposal["exact_decision_needed"].startswith("Choose staged rollout")
+
+    note = asyncio.run(
+        routes_personal.create_work_proposal_inbox(_proposal_request(lifecycle_required=False))
+    )
+    note_replay = asyncio.run(
+        routes_personal.create_work_proposal_inbox(_proposal_request(lifecycle_required=False))
+    )
+    assert note["kind"] == "discussion"
+    assert note_replay["idempotent_replay"] is True
+    assert (
+        conn.execute(
+            "SELECT item_id FROM kanban_discussions WHERE discussion_id='proposal-fixture-note'"
+        ).fetchone()["item_id"]
+        == routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_items WHERE parent_item_id=?",
+            (routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,),
+        ).fetchone()["count"]
+        == 1
+    )
+
+    status = asyncio.run(routes_personal.get_work_proposal_surfaces_status())["proposal_surfaces"]
+    assert status["inbox"]["count"] == 1
+    assert status["inbox"]["open_count"] == 1
+    assert status["inbox"]["entries"][0]["requested_operator_action"].startswith("Approve")
+
+
+def test_work_proposal_operator_response_creates_outcome_and_owned_follow_up(
+    monkeypatch,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
+    asyncio.run(routes_personal.create_work_proposal_inbox(_proposal_request()))
+
+    async def fake_classifier(**kwargs):
+        assert kwargs["processor_kind"] == "preprocessing"
+        prompt = json.loads(kwargs["messages"][1]["content"])
+        assert prompt["task_kind"] == "proposal_response_classification"
+        if prompt["operator_response"].startswith("Withdraw the staged approval"):
+            return {
+                "payload": {
+                    "outcome_type": "rejected",
+                    "title": "Staged rollout withdrawn",
+                    "summary": "The operator superseded the earlier approval.",
+                    "rationale": "The later whole response explicitly withdraws the prior choice.",
+                    "confidence": "high",
+                    "uncertainty": "",
+                    "selected_choices": [
+                        {"choice": "withdraw staged rollout", "evidence": "later response"}
+                    ],
+                    "best_judgment_authorized": False,
+                    "agent_choices": [],
+                    "remaining_questions": [],
+                    "implementation_actions": [],
+                    "affected_item_refs": ["xarta-kanban:item:work-proposal-semantic-owner"],
+                    "proof_refs": ["pytest:superseding-response"],
+                },
+                "model_alias": "TEST-HERMES",
+                "model_attempts": [{"route_id": "semantic-test", "status": "success"}],
+                "chosen_route_id": "semantic-test",
+                "chosen_model": "test-model",
+            }
+        assert prompt["operator_response"].startswith("Approve the staged path")
+        return {
+            "payload": {
+                "outcome_type": "accepted",
+                "title": "Staged rollout accepted",
+                "summary": "The operator approved the staged path and authorized bounded details.",
+                "rationale": "The whole response explicitly selects staged rollout and delegates safe details.",
+                "confidence": "high",
+                "uncertainty": "",
+                "selected_choices": [
+                    {"choice": "staged rollout", "evidence": "Approve the staged path"}
+                ],
+                "best_judgment_authorized": True,
+                "agent_choices": [
+                    {"choice": "use the smaller pilot", "evidence": "use your best judgment"}
+                ],
+                "remaining_questions": [],
+                "implementation_actions": [
+                    {
+                        "title": "Implement the staged pilot",
+                        "body": "Implement the bounded pilot and attach focused proof.",
+                        "requires_new_card": True,
+                        "priority_id": "high",
+                    }
+                ],
+                "affected_item_refs": ["xarta-kanban:item:work-proposal-semantic-owner"],
+                "proof_refs": ["pytest:classified-whole-response"],
+            },
+            "model_alias": "TEST-HERMES",
+            "model_attempts": [{"route_id": "semantic-test", "status": "success"}],
+            "chosen_route_id": "semantic-test",
+            "chosen_model": "test-model",
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        fake_classifier,
+    )
+    body = routes_personal.WorkProposalResponseRequest(
+        response_text=(
+            "Approve the staged path. Use your best judgment for the smaller pilot details, "
+            "within the proposal's existing authority."
+        ),
+        actor="operator-ui-audit",
+        source_surface="kanban-automation-status",
+    )
+    result = asyncio.run(
+        routes_personal.process_work_proposal_response("proposal-fixture-entry", body)
+    )
+    replay = asyncio.run(
+        routes_personal.process_work_proposal_response("proposal-fixture-entry", body)
+    )
+
+    assert result["processed"] is True
+    assert result["outcome_type"] == "accepted"
+    assert (
+        result["outbox_item"]["parent_item_id"]
+        == routes_personal.KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID
+    )
+    assert result["outbox_item"]["state_id"] == "done"
+    assert len(result["implementation_items"]) == 1
+    assert result["implementation_items"][0]["parent_item_id"] == "work-proposal-semantic-owner"
+    assert replay["idempotent_replay"] is True
+    assert (
+        conn.execute(
+            "SELECT state_id FROM kanban_items WHERE item_id='proposal-fixture-entry'"
+        ).fetchone()["state_id"]
+        == "done"
+    )
+    decision = conn.execute(
+        "SELECT * FROM kanban_review_decisions WHERE item_id='proposal-fixture-entry' "
+        "AND processor_kind='proposal_response'"
+    ).fetchone()
+    metadata = json.loads(decision["metadata_json"])
+    assert metadata["authority"]["kind"] == "operator"
+    assert metadata["authority"]["actor_is_audit_identity_only"] is True
+    assert metadata["best_judgment_authorized"] is True
+    assert metadata["agent_choices"][0]["choice"] == "use the smaller pilot"
+    discussion = conn.execute(
+        "SELECT body_excerpt FROM kanban_discussions WHERE discussion_id=?",
+        (metadata["response_discussion_id"],),
+    ).fetchone()
+    assert "Use your best judgment" in discussion["body_excerpt"]
+    assert result["proposal_surfaces"]["inbox"]["processed_count"] == 1
+    assert result["proposal_surfaces"]["outbox"]["processed_count"] == 1
+
+    superseding = asyncio.run(
+        routes_personal.process_work_proposal_response(
+            "proposal-fixture-entry",
+            routes_personal.WorkProposalResponseRequest(
+                response_text=(
+                    "Withdraw the staged approval. Reject this proposal based on the newer proof."
+                )
+            ),
+        )
+    )
+    assert superseding["outcome_type"] == "rejected"
+    assert superseding["superseded_decision_ids"] == [decision["decision_id"]]
+    assert (
+        conn.execute(
+            "SELECT status FROM kanban_review_decisions WHERE decision_id=?",
+            (decision["decision_id"],),
+        ).fetchone()["status"]
+        == "superseded"
+    )
+    assert superseding["proposal_surfaces"]["outbox"]["count"] == 2
+
+
+def test_work_proposal_response_failure_is_retryable_without_invented_semantics(
+    monkeypatch,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
+    asyncio.run(routes_personal.create_work_proposal_inbox(_proposal_request()))
+
+    async def invalid_classifier(**kwargs):
+        return {"payload": {"summary": "No semantic outcome type was returned."}}
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        invalid_classifier,
+    )
+    body = routes_personal.WorkProposalResponseRequest(
+        response_text="I approve only the first choice; hold the second until the dependency is proven.",
+        response_id="proposal-response-fixed-retry",
+    )
+    with pytest.raises(routes_personal.HTTPException) as exc_info:
+        asyncio.run(routes_personal.process_work_proposal_response("proposal-fixture-entry", body))
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["retryable"] is True
+    row = conn.execute(
+        "SELECT * FROM kanban_review_decisions WHERE item_id='proposal-fixture-entry' "
+        "AND processor_kind='proposal_response'"
+    ).fetchone()
+    assert row["status"] == "failed"
+    metadata = json.loads(row["metadata_json"])
+    assert metadata["response_state"]["retry_state"] == "retryable"
+    assert metadata["authority"]["kind"] == "operator"
+    assert (
+        conn.execute(
+            "SELECT state_id FROM kanban_items WHERE item_id='proposal-fixture-entry'"
+        ).fetchone()["state_id"]
+        == "todo"
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_items WHERE parent_item_id=?",
+            (routes_personal.KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID,),
+        ).fetchone()["count"]
+        == 0
+    )
+    status = asyncio.run(routes_personal.get_work_proposal_surfaces_status())["proposal_surfaces"]
+    assert status["inbox"]["failed_count"] == 1
+    assert status["inbox"]["retry_count"] == 1
+    conflicting = routes_personal.WorkProposalResponseRequest(
+        response_text="A different response must not reuse the same durable response identity.",
+        response_id="proposal-response-fixed-retry",
+    )
+    with pytest.raises(routes_personal.HTTPException) as conflict_info:
+        asyncio.run(
+            routes_personal.process_work_proposal_response("proposal-fixture-entry", conflicting)
+        )
+    assert conflict_info.value.status_code == 409
+
+
 def test_work_review_processor_processing_policy_endpoint(monkeypatch):
     monkeypatch.setenv(
         routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
@@ -8357,6 +8710,7 @@ def test_work_review_processor_completion_cancels_claimed_marker_after_exclusion
 def test_work_automation_idle_tick_processes_review_with_profile_llm(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
     monkeypatch.setenv(
         routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
         "TEST-KANBAN-LOCAL-AI",
@@ -8420,12 +8774,32 @@ def test_work_automation_idle_tick_processes_review_with_profile_llm(monkeypatch
                     "The Review states missing required provider wiring should produce "
                     "a blocker or question instead of substitute behavior."
                 ),
-                "decision_type": "review_guidance_recorded",
+                "decision_type": "follow_up_card",
                 "confidence": "high",
                 "uncertainty": "",
                 "status": "recorded",
                 "affected_refs": ["xarta-kanban:item:work-local-ai-review"],
                 "proof_refs": ["kanban_items:work-local-ai-review:review"],
+                "output_payload": {
+                    "title": "Implement the confirmed provider wiring",
+                    "body": "Implement only the provider path selected through the Review evidence.",
+                    "parent_ref": "xarta-kanban:item:work-local-ai-review",
+                    "lane": "todo",
+                    "priority": "high",
+                    "reason": "The Review identified a bounded implementation follow-up.",
+                },
+                "proposal_entries": [
+                    {
+                        "entry_type": "review_processor_follow_up",
+                        "title": "Confirm required provider wiring",
+                        "summary": "The Review requires an operator-visible provider decision.",
+                        "rationale": "The Review explicitly forbids substituting another workflow.",
+                        "requested_operator_action": "Confirm the required provider wiring.",
+                        "exact_decision_needed": "Select the authorized provider path or defer.",
+                        "lifecycle_required": True,
+                        "proof_refs": ["kanban_items:work-local-ai-review:review"],
+                    }
+                ],
             },
         }
 
@@ -8458,12 +8832,30 @@ def test_work_automation_idle_tick_processes_review_with_profile_llm(monkeypatch
         "SELECT * FROM kanban_review_decisions WHERE item_id='work-local-ai-review'"
     ).fetchone()
     assert row["provider_mode"] == routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
-    assert row["decision_type"] == "review_guidance_recorded"
+    assert row["decision_type"] == "follow_up_card"
     marker = conn.execute(
         "SELECT * FROM kanban_review_processor_markers WHERE item_id='work-local-ai-review'"
     ).fetchone()
     assert marker["status"] == "processed"
     assert marker["decision_id"] == row["decision_id"]
+    proposal = conn.execute(
+        "SELECT * FROM kanban_items WHERE parent_item_id=? AND title=?",
+        (
+            routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+            "Confirm required provider wiring",
+        ),
+    ).fetchone()
+    assert proposal is not None
+    assert proposal["state_id"] == "todo"
+    decision_metadata = json.loads(row["metadata_json"])
+    assert decision_metadata["proposal_results"][0]["item"]["item_id"] == proposal["item_id"]
+    follow_up = conn.execute(
+        "SELECT * FROM kanban_items WHERE parent_item_id='work-local-ai-review' "
+        "AND title='Implement the confirmed provider wiring'"
+    ).fetchone()
+    assert follow_up is not None
+    assert follow_up["state_id"] == "todo"
+    assert decision_metadata["follow_up_card"]["item"]["item_id"] == follow_up["item_id"]
 
 
 def test_work_automation_preprocessing_distinguishes_marker_staleness_from_blocker(
@@ -8554,6 +8946,7 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
             "run_id": run_id,
             "content_excerpt": "{}",
             "payload": {
+                **_preprocessing_contract_fields(unit_title="Create the missing proof artifact"),
                 "ready": False,
                 "summary": "Current evidence is not enough yet.",
                 "rationale": "The card needs proof before implementation can start.",
@@ -8639,6 +9032,15 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
     assert decision["status"] == "accepted"
     assert decision["title"] == "Preprocessing child"
     decision_metadata = json.loads(decision["metadata_json"])
+    assert marker["document_source_hash"] == marker["processed_source_hash"]
+    assert (
+        marker["document_source_hash"]
+        == (decision_metadata["source_after_decomposition"]["document_source_hash"])
+    )
+    assert (
+        marker["document_source_hash"]
+        != (decision_metadata["source_before_decomposition"]["document_source_hash"])
+    )
     assert decision_metadata["engineering_guidance"]["selected_guidance_ids"] == [
         "permission-and-ownership-guards"
     ]
@@ -9168,6 +9570,7 @@ def test_work_automation_preprocessing_malformed_decomposition_fails_without_chi
             "run_id": run_id,
             "content_excerpt": "{}",
             "payload": {
+                **_preprocessing_contract_fields(unit_title="Reject malformed decomposition"),
                 "ready": False,
                 "title": "Malformed decomposition",
                 "summary": "The model returned one malformed child.",
@@ -9294,7 +9697,8 @@ def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
             "run_id": run_id,
             "content_excerpt": "{}",
             "payload": {
-                "ready": False,
+                **_preprocessing_contract_fields(unit_title="Inspect the audit proof path"),
+                "ready": True,
                 "title": "Audit report files",
                 "summary": "The next action is to inspect the proof path and list files.",
                 "rationale": (
@@ -9357,7 +9761,7 @@ def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
         routes_personal.get_work_item_agent_hints("work-preprocess-actionable-child")
     )
     readiness_marker = hints["agent_hints"]["metadata"]["context_readiness_marker"]
-    assert readiness_marker["preprocessing_outcome"] == "ready_leaf_no_decomposition"
+    assert readiness_marker["preprocessing_outcome"] == "ready"
     assert readiness_marker["implementation_scope"] == "current_item"
     assert "Scan docs/reports/structure-audit" in readiness_marker["recommended_next_actions"][0]
     decision = conn.execute(
@@ -9369,10 +9773,9 @@ def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
         """
     ).fetchone()
     metadata = json.loads(decision["metadata_json"])
-    assert metadata["readiness_normalization"]["reason"] == (
-        "model_reported_not_ready_without_blocker_or_decomposition"
-    )
-    assert metadata["llm_payload"]["ready"] is False
+    assert metadata["readiness_normalization"] is None
+    assert metadata["execution_directive"]["recommended_mode"] == "serial"
+    assert metadata["llm_payload"]["ready"] is True
 
 
 def test_work_preprocessing_duplicate_outcome_needs_no_invented_children(
@@ -9409,6 +9812,7 @@ def test_work_preprocessing_duplicate_outcome_needs_no_invented_children(
             "run_id": run_id,
             "content_excerpt": "{}",
             "payload": {
+                **_preprocessing_contract_fields(unit_title="Confirm the canonical owner"),
                 "ready": False,
                 "outcome_type": "duplicate",
                 "canonical_item_ref": "xarta-kanban:item:work-canonical-owner",
@@ -9662,6 +10066,63 @@ def test_work_item_link_creation_delegates_whole_boundary_off_event_loop(monkeyp
             routes_personal._create_work_item_link_sync,
             ("work-off-loop-source", request),
         )
+    ]
+
+
+def test_work_proposal_routes_delegate_postgres_boundaries_off_event_loop(monkeypatch):
+    calls = []
+
+    async def run_sync(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        if func is routes_personal._work_proposal_surfaces_status_sync:
+            return {"schema": routes_personal.KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA}
+        return {"ok": True, "kind": "item"}
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", run_sync)
+    request = _proposal_request()
+    created = asyncio.run(routes_personal.create_work_proposal_inbox(request))
+    status = asyncio.run(routes_personal.get_work_proposal_surfaces_status(limit=7))
+    assert created == {"ok": True, "kind": "item"}
+    assert status["proposal_surfaces"]["schema"] == (
+        routes_personal.KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA
+    )
+    assert calls == [
+        (routes_personal._create_work_proposal_inbox_sync, (request,), {}),
+        (routes_personal._work_proposal_surfaces_status_sync, (7,), {}),
+    ]
+
+
+def test_work_discussion_and_decision_writes_delegate_off_event_loop(monkeypatch):
+    calls = []
+
+    async def run_sync(func, *args):
+        calls.append((func, args))
+        return {"ok": True, "worker": func.__name__}
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", run_sync)
+    discussion = routes_personal.WorkDiscussionCreateRequest(
+        discussion_id="discussion-off-loop",
+        body="Bounded Discussion write.",
+    )
+    decision = routes_personal.WorkReviewDecisionCreateRequest(
+        summary="Bounded durable decision.",
+    )
+    assert (
+        asyncio.run(routes_personal.create_work_discussion("work-off-loop", discussion))["worker"]
+        == "_create_work_discussion_sync"
+    )
+    assert (
+        asyncio.run(routes_personal.record_work_item_review_decision("work-off-loop", decision))[
+            "worker"
+        ]
+        == "_record_work_item_review_decision_sync"
+    )
+    assert calls == [
+        (routes_personal._create_work_discussion_sync, ("work-off-loop", discussion)),
+        (
+            routes_personal._record_work_item_review_decision_sync,
+            ("work-off-loop", decision),
+        ),
     ]
 
 

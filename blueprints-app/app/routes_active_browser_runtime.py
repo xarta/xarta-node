@@ -2332,6 +2332,34 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
         "automation_processing_policy_local_gate": _clean_string(
             kanban.get("automation_processing_policy_local_gate"), "", 160
         ),
+        "automation_proposal_surface_schema": _clean_string(
+            kanban.get("automation_proposal_surface_schema"), "", 160
+        ),
+        "automation_proposal_inbox_item_id": _clean_string(
+            kanban.get("automation_proposal_inbox_item_id"), "", 180
+        ),
+        "automation_proposal_outbox_item_id": _clean_string(
+            kanban.get("automation_proposal_outbox_item_id"), "", 180
+        ),
+        "automation_proposal_inbox_entry_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_inbox_entry_count"), maximum=5000
+        ),
+        "automation_proposal_outbox_entry_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_outbox_entry_count"), maximum=5000
+        ),
+        "automation_proposal_inbox_open_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_inbox_open_count"), maximum=5000
+        ),
+        "automation_proposal_outbox_processed_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_outbox_processed_count"), maximum=5000
+        ),
+        "automation_proposal_response_busy": bool(kanban.get("automation_proposal_response_busy")),
+        "automation_proposal_response_busy_item_id": _clean_string(
+            kanban.get("automation_proposal_response_busy_item_id"), "", 180
+        ),
+        "automation_proposal_response_error_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_response_error_count"), maximum=5000
+        ),
         "model_settings_visible": bool(kanban.get("model_settings_visible")),
         "model_settings_surface": _clean_string(kanban.get("model_settings_surface"), "", 48),
         "model_settings_route_count": _clean_browser_page_int(
