@@ -3767,6 +3767,11 @@ def _materialize_work_proposal_response_sync(
             ),
         )
 
+    readiness_refresh: dict[str, Any] = {
+        "requested": False,
+        "state": "not_applicable",
+        "item_id": semantic_owner_id or "",
+    }
     if semantic_owner_id and outcome_type in {"accepted", "partial", "follow_up"}:
         note_id = _clean_work_id(
             f"kanban-discussion-proposal-context-{digest[:20]}",
@@ -3789,6 +3794,11 @@ def _materialize_work_proposal_response_sync(
                     run_id=body.run_id,
                 ),
             )
+        readiness_refresh = _request_work_preprocessing_refresh_sync(
+            semantic_owner_id,
+            response_id=response_id,
+            body=body,
+        )
     return {
         "ok": True,
         "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
@@ -3805,7 +3815,8 @@ def _materialize_work_proposal_response_sync(
         "links": links,
         "superseded_decision_ids": superseded_ids,
         "superseded_outbox_item_ids": superseded_outbox_ids,
-        "readiness_refresh_requested": bool(semantic_owner_id and processed),
+        "readiness_refresh_requested": bool(readiness_refresh.get("requested")),
+        "readiness_refresh": readiness_refresh,
         "model_routing": _work_automation_ai_routing_evidence(ai),
     }
 
@@ -5355,6 +5366,146 @@ def _work_preprocessing_marker_row(
         }
     )
     return row
+
+
+def _request_work_preprocessing_refresh_sync(
+    item_id: str,
+    *,
+    response_id: str,
+    body: WorkProposalResponseRequest,
+) -> dict[str, Any]:
+    """Durably queue a material operator-context change for the normal idle worker."""
+    now = _utc_now_iso()
+    meta = _work_request_meta(body)
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    clean_response_id = _clean_short_text(response_id, "", limit=180)
+    audit_id = f"audit-{uuid.uuid4().hex}"
+    with get_conn() as conn:
+        item_row = _work_item_or_404(conn, clean_item_id)
+        candidate = conn.execute(
+            f"""
+            SELECT CASE WHEN {_work_preprocessing_candidate_predicate("item")}
+                        THEN 1 ELSE 0 END AS eligible
+            FROM kanban_items item
+            WHERE item.item_id=?
+            """,
+            (clean_item_id,),
+        ).fetchone()
+        if not candidate or not bool(candidate["eligible"]):
+            return {
+                "requested": False,
+                "state": "not_candidate",
+                "item_id": clean_item_id,
+                "response_id": clean_response_id,
+                "reason": "affected work is not an automation-included open Todo leaf",
+            }
+        source = _work_preprocessing_context_source(conn, item_row)
+        marker_id = _preprocessing_marker_id(clean_item_id)
+        existing = conn.execute(
+            "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+            (marker_id,),
+        ).fetchone()
+        same_source = bool(
+            existing is not None
+            and existing["document_source_hash"] == source["document_source_hash"]
+        )
+        already_processed = bool(
+            existing is not None
+            and _work_marker_successful_source_hash(existing) == source["document_source_hash"]
+        )
+        if same_source and existing["status"] in {"queued", "processing"}:
+            return {
+                "requested": True,
+                "state": existing["status"],
+                "item_id": clean_item_id,
+                "response_id": clean_response_id,
+                "marker": _row_to_work_review_processor_marker(existing),
+                "idempotent_replay": True,
+            }
+        if already_processed and existing["status"] == "processed":
+            return {
+                "requested": False,
+                "state": "already_current",
+                "item_id": clean_item_id,
+                "response_id": clean_response_id,
+                "marker": _row_to_work_review_processor_marker(existing),
+                "idempotent_replay": True,
+            }
+        if source["ready"] or not source.get("needs_preprocessing", True):
+            return {
+                "requested": False,
+                "state": "not_needed",
+                "item_id": clean_item_id,
+                "response_id": clean_response_id,
+                "reason": source.get("reason") or "preprocessing_not_needed",
+            }
+
+        _kanban_begin_write_transaction(conn)
+        marker_row = _work_preprocessing_marker_row(
+            existing=existing,
+            item_id=clean_item_id,
+            source=source,
+            meta=meta,
+            now=now,
+            reason="proposal_response_material_context_change",
+            scan_metadata={
+                "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+                "proposal_response_id": clean_response_id,
+                "queue_source": "proposal_response",
+            },
+        )
+        saved_marker = _write_work_review_processor_marker(conn, marker_row)
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=meta["actor"],
+            source_surface=meta["source_surface"],
+            action="request_proposal_response_preprocessing_refresh",
+            target_ref=f"kanban_review_processor_markers:{marker_id}",
+            item_id=clean_item_id,
+            parent_item_id=item_row["parent_item_id"] or "",
+            created_at=now,
+            request_id=meta["request_id"],
+            run_id=meta["run_id"],
+            result="ok",
+            source_hash=saved_marker["source_hash"],
+            metadata={
+                "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
+                "response_id": clean_response_id,
+                "document_source_hash": source["document_source_hash"],
+                "previous_marker_status": existing["status"] if existing is not None else "",
+            },
+        )
+        gen = _kanban_table_sync_gen(conn, "kanban-proposal-response-preprocessing-refresh")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_review_processor_markers",
+            saved_marker["marker_id"],
+            dict(saved_marker),
+            gen,
+        )
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_audit_log",
+            audit_id,
+            audit_row,
+            gen,
+        )
+    return {
+        "requested": True,
+        "state": "queued",
+        "item_id": clean_item_id,
+        "response_id": clean_response_id,
+        "marker": _row_to_work_review_processor_marker(saved_marker),
+        "audit": {
+            "audit_id": audit_id,
+            "action": "request_proposal_response_preprocessing_refresh",
+            "result": "ok",
+        },
+        "idempotent_replay": False,
+    }
 
 
 def _work_preprocessing_active_rows(conn: Any, scope_ids: list[str]) -> list[Any]:
@@ -22467,6 +22618,23 @@ async def process_work_proposal_response(
     )
     existing = prepared.get("existing_decision")
     if isinstance(existing, dict) and existing.get("status") not in {"failed", "hook_failed"}:
+        existing_metadata = (
+            existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+        )
+        readiness_refresh = {
+            "requested": False,
+            "state": "not_applicable",
+            "item_id": str(existing_metadata.get("semantic_owner_item_id") or ""),
+        }
+        if existing.get("decision_type") in {"accepted", "partial", "follow_up"} and str(
+            existing_metadata.get("semantic_owner_item_id") or ""
+        ):
+            readiness_refresh = await _run_personal_sync_work(
+                _request_work_preprocessing_refresh_sync,
+                str(existing_metadata["semantic_owner_item_id"]),
+                response_id=prepared["response_id"],
+                body=body,
+            )
         return {
             "ok": True,
             "schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
@@ -22475,6 +22643,8 @@ async def process_work_proposal_response(
             "source_hash": prepared["source_hash"],
             "decision": existing,
             "idempotent_replay": True,
+            "readiness_refresh_requested": bool(readiness_refresh.get("requested")),
+            "readiness_refresh": readiness_refresh,
             "proposal_surfaces": await _run_personal_sync_work(
                 _work_proposal_surfaces_status_sync, 20
             ),
