@@ -151,6 +151,7 @@ KANBAN_EXECUTION_DIRECTIVE_SCHEMA = "xarta.kanban.preprocessing.execution_direct
 KANBAN_ORIGINAL_OPERATOR_REQUESTS_SCHEMA = "xarta.kanban.original_operator_requests.v1"
 KANBAN_VERBATIM_OPERATOR_REQUEST_TAG = "operator-request-verbatim-v1"
 KANBAN_VERBATIM_OPERATOR_STEER_PREFIX = "operator-request-verbatim-"
+KANBAN_VERBATIM_OPERATOR_REQUEST_MAX_CODEPOINTS = 65_536
 KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA = "xarta.kanban.automation.idle_worker.v1"
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_SCHEMA = "xarta.kanban.automation.idle_worker.contract.v1"
 KANBAN_AUTOMATION_EXCLUSION_SCHEMA = "xarta.kanban.automation.exclusion.v1"
@@ -8389,6 +8390,54 @@ def _body_excerpt(body: str, limit: int = 500) -> str:
     return "\n".join(line.rstrip() for line in text.split("\n"))[:limit]
 
 
+def _verbatim_operator_request_text(value: str | None, *, field_name: str) -> str:
+    """Return authoritative Operator text unchanged, or reject it without silent loss."""
+    text = str(value or "")
+    if len(text) > KANBAN_VERBATIM_OPERATOR_REQUEST_MAX_CODEPOINTS:
+        raise HTTPException(
+            413,
+            f"{field_name} exceeds the {KANBAN_VERBATIM_OPERATOR_REQUEST_MAX_CODEPOINTS} "
+            "Unicode-codepoint verbatim Operator request limit",
+        )
+    return text
+
+
+def _assert_verbatim_operator_card_total(
+    conn: Any,
+    *,
+    item_id: str,
+    primary_body: str | None = None,
+    steering_body: str | None = None,
+    exclude_discussion_id: str = "",
+) -> None:
+    if primary_body is None:
+        item_row = conn.execute(
+            "SELECT body_excerpt FROM kanban_items WHERE item_id=?",
+            (item_id,),
+        ).fetchone()
+        primary_body = str(item_row["body_excerpt"] or "") if item_row else ""
+    total = len(primary_body) + len(steering_body or "")
+    rows = conn.execute(
+        """
+        SELECT discussion_id, body_excerpt
+        FROM kanban_discussions
+        WHERE item_id=? AND status!='archived' AND discussion_id LIKE ?
+        """,
+        (item_id, f"{KANBAN_VERBATIM_OPERATOR_STEER_PREFIX}%"),
+    ).fetchall()
+    total += sum(
+        len(str(row["body_excerpt"] or ""))
+        for row in rows
+        if str(row["discussion_id"] or "") != exclude_discussion_id
+    )
+    if total > KANBAN_VERBATIM_OPERATOR_REQUEST_MAX_CODEPOINTS:
+        raise HTTPException(
+            413,
+            "The card's active verbatim Operator requests exceed the "
+            f"{KANBAN_VERBATIM_OPERATOR_REQUEST_MAX_CODEPOINTS} Unicode-codepoint total limit",
+        )
+
+
 def _upsert_personal_source(conn: Any, now: str) -> None:
     conn.execute(
         """
@@ -13810,7 +13859,12 @@ def _work_item_payload(
     item_type = _clean_work_item_type(body.item_type, "item")
     goal_flag = bool(body.goal_flag)
     automation_excluded = bool(body.automation_excluded)
-    body_excerpt = _body_excerpt(body.body or "", limit=4000)
+    verbatim_request = KANBAN_VERBATIM_OPERATOR_REQUEST_TAG in tags
+    body_excerpt = (
+        _verbatim_operator_request_text(body.body, field_name="Kanban item body")
+        if verbatim_request
+        else _body_excerpt(body.body or "", limit=4000)
+    )
     related_events = _clean_event_list(body.related_event_ids, limit=32)
     related_tasks = _clean_event_list(body.related_task_ids, limit=32)
     related_issues = _clean_event_list(body.related_issue_ids, limit=32)
@@ -13824,7 +13878,7 @@ def _work_item_payload(
         row_id=item_id,
         kind=item_type,
         title=title,
-        body=body_excerpt,
+        body=_body_excerpt(body_excerpt, limit=4000) if verbatim_request else body_excerpt,
         tags=tags,
         related_refs=related_refs,
     )
@@ -15001,12 +15055,19 @@ def _update_work_item_sync(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             meta=meta,
         )
         priority = _require_work_priority(conn, body.priority_id or existing["priority_id"])
-        tags = (
-            _clean_event_list(body.tags, limit=32)
-            if body.tags is not None
-            else _json_value(existing["tags_json"], [])
-        )
+        existing_tags = _json_value(existing["tags_json"], [])
+        tags = _clean_event_list(body.tags, limit=32) if body.tags is not None else existing_tags
         tags = _work_item_tags_for_request(tags, meta)
+        if (
+            KANBAN_VERBATIM_OPERATOR_REQUEST_TAG in tags
+            and KANBAN_VERBATIM_OPERATOR_REQUEST_TAG not in existing_tags
+            and body.body is None
+        ):
+            raise HTTPException(
+                400,
+                "Adding operator-request-verbatim-v1 requires the complete Operator request "
+                "in the same item body update",
+            )
         related_events = (
             _clean_event_list(body.related_event_ids, limit=32)
             if body.related_event_ids is not None
@@ -15025,11 +15086,22 @@ def _update_work_item_sync(item_id: str, body: WorkItemUpdateRequest) -> dict[st
         title = _clean_short_text(body.title, existing["title"], limit=180)
         if not title:
             raise HTTPException(400, "Kanban item title is required")
+        verbatim_request = KANBAN_VERBATIM_OPERATOR_REQUEST_TAG in tags
         body_excerpt = (
-            _body_excerpt(body.body, limit=4000)
+            (
+                _verbatim_operator_request_text(body.body, field_name="Kanban item body")
+                if verbatim_request
+                else _body_excerpt(body.body, limit=4000)
+            )
             if body.body is not None
             else existing["body_excerpt"]
         )
+        if verbatim_request:
+            _assert_verbatim_operator_card_total(
+                conn,
+                item_id=item_id,
+                primary_body=body_excerpt,
+            )
         item_type = _clean_work_item_type(body.item_type, existing["item_type"])
         existing_goal_flag = (
             bool(existing["goal_flag"]) if "goal_flag" in existing.keys() else False
@@ -15050,7 +15122,7 @@ def _update_work_item_sync(item_id: str, body: WorkItemUpdateRequest) -> dict[st
             row_id=item_id,
             kind=item_type,
             title=title,
-            body=body_excerpt,
+            body=_body_excerpt(body_excerpt, limit=4000) if verbatim_request else body_excerpt,
             tags=tags,
             related_refs=[
                 *[f"personal_events:{event_id}" for event_id in related_events],
@@ -15512,8 +15584,13 @@ def _create_work_discussion_sync(item_id: str, body: WorkDiscussionCreateRequest
     meta = _work_request_meta(body)
     clean_item_id = _clean_short_text(item_id, "", limit=180)
     clean_discussion_id = _clean_work_id(body.discussion_id, "discussion")
-    clean_body = _normalise_markdown_document_body(body.body)
-    body_excerpt = _body_excerpt(clean_body, limit=4000)
+    verbatim_request = clean_discussion_id.startswith(KANBAN_VERBATIM_OPERATOR_STEER_PREFIX)
+    clean_body = (
+        _verbatim_operator_request_text(body.body, field_name="Kanban steering discussion body")
+        if verbatim_request
+        else _normalise_markdown_document_body(body.body)
+    )
+    body_excerpt = clean_body if verbatim_request else _body_excerpt(clean_body, limit=4000)
     author = _clean_short_text(body.author or meta["actor"], meta["actor"], limit=120)
     status = _clean_work_leaf_status(body.status, default="open")
     with get_conn() as conn:
@@ -15521,6 +15598,12 @@ def _create_work_discussion_sync(item_id: str, body: WorkDiscussionCreateRequest
         item = _work_item_or_404(conn, clean_item_id)
         if store.discussion_row(clean_discussion_id):
             raise HTTPException(409, "Kanban discussion already exists")
+        if verbatim_request:
+            _assert_verbatim_operator_card_total(
+                conn,
+                item_id=clean_item_id,
+                steering_body=clean_body,
+            )
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_discussions",
             row_id=clean_discussion_id,
@@ -15636,11 +15719,30 @@ async def update_work_discussion(
             raise HTTPException(404, "Kanban discussion not found")
         item = _work_item_or_404(conn, existing["item_id"])
         existing_document = _work_discussion_document(conn, existing)
+        verbatim_request = clean_discussion_id.startswith(KANBAN_VERBATIM_OPERATOR_STEER_PREFIX)
         clean_body = (
-            _normalise_markdown_document_body(body.body)
+            (
+                _verbatim_operator_request_text(
+                    body.body,
+                    field_name="Kanban steering discussion body",
+                )
+                if verbatim_request
+                else _normalise_markdown_document_body(body.body)
+            )
             if body.body is not None
-            else existing_document["body"]
+            else (
+                str(existing["body_excerpt"] or "")
+                if verbatim_request
+                else existing_document["body"]
+            )
         )
+        if verbatim_request:
+            _assert_verbatim_operator_card_total(
+                conn,
+                item_id=existing["item_id"],
+                steering_body=clean_body,
+                exclude_discussion_id=clean_discussion_id,
+            )
         author = (
             _clean_short_text(body.author, existing["author"], limit=120)
             if body.author is not None
@@ -15651,7 +15753,7 @@ async def update_work_discussion(
             if body.status is not None
             else existing["status"]
         )
-        body_excerpt = _body_excerpt(clean_body, limit=4000)
+        body_excerpt = clean_body if verbatim_request else _body_excerpt(clean_body, limit=4000)
         search_text, search_metadata, vector_key = _work_search_payload(
             table_name="kanban_discussions",
             row_id=clean_discussion_id,
@@ -18302,8 +18404,14 @@ def _work_preprocessing_original_operator_requests(
         )
     )
     for discussion in steering:
-        document = discussion.get("document") or {}
-        text = document.get("body") if isinstance(document.get("body"), str) else ""
+        text = (
+            discussion.get("body_excerpt")
+            if isinstance(discussion.get("body_excerpt"), str)
+            else ""
+        )
+        if not text:
+            document = discussion.get("document") or {}
+            text = document.get("body") if isinstance(document.get("body"), str) else ""
         discussion_id = str(discussion.get("discussion_id") or "")
         records.append(
             {
