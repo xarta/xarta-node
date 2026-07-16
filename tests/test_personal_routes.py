@@ -11110,6 +11110,138 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
     assert "trigger_preprocessing_idle_scan" in audit_actions
 
 
+def test_work_kanban_shadow_snapshot_matches_real_scan_candidates(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-shadow-parity-root",
+                title="Shadow parity root",
+                body="Root item for scheduler shadow parity.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="shadow-parity-root-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-shadow-parity-child",
+                parent_item_id="work-shadow-parity-root",
+                title="Shadow parity child",
+                body="Child needs preprocessing and has a Review document.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="shadow-parity-child-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-shadow-parity-child",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="Review evidence for the parity fixture.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="shadow-parity-review",
+            ),
+        )
+    )
+    conn.execute("DELETE FROM sync_queue")
+    conn.commit()
+
+    shadow = asyncio.run(
+        routes_personal.work_kanban_automation_shadow_snapshot(
+            item_id="work-shadow-parity-root",
+            max_scan_items=20,
+        )
+    )
+    assert shadow["review_queue_item_ids"] == ["work-shadow-parity-child"]
+    assert shadow["preprocessing_queue_item_ids"] == ["work-shadow-parity-child"]
+
+    review = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-shadow-parity-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="shadow-parity-review-scan",
+            )
+        )
+    )
+    preprocessing = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-shadow-parity-root",
+                max_items=20,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="shadow-parity-preprocessing-scan",
+            )
+        )
+    )
+    assert [marker["item_id"] for marker in review["queued_markers"]] == (
+        shadow["review_queue_item_ids"]
+    )
+    assert [marker["item_id"] for marker in preprocessing["queued_markers"]] == (
+        shadow["preprocessing_queue_item_ids"]
+    )
+
+
+def test_work_kanban_scheduler_tick_receipt_is_durable_and_replay_safe(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.commit()
+    tick_id = "blueprints-kanban-automation:run-receipt"
+    result = {
+        "schema": "xarta.blueprints.kanban_automation_tick.result.v1",
+        "scheduler_run_id": "run-receipt",
+        "tick_id": tick_id,
+        "producer_node_id": "test-owner",
+        "outcome": "completed",
+        "coverage_complete": True,
+        "truncated": False,
+        "error_count": 0,
+        "phase_counts": {"processed_markers": 1},
+        "failure_reasons": [],
+    }
+    first = asyncio.run(
+        routes_personal.record_work_kanban_automation_tick_receipt(
+            tick_id=tick_id,
+            scheduler_run_id="run-receipt",
+            result=result,
+        )
+    )
+    second = asyncio.run(
+        routes_personal.record_work_kanban_automation_tick_receipt(
+            tick_id=tick_id,
+            scheduler_run_id="run-receipt",
+            result=result,
+        )
+    )
+    replay = asyncio.run(routes_personal.work_kanban_automation_tick_receipt(tick_id))
+    assert first == result
+    assert second == result
+    assert replay == result
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count FROM kanban_audit_log
+        WHERE action='complete_kanban_automation_scheduler_tick' AND run_id=?
+        """,
+        (tick_id,),
+    ).fetchone()
+    assert row["count"] == 1
+
+
 def test_work_queued_processor_markers_prioritize_item_urgency_before_queue_age(
     monkeypatch,
 ):
