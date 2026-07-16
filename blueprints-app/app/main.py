@@ -32,6 +32,11 @@ from . import db, timing
 from .auth import compute_token
 from .cors import DynamicCORSMiddleware
 from .events import bus as events_bus
+from .kanban_automation_scheduler import router as kanban_automation_scheduler_router
+from .kanban_automation_scheduler import (
+    start_kanban_automation_scheduler,
+    stop_kanban_automation_scheduler,
+)
 from .middleware_auth import AuthMiddleware
 from .personal_search_scheduler import router as personal_search_scheduler_router
 from .personal_search_scheduler import (
@@ -90,6 +95,7 @@ from .routes_nodes import router as nodes_router
 from .routes_notifier_dnd import router as notifier_dnd_router
 from .routes_personal import (
     _close_work_processor_http_clients,
+    _work_automation_idle_worker_config,
     run_work_kanban_automation_idle_loop,
 )
 from .routes_personal import (
@@ -305,8 +311,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Server-side alarms publish browser SSE ring events when due.
     alarm_scheduler_task = asyncio.create_task(run_alarm_scheduler())
 
-    # Review/preprocessing markers are processed by the local AI Kanban worker.
-    kanban_automation_idle_task = asyncio.create_task(run_work_kanban_automation_idle_loop())
+    # Producer mode explicitly fences legacy recurrence from scheduler recurrence.
+    kanban_automation_config = _work_automation_idle_worker_config()
+    if kanban_automation_config["legacy_loop_effective_enabled"]:
+        kanban_automation_idle_task = asyncio.create_task(run_work_kanban_automation_idle_loop())
 
     # In-memory timing sampler for reconstructing event-loop stalls.
     timing_lag_task = asyncio.create_task(timing.run_event_loop_lag_sampler())
@@ -320,11 +328,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Typed provider for scheduler-owned Personal Search index refreshes.
     await start_personal_search_scheduler()
 
+    # Typed provider for scheduler-owned Kanban automation recurrence.
+    await start_kanban_automation_scheduler()
+
     log.info("blueprints node ready — peers: %s", list(cfg.PEER_SYNC_URLS) or "(none)")
 
     yield  # application is running
 
     # Shutdown — stop producers, then close SSE bus so clients receive the sentinel
+    await stop_kanban_automation_scheduler()
     await stop_personal_search_scheduler()
     await stop_matrix_chat_sync_workers()
     await close_matrix_chat_e2ee_clients()
@@ -582,6 +594,7 @@ def create_app() -> FastAPI:
     application.include_router(events_router, prefix="/api/v1")
     application.include_router(personal_router, prefix="/api/v1")
     application.include_router(personal_search_scheduler_router, prefix="/api/v1")
+    application.include_router(kanban_automation_scheduler_router, prefix="/api/v1")
     application.include_router(pim_email_router, prefix="/api/v1")
     application.include_router(personal_prompts_router, prefix="/api/v1")
 

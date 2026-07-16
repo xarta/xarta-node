@@ -1,10 +1,10 @@
 {
   "schema": "xarta.kanban.automation.idle_worker.contract.v1",
   "status": "active",
-  "version": "2026-07-05",
+  "version": "2026-07-16",
   "title": "Kanban automation idle worker contract",
   "source_of_truth": true,
-  "summary": "The Kanban idle worker is automatic by default for eligible non-excluded cards, but only the nominated singleton owner node should run it. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff. Range-type runtime config values must expose raw, default, accepted range, effective value, source, and state in Automation Status.",
+  "summary": "Kanban semantic discovery and processing remain in Blueprints/Hermes while an explicit producer mode fences legacy recurrence from the typed xarta-scheduler provider. Only the nominated singleton owner may run automatic or manual recovery work. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff. Range-type runtime config values must expose raw, default, accepted range, effective value, source, and state in Automation Status.",
   "singleton_guard": {
     "required": true,
     "owner_node_env": "BLUEPRINTS_KANBAN_AUTOMATION_OWNER_NODE_ID",
@@ -14,8 +14,24 @@
     "override_env": "BLUEPRINTS_KANBAN_AUTOMATION_SINGLETON_OVERRIDE",
     "override_path_env": "BLUEPRINTS_KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH",
     "default_override_path": "/etc/xarta-kanban-automation-singleton-override",
-    "rule": "Automatic background loop and idle-worker tick processing run only when current_node_id equals an explicit owner_node_id, or when no explicit owner is set and this node's private primary flag is active, unless an operator-created override env/file is active.",
+    "rule": "Legacy recurrence, scheduler-provider recurrence, and manual recovery tick processing run only when current_node_id equals an explicit owner_node_id, or when no explicit owner is set and this node's private primary flag is active, unless an operator-created override env/file is active.",
     "non_owner_result": "Return idle_worker_not_owner_node without scanning, queueing, requeueing timeouts, acquiring a lease, claiming markers, or processing work."
+  },
+  "producer_fence": {
+    "env": "BLUEPRINTS_KANBAN_AUTOMATION_PRODUCER_MODE",
+    "default": "legacy",
+    "allowed": {
+      "legacy": "Blueprints lifespan loop is the sole automatic producer; scheduler provider is disabled.",
+      "scheduler_shadow": "Blueprints lifespan loop remains the sole mutating producer; scheduler provider performs read-only discovery/blocker shadow work.",
+      "scheduler": "Blueprints lifespan loop is fenced; the typed scheduler provider is the sole automatic producer.",
+      "fenced": "Both automatic recurrence paths are fenced; owner-node manual recovery remains available."
+    },
+    "invalid_behavior": "fail_closed_to_fenced",
+    "scheduler_target": "blueprints_kanban_automation_tick_v1",
+    "scheduler_provider": "blueprints-kanban-automation",
+    "scheduler_worker_template": "blueprints-kanban-automation:<configured-owner-node-id>",
+    "status_surface": "GET /api/v1/personal/kanban/scheduler/status",
+    "manual_recovery_surface": "POST /api/v1/personal/kanban/automation/idle-worker/tick"
   },
   "provider_mode": {
     "active": "required-hermes-kanban-llm",

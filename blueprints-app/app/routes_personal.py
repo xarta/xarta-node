@@ -373,6 +373,13 @@ KANBAN_AUTOMATION_SINGLETON_OVERRIDE_PATH_ENV = (
 KANBAN_AUTOMATION_SINGLETON_OVERRIDE_DEFAULT_PATH = (
     "/etc/xarta-kanban-automation-singleton-override"
 )
+KANBAN_AUTOMATION_PRODUCER_MODE_ENV = "BLUEPRINTS_KANBAN_AUTOMATION_PRODUCER_MODE"
+KANBAN_AUTOMATION_PRODUCER_MODES = {
+    "legacy",
+    "scheduler_shadow",
+    "scheduler",
+    "fenced",
+}
 KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_PATH = (
     Path(__file__).resolve().parent / "contracts" / "kanban_automation_idle_worker.v1.json"
 )
@@ -17825,6 +17832,15 @@ def _work_automation_singleton_override_state() -> dict[str, Any]:
     }
 
 
+def _work_automation_producer_mode() -> str:
+    value = _clean_short_text(
+        os.environ.get(KANBAN_AUTOMATION_PRODUCER_MODE_ENV, "legacy"),
+        "legacy",
+        limit=40,
+    ).lower()
+    return value if value in KANBAN_AUTOMATION_PRODUCER_MODES else "fenced"
+
+
 def _work_automation_idle_worker_config() -> dict[str, Any]:
     local_model_alias = _work_automation_local_ai_model_alias()
     enabled = _env_bool("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", True)
@@ -17833,6 +17849,10 @@ def _work_automation_idle_worker_config() -> dict[str, Any]:
     override_state = _work_automation_singleton_override_state()
     owner_match = bool(current_node_id and owner_node_id and current_node_id == owner_node_id)
     runs_on_this_node = bool(owner_match or override_state["active"])
+    producer_mode = _work_automation_producer_mode()
+    legacy_loop_enabled = producer_mode in {"legacy", "scheduler_shadow"}
+    scheduler_provider_enabled = producer_mode in {"scheduler_shadow", "scheduler"}
+    scheduler_mutations_enabled = producer_mode == "scheduler"
     max_scan_items_config = _env_int_range_config(
         "BLUEPRINTS_KANBAN_AUTOMATION_MAX_SCAN_ITEMS",
         KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS,
@@ -17842,7 +17862,25 @@ def _work_automation_idle_worker_config() -> dict[str, Any]:
     return {
         "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
         "enabled": enabled,
-        "effective_enabled": bool(enabled and runs_on_this_node),
+        "effective_enabled": bool(
+            enabled and runs_on_this_node and (legacy_loop_enabled or scheduler_provider_enabled)
+        ),
+        "producer_mode": producer_mode,
+        "producer_mode_env": KANBAN_AUTOMATION_PRODUCER_MODE_ENV,
+        "producer_mode_valid": (
+            os.environ.get(KANBAN_AUTOMATION_PRODUCER_MODE_ENV, "legacy").strip().lower()
+            in KANBAN_AUTOMATION_PRODUCER_MODES
+        ),
+        "legacy_loop_enabled": legacy_loop_enabled,
+        "legacy_loop_effective_enabled": bool(
+            enabled and runs_on_this_node and legacy_loop_enabled
+        ),
+        "scheduler_provider_enabled": scheduler_provider_enabled,
+        "scheduler_provider_effective_enabled": bool(
+            enabled and runs_on_this_node and scheduler_provider_enabled
+        ),
+        "scheduler_mutations_enabled": scheduler_mutations_enabled,
+        "manual_recovery_enabled": bool(enabled and runs_on_this_node),
         "current_node_id": current_node_id,
         "owner_node_id": owner_node_id,
         "owner_node_env": KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
@@ -21192,6 +21230,266 @@ def _work_queued_processor_marker_ids_for_item_sync(clean_item_id: str) -> list[
         return _work_queued_processor_marker_ids(conn, scope_ids)
 
 
+def _work_kanban_automation_shadow_snapshot_sync(
+    item_id: str | None = None,
+    max_scan_items: int | None = None,
+) -> dict[str, Any]:
+    config = _work_automation_idle_worker_config()
+    clean_item_id = _clean_short_text(item_id or config["root_item_id"], "", limit=180)
+    scan_limit = _clean_review_scan_limit(max_scan_items or config["max_scan_items"])
+    now_dt = datetime.now(timezone.utc)
+    with _kanban_automation_scan_conn(operation="kanban_automation_shadow_snapshot") as conn:
+        scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
+        scope_args: list[Any] = []
+        scope_where = ""
+        if scope_ids:
+            placeholders = ",".join("?" for _ in scope_ids)
+            scope_where = f" AND item.item_id IN ({placeholders})"
+            scope_args.extend(scope_ids)
+
+        timeout_rows = conn.execute(
+            f"""
+            SELECT marker.* FROM kanban_review_processor_markers marker
+            JOIN kanban_items item ON item.item_id=marker.item_id
+            WHERE marker.status='processing'
+              AND marker.processing_expires_at != ''
+              AND {_work_item_automation_included_predicate("item")}
+              {scope_where}
+            ORDER BY marker.processing_expires_at, marker.marker_id
+            """,
+            scope_args,
+        ).fetchall()
+        timeout_marker_ids = [
+            row["marker_id"]
+            for row in timeout_rows
+            if (expires_at := _parse_utc_datetime(row["processing_expires_at"])) is not None
+            and expires_at <= now_dt
+        ]
+
+        review_rows = conn.execute(
+            f"""
+            SELECT item.* FROM kanban_items item
+            WHERE item.status != 'archived'
+              AND item.status NOT IN ('done', 'closed', 'resolved')
+              AND {_work_item_automation_included_predicate("item")}
+              {scope_where}
+            ORDER BY item.updated_at DESC, item.item_id
+            LIMIT ?
+            """,
+            [*scope_args, scan_limit],
+        ).fetchall()
+        review_candidate_ids: list[str] = []
+        review_queue_ids: list[str] = []
+        for item_row in review_rows:
+            document_source = _review_document_source(
+                _work_item_review_document(conn, item_row["item_id"])
+            )
+            if not document_source["has_review_text"]:
+                continue
+            item_id_value = str(item_row["item_id"])
+            review_candidate_ids.append(item_id_value)
+            existing = conn.execute(
+                "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+                (_review_processor_marker_id(item_id_value),),
+            ).fetchone()
+            if existing is None:
+                review_queue_ids.append(item_id_value)
+                continue
+            same_document = (
+                existing["document_source_hash"] == document_source["document_source_hash"]
+            )
+            already_processed = (
+                _work_marker_successful_source_hash(existing)
+                == document_source["document_source_hash"]
+            )
+            if same_document and existing["status"] in {
+                "queued",
+                "processing",
+                "failed",
+                "skipped",
+                "cancelled",
+            }:
+                continue
+            if already_processed and existing["status"] == "processed":
+                continue
+            review_queue_ids.append(item_id_value)
+
+        preprocessing_args = list(scope_args)
+        preprocessing_rows = conn.execute(
+            f"""
+            SELECT item.* FROM kanban_items item
+            LEFT JOIN kanban_agent_hints hints ON hints.item_id=item.item_id
+            WHERE {_work_preprocessing_candidate_predicate("item")}
+              {scope_where}
+            ORDER BY
+              CASE
+                WHEN hints.hint_id IS NULL
+                  OR COALESCE(json_extract(hints.metadata_json, '$.context_readiness_marker.schema'), '')=''
+                THEN 0 ELSE 1
+              END,
+              CASE item.priority_id
+                WHEN 'critical' THEN 0
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3
+                ELSE 4
+              END,
+              item.updated_at DESC,
+              item.item_id
+            LIMIT ?
+            """,
+            [*preprocessing_args, scan_limit],
+        ).fetchall()
+        preprocessing_counts = _work_preprocessing_counts_by_item(conn, preprocessing_rows)
+        preprocessing_candidate_ids: list[str] = []
+        preprocessing_queue_ids: list[str] = []
+        for item_row in preprocessing_rows:
+            item_id_value = str(item_row["item_id"])
+            source = _work_preprocessing_context_source(
+                conn,
+                item_row,
+                counts=preprocessing_counts.get(item_id_value),
+            )
+            if source["ready"] or not source.get("needs_preprocessing", True):
+                continue
+            preprocessing_candidate_ids.append(item_id_value)
+            existing = conn.execute(
+                "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+                (_preprocessing_marker_id(item_id_value),),
+            ).fetchone()
+            if existing is None:
+                preprocessing_queue_ids.append(item_id_value)
+                continue
+            same_source = existing["document_source_hash"] == source["document_source_hash"]
+            already_processed = (
+                _work_marker_successful_source_hash(existing) == source["document_source_hash"]
+            )
+            if same_source and existing["status"] in {
+                "queued",
+                "processing",
+                "failed",
+                "skipped",
+                "cancelled",
+            }:
+                continue
+            if already_processed and existing["status"] == "processed":
+                continue
+            preprocessing_queue_ids.append(item_id_value)
+
+        claimable_marker_ids = _work_queued_processor_marker_ids(conn, scope_ids)
+    result = {
+        "schema": "xarta.kanban.automation.shadow_snapshot.v1",
+        "item_id": clean_item_id,
+        "scan_limit": scan_limit,
+        "timeout_marker_ids": timeout_marker_ids,
+        "review_candidate_ids": review_candidate_ids,
+        "review_queue_item_ids": review_queue_ids,
+        "preprocessing_candidate_ids": preprocessing_candidate_ids,
+        "preprocessing_queue_item_ids": preprocessing_queue_ids,
+        "claimable_marker_ids": claimable_marker_ids,
+    }
+    result["source_hash"] = _hash_json_payload(result)
+    return result
+
+
+async def work_kanban_automation_shadow_snapshot(
+    *,
+    item_id: str | None = None,
+    max_scan_items: int | None = None,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _work_kanban_automation_shadow_snapshot_sync,
+        item_id,
+        max_scan_items,
+    )
+
+
+def _work_kanban_automation_tick_receipt_sync(tick_id: str) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM kanban_audit_log
+            WHERE action='complete_kanban_automation_scheduler_tick'
+              AND run_id=?
+            ORDER BY created_at DESC, audit_id
+            LIMIT 1
+            """,
+            (tick_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    metadata = _json_value(row["metadata_json"], {})
+    result = metadata.get("result") if isinstance(metadata, dict) else None
+    return result if isinstance(result, dict) else None
+
+
+async def work_kanban_automation_tick_receipt(tick_id: str) -> dict[str, Any] | None:
+    return await _run_personal_sync_work(_work_kanban_automation_tick_receipt_sync, tick_id)
+
+
+def _record_work_kanban_automation_tick_receipt_sync(
+    *,
+    tick_id: str,
+    scheduler_run_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    now = _utc_now_iso()
+    audit_id = f"audit-kanban-scheduler-{hashlib.sha256(tick_id.encode()).hexdigest()[:24]}"
+    with get_conn() as conn:
+        _kanban_begin_write_transaction(conn)
+        audit_row = _write_work_audit(
+            conn,
+            audit_id=audit_id,
+            actor=(
+                "blueprints-kanban-automation:"
+                + _clean_short_text(
+                    str(result.get("producer_node_id") or ""),
+                    "unconfigured-owner",
+                    limit=120,
+                )
+            ),
+            source_surface="xarta-scheduler-provider",
+            action="complete_kanban_automation_scheduler_tick",
+            target_ref=f"xarta-scheduler-runs:{scheduler_run_id}",
+            item_id="",
+            parent_item_id="",
+            created_at=now,
+            request_id=f"{tick_id}-receipt",
+            run_id=tick_id,
+            result=str(result.get("outcome") or "completed"),
+            source_hash=_hash_json_payload(result),
+            metadata={
+                "schema": "xarta.kanban.automation.scheduler_tick_receipt.v1",
+                "scheduler_run_id": scheduler_run_id,
+                "result": result,
+            },
+        )
+        gen = _kanban_table_sync_gen(conn, "kanban-automation-scheduler-tick-receipt")
+        enqueue_for_all_peers(
+            conn,
+            "UPDATE",
+            "kanban_audit_log",
+            audit_id,
+            audit_row,
+            gen,
+        )
+    return result
+
+
+async def record_work_kanban_automation_tick_receipt(
+    *,
+    tick_id: str,
+    scheduler_run_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _record_work_kanban_automation_tick_receipt_sync,
+        tick_id=tick_id,
+        scheduler_run_id=scheduler_run_id,
+        result=result,
+    )
+
+
 async def run_work_kanban_automation_idle_tick(
     *,
     item_id: str | None = None,
@@ -21200,8 +21498,16 @@ async def run_work_kanban_automation_idle_tick(
     holder_id: str | None = None,
     lease_ttl_seconds: int | None = None,
     marker_timeout_seconds: int | None = None,
+    run_id: str | None = None,
+    actor: str | None = None,
+    source_surface: str | None = None,
+    request_id: str | None = None,
+    producer_source: str = "manual",
 ) -> dict[str, Any]:
     config = _work_automation_idle_worker_config()
+    clean_producer_source = _clean_short_text(producer_source, "manual", limit=40).lower()
+    if clean_producer_source not in {"legacy", "scheduler", "manual"}:
+        raise HTTPException(422, "Kanban automation producer_source is invalid")
     if not config["enabled"]:
         return {
             "ok": True,
@@ -21236,6 +21542,33 @@ async def run_work_kanban_automation_idle_tick(
             "eligible_marker_count": 0,
             "eligible_marker_ids": [],
         }
+    source_enabled = {
+        "legacy": bool(config["legacy_loop_effective_enabled"]),
+        "scheduler": bool(
+            config["scheduler_provider_effective_enabled"] and config["scheduler_mutations_enabled"]
+        ),
+        "manual": bool(config["manual_recovery_enabled"]),
+    }[clean_producer_source]
+    if not source_enabled:
+        return {
+            "ok": True,
+            "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+            "enabled": True,
+            "effective_enabled": False,
+            "runs_on_this_node": bool(config.get("runs_on_this_node")),
+            "current_node_id": config.get("current_node_id", ""),
+            "owner_node_id": config.get("owner_node_id", ""),
+            "singleton_override": config.get("singleton_override", {}),
+            "producer_mode": config["producer_mode"],
+            "producer_source": clean_producer_source,
+            "reason": f"{clean_producer_source}_producer_fenced",
+            "lease_acquired": False,
+            "processed_count": 0,
+            "processed_markers": [],
+            "claim_results": [],
+            "eligible_marker_count": 0,
+            "eligible_marker_ids": [],
+        }
     clean_item_id = _clean_short_text(item_id or config["root_item_id"], "", limit=180)
     scan_limit = _clean_review_scan_limit(max_scan_items or config["max_scan_items"])
     process_limit = max(1, min(int(max_process_items or config["max_process_items"]), 50))
@@ -21248,16 +21581,37 @@ async def run_work_kanban_automation_idle_tick(
     timeout_seconds = _clean_review_lease_ttl(
         marker_timeout_seconds or config["marker_timeout_seconds"]
     )
-    run_id = f"kanban-idle-worker-{uuid.uuid4().hex[:12]}"
+    clean_run_id = _clean_short_text(
+        run_id or f"kanban-idle-worker-{uuid.uuid4().hex[:12]}",
+        "",
+        limit=220,
+    )
+    clean_actor = _clean_short_text(actor or clean_holder_id, clean_holder_id, limit=160)
+    clean_source_surface = _clean_short_text(
+        source_surface
+        or (
+            "xarta-scheduler-provider"
+            if clean_producer_source == "scheduler"
+            else "kanban-automation-idle-worker"
+        ),
+        "kanban-automation-idle-worker",
+        limit=160,
+    )
+    clean_request_id = _clean_short_text(request_id or clean_run_id, clean_run_id, limit=220)
+    source_metadata = {
+        "worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+        "producer_mode": config["producer_mode"],
+        "producer_source": clean_producer_source,
+    }
 
     timeout_requeue = await requeue_timed_out_work_review_processor_markers(
         WorkReviewProcessorTimeoutRequeueRequest(
             item_id=clean_item_id or None,
-            actor=clean_holder_id,
-            source_surface="kanban-automation-idle-worker",
-            request_id=f"{run_id}-requeue-timeouts",
-            run_id=run_id,
-            metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+            actor=clean_actor,
+            source_surface=clean_source_surface,
+            request_id=f"{clean_request_id}-requeue-timeouts",
+            run_id=clean_run_id,
+            metadata=source_metadata,
         )
     )
     review_scan = await trigger_work_review_processor_idle_scan(
@@ -21265,22 +21619,22 @@ async def run_work_kanban_automation_idle_tick(
             item_id=clean_item_id or None,
             max_items=scan_limit,
             include_empty=False,
-            actor=clean_holder_id,
-            source_surface="kanban-automation-idle-worker",
-            request_id=f"{run_id}-review-scan",
-            run_id=run_id,
-            metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+            actor=clean_actor,
+            source_surface=clean_source_surface,
+            request_id=f"{clean_request_id}-review-scan",
+            run_id=clean_run_id,
+            metadata=source_metadata,
         )
     )
     preprocessing_scan = await trigger_work_preprocessing_idle_scan(
         WorkPreprocessingIdleScanRequest(
             item_id=clean_item_id or None,
             max_items=scan_limit,
-            actor=clean_holder_id,
-            source_surface="kanban-automation-idle-worker",
-            request_id=f"{run_id}-preprocessing-scan",
-            run_id=run_id,
-            metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+            actor=clean_actor,
+            source_surface=clean_source_surface,
+            request_id=f"{clean_request_id}-preprocessing-scan",
+            run_id=clean_run_id,
+            metadata=source_metadata,
         )
     )
     eligible_marker_ids = await _run_personal_sync_work(
@@ -21292,11 +21646,11 @@ async def run_work_kanban_automation_idle_tick(
             holder_id=clean_holder_id,
             item_id=clean_item_id or None,
             ttl_seconds=ttl_seconds,
-            actor=clean_holder_id,
-            source_surface="kanban-automation-idle-worker",
-            request_id=f"{run_id}-lease",
-            run_id=run_id,
-            metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+            actor=clean_actor,
+            source_surface=clean_source_surface,
+            request_id=f"{clean_request_id}-lease",
+            run_id=clean_run_id,
+            metadata=source_metadata,
         )
     )
     processed_markers: list[dict[str, Any]] = []
@@ -21306,7 +21660,7 @@ async def run_work_kanban_automation_idle_tick(
         return {
             "ok": True,
             "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
-            "run_id": run_id,
+            "run_id": clean_run_id,
             "item_id": clean_item_id,
             "enabled": True,
             "effective_enabled": True,
@@ -21314,6 +21668,8 @@ async def run_work_kanban_automation_idle_tick(
             "current_node_id": config["current_node_id"],
             "owner_node_id": config["owner_node_id"],
             "singleton_override": config["singleton_override"],
+            "producer_mode": config["producer_mode"],
+            "producer_source": clean_producer_source,
             "reason": lease.get("reason") or "lease_not_acquired",
             "lease_acquired": False,
             "timeout_requeue": timeout_requeue,
@@ -21334,10 +21690,10 @@ async def run_work_kanban_automation_idle_tick(
                     item_id=clean_item_id or None,
                     lease_token=lease_token,
                     ttl_seconds=ttl_seconds,
-                    actor=clean_holder_id,
-                    source_surface="kanban-automation-idle-worker",
-                    request_id=f"{run_id}-heartbeat-{index}",
-                    run_id=run_id,
+                    actor=clean_actor,
+                    source_surface=clean_source_surface,
+                    request_id=f"{clean_request_id}-heartbeat-{index}",
+                    run_id=clean_run_id,
                 )
             )
             try:
@@ -21348,11 +21704,11 @@ async def run_work_kanban_automation_idle_tick(
                         item_id=clean_item_id or None,
                         timeout_seconds=timeout_seconds,
                         eligible_marker_ids=eligible_marker_ids,
-                        actor=clean_holder_id,
-                        source_surface="kanban-automation-idle-worker",
-                        request_id=f"{run_id}-claim-{index}",
-                        run_id=run_id,
-                        metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+                        actor=clean_actor,
+                        source_surface=clean_source_surface,
+                        request_id=f"{clean_request_id}-claim-{index}",
+                        run_id=clean_run_id,
+                        metadata=source_metadata,
                     )
                 )
             except HTTPException as exc:
@@ -21384,7 +21740,7 @@ async def run_work_kanban_automation_idle_tick(
                     claimed["marker"],
                     holder_id=clean_holder_id,
                     lease_token=lease_token,
-                    run_id=run_id,
+                    run_id=clean_run_id,
                 )
             )
     finally:
@@ -21393,17 +21749,17 @@ async def run_work_kanban_automation_idle_tick(
                 holder_id=clean_holder_id,
                 item_id=clean_item_id or None,
                 lease_token=lease_token,
-                actor=clean_holder_id,
-                source_surface="kanban-automation-idle-worker",
-                request_id=f"{run_id}-release",
-                run_id=run_id,
-                metadata={"worker_schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA},
+                actor=clean_actor,
+                source_surface=clean_source_surface,
+                request_id=f"{clean_request_id}-release",
+                run_id=clean_run_id,
+                metadata=source_metadata,
             )
         )
     return {
         "ok": True,
         "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
-        "run_id": run_id,
+        "run_id": clean_run_id,
         "item_id": clean_item_id,
         "enabled": True,
         "effective_enabled": True,
@@ -21411,6 +21767,8 @@ async def run_work_kanban_automation_idle_tick(
         "current_node_id": config["current_node_id"],
         "owner_node_id": config["owner_node_id"],
         "singleton_override": config["singleton_override"],
+        "producer_mode": config["producer_mode"],
+        "producer_source": clean_producer_source,
         "lease_acquired": True,
         "timeout_requeue": timeout_requeue,
         "review_scan": review_scan,
@@ -21429,6 +21787,12 @@ async def run_work_kanban_automation_idle_loop() -> None:
     if not config["enabled"]:
         log.info("Kanban automation idle worker disabled by configuration")
         return
+    if not config["legacy_loop_enabled"]:
+        log.info(
+            "Kanban automation legacy loop fenced by producer mode %s",
+            config["producer_mode"],
+        )
+        return
     if not config["runs_on_this_node"]:
         log.info(
             "Kanban automation idle worker not started on %s; owner node is %s",
@@ -21442,7 +21806,7 @@ async def run_work_kanban_automation_idle_loop() -> None:
     while True:
         try:
             with timing.span("background_task_cycle", task="kanban_automation_idle_tick"):
-                result = await run_work_kanban_automation_idle_tick()
+                result = await run_work_kanban_automation_idle_tick(producer_source="legacy")
             if int(result.get("processed_count") or 0) > 0:
                 log.info(
                     "Kanban automation idle worker processed %s marker(s)",
@@ -21467,6 +21831,11 @@ async def trigger_work_automation_idle_worker_tick(
         holder_id=body.holder_id or meta["actor"],
         lease_ttl_seconds=body.lease_ttl_seconds,
         marker_timeout_seconds=body.marker_timeout_seconds,
+        run_id=meta["run_id"],
+        actor=meta["actor"],
+        source_surface=meta["source_surface"],
+        request_id=meta["request_id"],
+        producer_source="manual",
     )
 
 
@@ -22245,7 +22614,7 @@ def _claim_next_work_review_processor_marker_sync(
     processing_expires_at = _utc_iso_from_datetime(now_dt + timedelta(seconds=ttl_seconds))
     audit_id = f"audit-{uuid.uuid4().hex}"
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         lease_row = _require_work_review_processor_lease_owner(
             conn,
             holder_id=holder_id,
@@ -22434,7 +22803,7 @@ def _complete_work_review_processor_marker_sync(
     outcome_status = _clean_review_marker_outcome_status(body.status)
     audit_id = f"audit-{uuid.uuid4().hex}"
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         lease_row = _require_work_review_processor_lease_owner(
             conn,
             holder_id=holder_id,
@@ -22901,7 +23270,7 @@ def _requeue_timed_out_work_review_processor_markers_sync(
     clean_item_id = _clean_short_text(body.item_id, "", limit=180)
     audit_id = f"audit-{uuid.uuid4().hex}"
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         args: list[Any] = []
         now_dt = _parse_utc_datetime(now) or datetime.now(timezone.utc)
@@ -23360,7 +23729,7 @@ def _acquire_work_review_processor_lease_sync(
     ttl_seconds = _clean_review_lease_ttl(body.ttl_seconds)
     requested_token = _clean_short_text(body.lease_token or "", "", limit=220)
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         item = _work_item_or_404(conn, clean_item_id) if clean_item_id else None
         existing = conn.execute(
             "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
@@ -23505,7 +23874,7 @@ def _heartbeat_work_review_processor_lease_sync(
     lease_token = _clean_short_text(body.lease_token or "", "", limit=220)
     ttl_seconds = _clean_review_lease_ttl(body.ttl_seconds)
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         existing = conn.execute(
             "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
             (_review_processor_lease_id(),),
@@ -23594,7 +23963,7 @@ def _release_work_review_processor_lease_sync(
         raise HTTPException(400, "Review Processor lease holder_id is required")
     lease_token = _clean_short_text(body.lease_token or "", "", limit=220)
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        _kanban_begin_write_transaction(conn)
         existing = conn.execute(
             "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
             (_review_processor_lease_id(),),
