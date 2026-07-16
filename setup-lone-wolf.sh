@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup-lone-wolf.sh — run after .env is loaded on any fleet node
-# Manages .lone-wolf/.gitignore docs/syncthing entries and cron backup.
+# Manages .lone-wolf/.gitignore runtime/docs/syncthing entries and cron backup.
 # DOCS_ROOT is set in .env; no symlink needed (Option B).
 
 set -euo pipefail
@@ -83,6 +83,39 @@ remove_legacy_docs_issue_exceptions() {
     remove_gitignore_line '!docs/issues/' "Drop legacy docs/issues exception" "legacy docs cleanup"
     remove_gitignore_line '!docs/issues/**' "Drop legacy docs/issues exception" "legacy docs cleanup"
 }
+
+ensure_runtime_gitignore_rules() {
+    local rules=(
+        '__pycache__/'
+        '*.pyc'
+        '.pytest_cache/'
+        '.mypy_cache/'
+        '.ruff_cache/'
+        '.coverage'
+        'htmlcov/'
+    )
+    local missing=()
+    local line
+
+    for line in "${rules[@]}"; do
+        if ! grep -qxF "$line" "$GITIGNORE" 2>/dev/null; then
+            missing+=("$line")
+        fi
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        {
+            printf '\n# Generated Python test, type-check, lint, and coverage state\n'
+            printf '%s\n' "${missing[@]}"
+        } >> "$GITIGNORE"
+        commit_gitignore_change "Ignore generated Python runtime and test state"
+        echo "  gitignore: added ${#missing[@]} generated-runtime rule(s)"
+    else
+        echo "  gitignore: generated Python runtime rules already present — OK"
+    fi
+}
+
+ensure_runtime_gitignore_rules
 
 if ! grep -q "$OWNER_CRON_MARKER" "$OWNER_CRON_FILE" 2>/dev/null; then
     echo "# $OWNER_CRON_MARKER" > "$OWNER_CRON_FILE"
