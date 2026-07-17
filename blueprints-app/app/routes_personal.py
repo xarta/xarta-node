@@ -148,6 +148,8 @@ KANBAN_PROPOSAL_SURFACES_CONTRACT_SCHEMA = "xarta.kanban.proposal_surfaces.contr
 KANBAN_PROPOSAL_ENTRY_SCHEMA = "xarta.kanban.proposal_entry.v1"
 KANBAN_PROPOSAL_RESPONSE_SCHEMA = "xarta.kanban.proposal_response.v1"
 KANBAN_PROPOSAL_OUTCOME_SCHEMA = "xarta.kanban.proposal_outcome.v1"
+KANBAN_PROPOSAL_RECONCILIATION_SCHEMA = "xarta.kanban.proposal_reconciliation.v1"
+KANBAN_PROPOSAL_RECONCILIATION_POLICY_ID = "explicit-semantic-owner-canonical-outcome-v1"
 KANBAN_EXECUTION_DIRECTIVE_SCHEMA = "xarta.kanban.preprocessing.execution_directive.v1"
 KANBAN_PREPROCESSING_VALIDATION_REPAIR_SCHEMA = "xarta.kanban.preprocessing.validation_repair.v1"
 KANBAN_ORIGINAL_OPERATOR_REQUESTS_SCHEMA = "xarta.kanban.original_operator_requests.v1"
@@ -1216,6 +1218,30 @@ class WorkProposalResponseRequest(BaseModel):
     source_surface: str = "kanban-automation-status"
     request_id: str | None = None
     run_id: str | None = None
+
+
+class WorkProposalReconciliationPreviewRequest(BaseModel):
+    """Explicit, bounded semantic reconciliation request; never a discovery query."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reconciliation_id: str
+    policy_id: str
+    disposition: str
+    candidate_item_refs: list[str]
+    semantic_owner_item_ref: str
+    canonical_outcome_item_ref: str
+    canonical_decision_id: str
+    reason: str
+    proof_refs: list[str] = []
+    actor: str = "operator"
+    source_surface: str = "kanban-proposal-reconciliation"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkProposalReconciliationApplyRequest(WorkProposalReconciliationPreviewRequest):
+    preview_fingerprint: str
 
 
 class WorkReviewProcessorLeaseRequest(BaseModel):
@@ -2635,6 +2661,8 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
         "entry_schema": KANBAN_PROPOSAL_ENTRY_SCHEMA,
         "response_schema": KANBAN_PROPOSAL_RESPONSE_SCHEMA,
         "outcome_schema": KANBAN_PROPOSAL_OUTCOME_SCHEMA,
+        "reconciliation_schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+        "reconciliation_policy_id": KANBAN_PROPOSAL_RECONCILIATION_POLICY_ID,
         "execution_directive_schema": KANBAN_EXECUTION_DIRECTIVE_SCHEMA,
         "surface_root": {
             "item_id": KANBAN_OPERATOR_PROPOSAL_SURFACE_ITEM_ID,
@@ -2721,6 +2749,12 @@ def _work_proposal_surfaces_contract() -> dict[str, Any]:
             "response_endpoint_template": (
                 "/api/v1/personal/kanban/automation/proposal-surfaces/inbox/{item_id}/responses"
             ),
+            "reconciliation_preview_endpoint": (
+                "/api/v1/personal/kanban/automation/proposal-surfaces/reconciliations/preview"
+            ),
+            "reconciliation_apply_endpoint": (
+                "/api/v1/personal/kanban/automation/proposal-surfaces/reconciliations/apply"
+            ),
             "operator_visible": True,
             "expected_surfaces": [
                 "automation status modal",
@@ -2760,7 +2794,12 @@ def _proposal_item_id_from_ref(value: Any) -> str:
     return _kanban_item_id_from_share_ref(clean) or _clean_short_text(clean, "", limit=180)
 
 
-def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any]:
+def _work_proposal_surface_item_projection(
+    row: Any,
+    *,
+    link_rows: list[Any] | None = None,
+    decision_row: Any | None = None,
+) -> dict[str, Any]:
     item = _row_to_work_item(row)
     provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
     proposal = (
@@ -2768,19 +2807,14 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         if isinstance(provenance.get("proposal_surface"), dict)
         else {}
     )
-    link_rows = conn.execute(
-        """
-        SELECT * FROM kanban_item_links
-        WHERE source_item_id=? OR target_item_id=?
-        ORDER BY updated_at DESC, link_id
-        """,
-        (row["item_id"], row["item_id"]),
-    ).fetchall()
+    reconciliation = (
+        proposal.get("reconciliation") if isinstance(proposal.get("reconciliation"), dict) else {}
+    )
     source_refs: list[str] = list(proposal.get("source_item_refs") or [])
     outcome_refs: list[str] = []
     implementation_refs: list[str] = []
     links: list[dict[str, Any]] = []
-    for link_row in link_rows:
+    for link_row in link_rows or []:
         metadata = _json_value(link_row["metadata_json"], {})
         other_id = (
             link_row["target_item_id"]
@@ -2789,7 +2823,16 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         )
         role = _clean_short_text(str(metadata.get("role") or ""), "", limit=100)
         ref = _kanban_item_uri(other_id)
-        if role in {"processed_outcome", "outcome", "source_inbox"} and ref not in outcome_refs:
+        if (
+            role
+            in {
+                "processed_outcome",
+                "outcome",
+                "source_inbox",
+                "reconciled_outcome",
+            }
+            and ref not in outcome_refs
+        ):
             outcome_refs.append(ref)
         if (
             role
@@ -2798,6 +2841,7 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
                 "accepted_implementation_owner",
                 "affected_work",
                 "semantic_owner",
+                "reconciliation_owner",
             }
             and ref not in implementation_refs
         ):
@@ -2812,15 +2856,6 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
                 "role": role,
             }
         )
-    decision_row = conn.execute(
-        """
-        SELECT * FROM kanban_review_decisions
-        WHERE item_id=? AND processor_kind IN ('proposal', 'proposal_response')
-        ORDER BY updated_at DESC, created_at DESC, decision_id
-        LIMIT 1
-        """,
-        (row["item_id"],),
-    ).fetchone()
     decision_metadata = _json_value(decision_row["metadata_json"], {}) if decision_row else {}
     response_state = (
         decision_metadata.get("response_state")
@@ -2828,8 +2863,20 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         else {}
     )
     tags = _json_value(row["tags_json"], [])
-    superseded = proposal.get("status") == "superseded" or "superseded" in tags
-    processed = row["state_id"] == "done" or bool(proposal.get("processed_at"))
+    disposition = _clean_short_text(str(reconciliation.get("disposition") or ""), "", limit=80)
+    superseded = (
+        disposition == "superseded"
+        or proposal.get("status") == "superseded"
+        or "superseded" in tags
+    )
+    obsolete = (
+        disposition == "obsolete" or proposal.get("status") == "obsolete" or "obsolete" in tags
+    )
+    processed = (
+        row["state_id"] == "done"
+        or bool(proposal.get("processed_at"))
+        or disposition in {"superseded", "obsolete"}
+    )
     retry_state = _clean_short_text(
         str(response_state.get("retry_state") or proposal.get("retry_state") or ""),
         "",
@@ -2844,7 +2891,9 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         "status": row["status"],
         "entry_type": proposal.get("entry_type") or "",
         "proposal_status": (
-            "superseded"
+            disposition
+            if disposition in {"superseded", "obsolete"}
+            else "superseded"
             if superseded
             else (
                 "processed"
@@ -2860,6 +2909,8 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         "links": links,
         "processed": processed,
         "superseded": superseded,
+        "obsolete": obsolete,
+        "reconciliation": reconciliation,
         "superseded_at": proposal.get("superseded_at") or "",
         "superseded_by_response_id": proposal.get("superseded_by_response_id") or "",
         "retry_state": retry_state,
@@ -2867,6 +2918,104 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
         "latest_decision_id": decision_row["decision_id"] if decision_row else "",
         "latest_decision_type": decision_row["decision_type"] if decision_row else "",
         "updated_at": row["updated_at"],
+    }
+
+
+def _work_proposal_surface_projection_rows(
+    conn: Any,
+    rows: list[Any],
+) -> list[dict[str, Any]]:
+    item_ids = [str(row["item_id"]) for row in rows]
+    if not item_ids:
+        return []
+    placeholders = ",".join("?" for _ in item_ids)
+    related_links = conn.execute(
+        f"""
+        SELECT * FROM kanban_item_links
+        WHERE source_item_id IN ({placeholders}) OR target_item_id IN ({placeholders})
+        ORDER BY updated_at DESC, link_id
+        """,
+        [*item_ids, *item_ids],
+    ).fetchall()
+    links_by_item: dict[str, list[Any]] = {item_id: [] for item_id in item_ids}
+    for link_row in related_links:
+        source_id = str(link_row["source_item_id"])
+        target_id = str(link_row["target_item_id"])
+        if source_id in links_by_item:
+            links_by_item[source_id].append(link_row)
+        if target_id in links_by_item and target_id != source_id:
+            links_by_item[target_id].append(link_row)
+    decision_rows = conn.execute(
+        f"""
+        SELECT * FROM kanban_review_decisions
+        WHERE item_id IN ({placeholders})
+          AND processor_kind IN ('proposal', 'proposal_response', 'proposal_reconciliation')
+        ORDER BY item_id, updated_at DESC, created_at DESC, decision_id
+        """,
+        item_ids,
+    ).fetchall()
+    latest_decision_by_item: dict[str, Any] = {}
+    for decision_row in decision_rows:
+        latest_decision_by_item.setdefault(str(decision_row["item_id"]), decision_row)
+    return [
+        _work_proposal_surface_item_projection(
+            row,
+            link_rows=links_by_item.get(str(row["item_id"]), []),
+            decision_row=latest_decision_by_item.get(str(row["item_id"])),
+        )
+        for row in rows
+    ]
+
+
+def _work_proposal_surface_lifecycle_counts(conn: Any, parent_id: str) -> dict[str, int]:
+    row = conn.execute(
+        """
+        WITH proposal_rows AS (
+          SELECT
+            state_id,
+            status,
+            COALESCE(json_extract(provenance_json, '$.proposal_surface.status'), '') AS proposal_status,
+            COALESCE(json_extract(provenance_json, '$.proposal_surface.processed_at'), '') AS processed_at,
+            COALESCE(json_extract(provenance_json, '$.proposal_surface.reconciliation.disposition'), '') AS disposition
+          FROM kanban_items
+          WHERE parent_item_id=? AND status != 'archived'
+        ), classified AS (
+          SELECT *,
+            CASE
+              WHEN state_id != 'done'
+               AND status NOT IN ('done', 'closed', 'resolved', 'cancelled')
+               AND processed_at=''
+               AND proposal_status NOT IN ('processed', 'superseded', 'obsolete')
+               AND disposition NOT IN ('superseded', 'obsolete')
+              THEN 1 ELSE 0
+            END AS actionable
+          FROM proposal_rows
+        )
+        SELECT
+          COUNT(*) AS total_count,
+          COALESCE(SUM(actionable), 0) AS actionable_count,
+          COALESCE(SUM(CASE WHEN actionable=0 THEN 1 ELSE 0 END), 0) AS processed_count,
+          COALESCE(SUM(CASE WHEN actionable=0 AND disposition='' AND proposal_status NOT IN ('superseded', 'obsolete') THEN 1 ELSE 0 END), 0) AS canonical_processed_count,
+          COALESCE(SUM(CASE WHEN disposition='superseded' OR (disposition='' AND proposal_status='superseded') THEN 1 ELSE 0 END), 0) AS superseded_count,
+          COALESCE(SUM(CASE WHEN disposition='obsolete' OR (disposition='' AND proposal_status='obsolete') THEN 1 ELSE 0 END), 0) AS obsolete_count,
+          COALESCE(SUM(CASE WHEN actionable=0 THEN 1 ELSE 0 END), 0) AS history_count,
+          COALESCE(SUM(CASE WHEN actionable=0 THEN 1 ELSE 0 END), 0) AS resolved_count
+        FROM classified
+        """,
+        (parent_id,),
+    ).fetchone()
+    return {
+        key: int(row[key] if row else 0)
+        for key in (
+            "total_count",
+            "actionable_count",
+            "processed_count",
+            "canonical_processed_count",
+            "superseded_count",
+            "obsolete_count",
+            "history_count",
+            "resolved_count",
+        )
     }
 
 
@@ -2889,17 +3038,14 @@ def _work_proposal_surfaces_status_from_conn(
             """,
             (parent_id, max(1, min(int(limit or 20), 100))),
         ).fetchall()
-        total_row = conn.execute(
-            "SELECT COUNT(*) AS count FROM kanban_items "
-            "WHERE parent_item_id=? AND status != 'archived'",
-            (parent_id,),
-        ).fetchone()
-        entries = [_work_proposal_surface_item_projection(conn, row) for row in rows]
+        counts = _work_proposal_surface_lifecycle_counts(conn, parent_id)
+        entries = _work_proposal_surface_projection_rows(conn, list(rows))
         surfaces[name] = {
             **dict(contract[name]),
-            "count": int(total_row["count"] if total_row else 0),
-            "open_count": sum(1 for entry in entries if not entry["processed"]),
-            "processed_count": sum(1 for entry in entries if entry["processed"]),
+            "count": counts["total_count"],
+            "total_count": counts["total_count"],
+            "open_count": counts["actionable_count"],
+            **counts,
             "failed_count": sum(1 for entry in entries if entry["failure"]),
             "retry_count": sum(1 for entry in entries if entry["retry_state"]),
             "entries": entries,
@@ -2912,13 +3058,670 @@ def _work_proposal_surfaces_status_from_conn(
         "outbox": surfaces["outbox"],
         "producer_endpoint": contract["status_integration"]["producer_endpoint"],
         "response_endpoint_template": contract["status_integration"]["response_endpoint_template"],
+        "reconciliation_preview_endpoint": contract["status_integration"][
+            "reconciliation_preview_endpoint"
+        ],
+        "reconciliation_apply_endpoint": contract["status_integration"][
+            "reconciliation_apply_endpoint"
+        ],
         "generated_at": _utc_now_iso(),
     }
 
 
 def _work_proposal_surfaces_status_sync(limit: int = 20) -> dict[str, Any]:
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(
+        operation="kanban_proposal_surfaces_status",
+        transactional=False,
+    ) as conn:
         return _work_proposal_surfaces_status_from_conn(conn, limit)
+
+
+def _clean_work_proposal_reconciliation_request(
+    body: WorkProposalReconciliationPreviewRequest,
+) -> dict[str, Any]:
+    reconciliation_id = _clean_work_id(body.reconciliation_id, "proposal-reconciliation")
+    policy_id = _clean_short_text(body.policy_id, "", limit=120)
+    if policy_id != KANBAN_PROPOSAL_RECONCILIATION_POLICY_ID:
+        raise HTTPException(422, "Unsupported proposal reconciliation policy_id")
+    disposition = _clean_short_text(body.disposition, "", limit=80).lower()
+    if disposition not in {"superseded", "obsolete"}:
+        raise HTTPException(422, "Proposal reconciliation disposition is invalid")
+    candidate_ids = [_proposal_item_id_from_ref(ref) for ref in body.candidate_item_refs]
+    if (
+        not candidate_ids
+        or len(candidate_ids) > 50
+        or any(not item_id for item_id in candidate_ids)
+    ):
+        raise HTTPException(422, "Proposal reconciliation requires 1 to 50 candidate refs")
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise HTTPException(422, "Proposal reconciliation candidate refs must be unique")
+    semantic_owner_id = _proposal_item_id_from_ref(body.semantic_owner_item_ref)
+    canonical_outcome_id = _proposal_item_id_from_ref(body.canonical_outcome_item_ref)
+    canonical_decision_id = _clean_work_id(body.canonical_decision_id, "kanban-decision")
+    reason = _body_excerpt(body.reason, limit=4000).strip()
+    if not semantic_owner_id or not canonical_outcome_id or not canonical_decision_id or not reason:
+        raise HTTPException(
+            422,
+            "Reconciliation owner, outcome, decision, and nonempty reason are required",
+        )
+    preview_fingerprint = _clean_short_text(
+        str(getattr(body, "preview_fingerprint", "") or ""), "", limit=96
+    )
+    if isinstance(body, WorkProposalReconciliationApplyRequest) and not preview_fingerprint:
+        raise HTTPException(422, "preview_fingerprint is required for reconciliation apply")
+    meta = _work_request_meta(body)
+    return {
+        "reconciliation_id": reconciliation_id,
+        "policy_id": policy_id,
+        "disposition": disposition,
+        "candidate_ids": candidate_ids,
+        "semantic_owner_id": semantic_owner_id,
+        "canonical_outcome_id": canonical_outcome_id,
+        "canonical_decision_id": canonical_decision_id,
+        "reason": reason,
+        "proof_refs": _clean_event_list(body.proof_refs, limit=64),
+        "preview_fingerprint": preview_fingerprint,
+        **meta,
+    }
+
+
+def _work_proposal_reconciliation_request_identity(clean: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+        "reconciliation_id": clean["reconciliation_id"],
+        "policy_id": clean["policy_id"],
+        "disposition": clean["disposition"],
+        "candidate_ids": clean["candidate_ids"],
+        "semantic_owner_id": clean["semantic_owner_id"],
+        "canonical_outcome_id": clean["canonical_outcome_id"],
+        "canonical_decision_id": clean["canonical_decision_id"],
+        "reason": clean["reason"],
+        "proof_refs": clean["proof_refs"],
+    }
+
+
+def _work_proposal_reconciliation_preview_from_conn(
+    conn: Any,
+    clean: dict[str, Any],
+) -> dict[str, Any]:
+    owner = _work_item_or_404(conn, clean["semantic_owner_id"])
+    outcome = _work_item_or_404(conn, clean["canonical_outcome_id"])
+    decision = conn.execute(
+        "SELECT * FROM kanban_review_decisions WHERE decision_id=?",
+        (clean["canonical_decision_id"],),
+    ).fetchone()
+    canonical_findings: list[dict[str, str]] = []
+    if decision is None:
+        canonical_findings.append(
+            {
+                "code": "canonical_decision_missing",
+                "message": "The exact canonical decision does not exist.",
+            }
+        )
+    else:
+        if str(decision["item_id"]) != clean["canonical_outcome_id"]:
+            canonical_findings.append(
+                {
+                    "code": "canonical_decision_wrong_item",
+                    "message": "The canonical decision is not owned by the canonical outcome.",
+                }
+            )
+        if str(decision["status"]) != "accepted":
+            canonical_findings.append(
+                {
+                    "code": "canonical_decision_not_accepted",
+                    "message": "The canonical decision is not accepted.",
+                }
+            )
+    canonical_links = conn.execute(
+        """
+        SELECT * FROM kanban_item_links
+        WHERE source_item_id=? OR target_item_id=?
+        ORDER BY updated_at DESC, link_id
+        """,
+        (clean["canonical_outcome_id"], clean["canonical_outcome_id"]),
+    ).fetchall()
+    outcome_owner_linked = any(
+        str(link["source_item_id"]) == clean["canonical_outcome_id"]
+        and str(link["target_item_id"]) == clean["semantic_owner_id"]
+        and _json_value(link["metadata_json"], {}).get("role") == "semantic_owner"
+        for link in canonical_links
+    )
+    owner_is_direct_child = str(owner["parent_item_id"] or "") == clean["canonical_outcome_id"]
+    if not outcome_owner_linked and not owner_is_direct_child:
+        canonical_findings.append(
+            {
+                "code": "canonical_outcome_owner_mismatch",
+                "message": "The canonical outcome has no reviewed direct relation to the owner.",
+            }
+        )
+    placeholders = ",".join("?" for _ in clean["candidate_ids"])
+    candidate_rows = conn.execute(
+        f"SELECT * FROM kanban_items WHERE item_id IN ({placeholders})",
+        clean["candidate_ids"],
+    ).fetchall()
+    rows_by_id = {str(row["item_id"]): row for row in candidate_rows}
+    link_rows = conn.execute(
+        f"""
+        SELECT * FROM kanban_item_links
+        WHERE source_item_id IN ({placeholders})
+        ORDER BY source_item_id, updated_at DESC, link_id
+        """,
+        clean["candidate_ids"],
+    ).fetchall()
+    links_by_source: dict[str, list[Any]] = {item_id: [] for item_id in clean["candidate_ids"]}
+    for link_row in link_rows:
+        links_by_source.setdefault(str(link_row["source_item_id"]), []).append(link_row)
+    candidates: list[dict[str, Any]] = []
+    for item_id in clean["candidate_ids"]:
+        row = rows_by_id.get(item_id)
+        reasons: list[dict[str, str]] = []
+        if row is None:
+            reasons.append(
+                {"code": "candidate_missing", "message": "The exact candidate does not exist."}
+            )
+            candidates.append(
+                {
+                    "item_id": item_id,
+                    "uri": _kanban_item_uri(item_id),
+                    "eligible": False,
+                    "reasons": reasons,
+                    "material_state": {},
+                }
+            )
+            continue
+        provenance = _json_value(row["provenance_json"], {})
+        proposal = (
+            provenance.get("proposal_surface")
+            if isinstance(provenance.get("proposal_surface"), dict)
+            else {}
+        )
+        reconciliation = (
+            proposal.get("reconciliation")
+            if isinstance(proposal.get("reconciliation"), dict)
+            else {}
+        )
+        if str(row["parent_item_id"] or "") != KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID:
+            reasons.append(
+                {
+                    "code": "candidate_not_inbox_child",
+                    "message": "The candidate is not a direct proposal INBOX child.",
+                }
+            )
+        if str(row["state_id"]) != "todo" or str(row["status"]) != "open":
+            reasons.append(
+                {
+                    "code": "candidate_not_actionable",
+                    "message": "The candidate is not currently open in ToDo.",
+                }
+            )
+        if proposal.get("schema") != KANBAN_PROPOSAL_ENTRY_SCHEMA:
+            reasons.append(
+                {
+                    "code": "candidate_not_proposal_entry",
+                    "message": "The candidate lacks proposal-entry provenance.",
+                }
+            )
+        if reconciliation:
+            reasons.append(
+                {
+                    "code": "candidate_already_reconciled",
+                    "message": "The candidate already has reconciliation provenance.",
+                }
+            )
+        role_targets: dict[str, list[str]] = {}
+        material_links: list[dict[str, str]] = []
+        for link_row in links_by_source.get(item_id, []):
+            metadata = _json_value(link_row["metadata_json"], {})
+            role = _clean_short_text(str(metadata.get("role") or ""), "", limit=100)
+            target_id = str(link_row["target_item_id"])
+            role_targets.setdefault(role, []).append(target_id)
+            material_links.append(
+                {
+                    "link_id": str(link_row["link_id"]),
+                    "target_item_id": target_id,
+                    "role": role,
+                }
+            )
+        for role in ("semantic_owner", "source_item"):
+            if role_targets.get(role) != [clean["semantic_owner_id"]]:
+                reasons.append(
+                    {
+                        "code": f"candidate_{role}_mismatch",
+                        "message": f"The exact {role} link does not uniquely identify the owner.",
+                    }
+                )
+        material_state = {
+            "source_hash": str(row["source_hash"]),
+            "state_id": str(row["state_id"]),
+            "status": str(row["status"]),
+            "updated_at": str(row["updated_at"]),
+            "proposal_status": str(proposal.get("status") or ""),
+            "processed_at": str(proposal.get("processed_at") or ""),
+            "links": material_links,
+        }
+        candidates.append(
+            {
+                "item_id": item_id,
+                "uri": _kanban_item_uri(item_id),
+                "eligible": not canonical_findings and not reasons,
+                "reasons": reasons,
+                "material_state": material_state,
+            }
+        )
+    fingerprint_payload = {
+        **_work_proposal_reconciliation_request_identity(clean),
+        "canonical": {
+            "owner_source_hash": str(owner["source_hash"]),
+            "owner_updated_at": str(owner["updated_at"]),
+            "outcome_source_hash": str(outcome["source_hash"]),
+            "outcome_updated_at": str(outcome["updated_at"]),
+            "owner_relation": ("semantic_owner_link" if outcome_owner_linked else "direct_parent"),
+            "decision_source_hash": str(decision["source_hash"]) if decision else "",
+            "decision_status": str(decision["status"]) if decision else "",
+        },
+        "canonical_findings": canonical_findings,
+        "candidates": [
+            {
+                "item_id": candidate["item_id"],
+                "eligible": candidate["eligible"],
+                "reasons": candidate["reasons"],
+                "material_state": candidate["material_state"],
+            }
+            for candidate in candidates
+        ],
+    }
+    return {
+        "ok": True,
+        "schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+        "mode": "preview",
+        "reconciliation_id": clean["reconciliation_id"],
+        "policy_id": clean["policy_id"],
+        "disposition": clean["disposition"],
+        "semantic_owner_item_ref": _kanban_item_uri(clean["semantic_owner_id"]),
+        "canonical_outcome_item_ref": _kanban_item_uri(clean["canonical_outcome_id"]),
+        "canonical_decision_id": clean["canonical_decision_id"],
+        "canonical_findings": canonical_findings,
+        "candidate_count": len(candidates),
+        "eligible_count": sum(1 for candidate in candidates if candidate["eligible"]),
+        "all_eligible": bool(candidates) and all(candidate["eligible"] for candidate in candidates),
+        "candidates": candidates,
+        "preview_fingerprint": _hash_json_payload(fingerprint_payload),
+        "fingerprint_payload": fingerprint_payload,
+        "generated_at": _utc_now_iso(),
+    }
+
+
+def _preview_work_proposal_reconciliation_sync(
+    body: WorkProposalReconciliationPreviewRequest,
+) -> dict[str, Any]:
+    clean = _clean_work_proposal_reconciliation_request(body)
+    with _kanban_automation_scan_conn(
+        operation="kanban_proposal_reconciliation_preview",
+        transactional=False,
+    ) as conn:
+        return _work_proposal_reconciliation_preview_from_conn(conn, clean)
+
+
+def _proposal_reconciliation_decision_id(reconciliation_id: str, item_id: str) -> str:
+    digest = hashlib.sha256(f"{reconciliation_id}\0{item_id}".encode()).hexdigest()[:20]
+    return _clean_work_id(f"kanban-decision-proposal-reconciliation-{digest}", "kanban-decision")
+
+
+def _work_proposal_reconciliation_replay_from_conn(
+    conn: Any,
+    clean: dict[str, Any],
+    request_hash: str,
+) -> dict[str, Any] | None:
+    placeholders = ",".join("?" for _ in clean["candidate_ids"])
+    rows = conn.execute(
+        f"SELECT * FROM kanban_items WHERE item_id IN ({placeholders})",
+        clean["candidate_ids"],
+    ).fetchall()
+    rows_by_id = {str(row["item_id"]): row for row in rows}
+    matching: list[Any] = []
+    conflicting: list[str] = []
+    for item_id in clean["candidate_ids"]:
+        row = rows_by_id.get(item_id)
+        if row is None:
+            continue
+        proposal = _json_value(row["provenance_json"], {}).get("proposal_surface") or {}
+        reconciliation = (
+            proposal.get("reconciliation")
+            if isinstance(proposal.get("reconciliation"), dict)
+            else {}
+        )
+        if not reconciliation:
+            continue
+        if (
+            reconciliation.get("reconciliation_id") == clean["reconciliation_id"]
+            and reconciliation.get("request_hash") == request_hash
+            and reconciliation.get("preview_fingerprint") == clean["preview_fingerprint"]
+        ):
+            matching.append(row)
+        else:
+            conflicting.append(item_id)
+    if conflicting:
+        raise HTTPException(
+            409,
+            {
+                "code": "proposal_reconciliation_conflicting_reuse",
+                "candidate_item_ids": conflicting,
+            },
+        )
+    if not matching:
+        return None
+    if len(matching) != len(clean["candidate_ids"]):
+        raise HTTPException(
+            409,
+            {
+                "code": "proposal_reconciliation_partial_state",
+                "matching_count": len(matching),
+                "candidate_count": len(clean["candidate_ids"]),
+            },
+        )
+    return {
+        "ok": True,
+        "schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+        "mode": "apply",
+        "reconciliation_id": clean["reconciliation_id"],
+        "policy_id": clean["policy_id"],
+        "disposition": clean["disposition"],
+        "preview_fingerprint": clean["preview_fingerprint"],
+        "request_hash": request_hash,
+        "idempotent_replay": True,
+        "applied_count": len(matching),
+        "items": [_row_to_work_item(row) for row in matching],
+        "proposal_surfaces": _work_proposal_surfaces_status_from_conn(conn, 100),
+    }
+
+
+def _lock_work_proposal_reconciliation_scope(
+    conn: Any,
+    clean: dict[str, Any],
+) -> None:
+    """Lock the exact mutable/read-authority rows before in-transaction validation."""
+
+    if not _is_kanban_active_postgres_connection(conn):
+        return
+    item_ids = sorted(
+        {
+            *clean["candidate_ids"],
+            clean["semantic_owner_id"],
+            clean["canonical_outcome_id"],
+        }
+    )
+    placeholders = ",".join("?" for _ in item_ids)
+    conn.execute(
+        f"SELECT item_id FROM kanban_items WHERE item_id IN ({placeholders}) "
+        "ORDER BY item_id FOR UPDATE",
+        item_ids,
+    ).fetchall()
+    conn.execute(
+        "SELECT decision_id FROM kanban_review_decisions WHERE decision_id=? FOR SHARE",
+        (clean["canonical_decision_id"],),
+    ).fetchall()
+
+
+def _apply_work_proposal_reconciliation_sync(
+    body: WorkProposalReconciliationApplyRequest,
+) -> dict[str, Any]:
+    clean = _clean_work_proposal_reconciliation_request(body)
+    request_hash = _hash_json_payload(
+        {
+            **_work_proposal_reconciliation_request_identity(clean),
+            "preview_fingerprint": clean["preview_fingerprint"],
+        }
+    )
+    now = _utc_now_iso()
+    with get_conn() as conn:
+        _kanban_begin_write_transaction(conn)
+        _lock_work_proposal_reconciliation_scope(conn, clean)
+        replay = _work_proposal_reconciliation_replay_from_conn(conn, clean, request_hash)
+        if replay is not None:
+            return replay
+        preview = _work_proposal_reconciliation_preview_from_conn(conn, clean)
+        if preview["preview_fingerprint"] != clean["preview_fingerprint"]:
+            raise HTTPException(
+                409,
+                {
+                    "code": "proposal_reconciliation_preview_drift",
+                    "expected": clean["preview_fingerprint"],
+                    "current": preview["preview_fingerprint"],
+                    "candidates": preview["candidates"],
+                },
+            )
+        if not preview["all_eligible"]:
+            raise HTTPException(
+                409,
+                {
+                    "code": "proposal_reconciliation_candidates_ineligible",
+                    "canonical_findings": preview["canonical_findings"],
+                    "candidates": preview["candidates"],
+                },
+            )
+        store = _kanban_write_store(conn)
+        gen = _kanban_table_sync_gen(conn, "kanban-proposal-reconciliation")
+        saved_rows: list[Any] = []
+        decision_ids: list[str] = []
+        link_ids: list[str] = []
+        audit_ids: list[str] = []
+        for item_id in clean["candidate_ids"]:
+            existing = _work_item_or_404(conn, item_id)
+            provenance = _json_value(existing["provenance_json"], {})
+            proposal = (
+                dict(provenance.get("proposal_surface") or {})
+                if isinstance(provenance.get("proposal_surface"), dict)
+                else {}
+            )
+            proposal["status"] = clean["disposition"]
+            proposal["processed_at"] = now
+            proposal["reconciliation"] = {
+                "schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+                "reconciliation_id": clean["reconciliation_id"],
+                "policy_id": clean["policy_id"],
+                "disposition": clean["disposition"],
+                "semantic_owner_item_ref": _kanban_item_uri(clean["semantic_owner_id"]),
+                "canonical_outcome_item_ref": _kanban_item_uri(clean["canonical_outcome_id"]),
+                "canonical_decision_id": clean["canonical_decision_id"],
+                "reason": clean["reason"],
+                "proof_refs": clean["proof_refs"],
+                "preview_fingerprint": clean["preview_fingerprint"],
+                "request_hash": request_hash,
+                "applied_at": now,
+                "actor": clean["actor"],
+                "source_surface": clean["source_surface"],
+            }
+            provenance["proposal_surface"] = proposal
+            tags = list(_json_value(existing["tags_json"], []))
+            for tag in ("processed", "reconciled", clean["disposition"]):
+                if tag not in tags:
+                    tags.append(tag)
+            payload = {
+                "item_id": item_id,
+                "title": existing["title"],
+                "body_excerpt": existing["body_excerpt"],
+                "item_type": existing["item_type"],
+                "state_id": "done",
+                "priority_id": existing["priority_id"],
+                "sort_order": int(existing["sort_order"]),
+                "status": "done",
+                "goal_flag": bool(existing["goal_flag"]),
+                "automation_excluded": True,
+                "tags": tags,
+                "related_event_ids": _json_value(existing["related_event_ids_json"], []),
+                "related_task_ids": _json_value(existing["related_task_ids_json"], []),
+                "related_issue_ids": _json_value(existing["related_issue_ids_json"], []),
+                "search_text": existing["search_text"],
+                "search_metadata": _json_value(existing["search_metadata_json"], {}),
+                "vector_index_key": existing["vector_index_key"],
+                "provenance": provenance,
+            }
+            payload["source_hash"] = _hash_json_payload(payload)
+            saved = store.update_item_row(item_id, payload, now=now)
+            saved_rows.append(saved)
+            link_metadata = {
+                "role": "reconciled_outcome",
+                "schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+                "reconciliation_id": clean["reconciliation_id"],
+                "policy_id": clean["policy_id"],
+                "disposition": clean["disposition"],
+                "canonical_decision_id": clean["canonical_decision_id"],
+            }
+            link_row = store.item_link_semantic_row(
+                item_id,
+                clean["canonical_outcome_id"],
+                "references",
+                link_metadata,
+            )
+            if link_row is None:
+                link_hash = _hash_json_payload(
+                    {
+                        "source_item_id": item_id,
+                        "target_item_id": clean["canonical_outcome_id"],
+                        "link_type": "references",
+                        "metadata": link_metadata,
+                    }
+                ).removeprefix("sha256:")
+                link_row = store.create_item_link_row(
+                    {
+                        "link_id": f"kanban-link-{link_hash[:12]}",
+                        "source_item_id": item_id,
+                        "target_item_id": clean["canonical_outcome_id"],
+                        "link_type": "references",
+                        "metadata": link_metadata,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+            if link_row is None:
+                raise HTTPException(409, "Reconciliation outcome link could not be retained")
+            link_ids.append(str(link_row["link_id"]))
+            decision_id = _proposal_reconciliation_decision_id(clean["reconciliation_id"], item_id)
+            decision_ids.append(decision_id)
+            decision_payload = {
+                "decision_id": decision_id,
+                "item_id": item_id,
+                "processor_kind": "proposal_reconciliation",
+                "decision_type": clean["disposition"],
+                "title": f"Proposal INBOX record {clean['disposition']}",
+                "summary": clean["reason"],
+                "rationale": (
+                    "The exact semantic owner and canonical accepted outcome were "
+                    "validated by the reviewed reconciliation policy."
+                ),
+                "affected_refs_json": json.dumps(
+                    [
+                        f"kanban_items:{item_id}",
+                        f"kanban_items:{clean['semantic_owner_id']}",
+                        f"kanban_items:{clean['canonical_outcome_id']}",
+                        f"kanban_review_decisions:{clean['canonical_decision_id']}",
+                    ],
+                    ensure_ascii=True,
+                ),
+                "confidence": "high",
+                "uncertainty": "",
+                "proof_refs_json": json.dumps(
+                    [
+                        *clean["proof_refs"],
+                        f"kanban_review_decisions:{clean['canonical_decision_id']}",
+                    ],
+                    ensure_ascii=True,
+                ),
+                "commit_link_ids_json": "[]",
+                "status": "accepted",
+                "provider_mode": "local",
+                "source_hash": request_hash,
+                "metadata_json": json.dumps(
+                    {
+                        "schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+                        "reconciliation_id": clean["reconciliation_id"],
+                        "policy_id": clean["policy_id"],
+                        "disposition": clean["disposition"],
+                        "preview_fingerprint": clean["preview_fingerprint"],
+                        "request_hash": request_hash,
+                        "canonical_decision_id": clean["canonical_decision_id"],
+                        "outcome_link_id": str(link_row["link_id"]),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                "provenance_json": json.dumps(
+                    {
+                        "schema": KANBAN_REVIEW_DECISION_SCHEMA,
+                        "recorded_by": clean["actor"],
+                        "source_surface": clean["source_surface"],
+                        "request_id": clean["request_id"],
+                        "run_id": clean["run_id"],
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+                "created_at": now,
+                "updated_at": now,
+            }
+            decision_row = store.upsert_review_decision_row(decision_payload)
+            audit_id = (
+                "audit-proposal-reconciliation-"
+                + hashlib.sha256(f"{clean['reconciliation_id']}\0{item_id}".encode()).hexdigest()[
+                    :20
+                ]
+            )
+            audit_ids.append(audit_id)
+            audit_row = _write_work_audit(
+                conn,
+                audit_id=audit_id,
+                actor=clean["actor"],
+                source_surface=clean["source_surface"],
+                action="reconcile_work_proposal_inbox",
+                target_ref=f"kanban_items:{item_id}",
+                item_id=item_id,
+                parent_item_id=str(saved["parent_item_id"] or ""),
+                created_at=now,
+                request_id=clean["request_id"],
+                run_id=clean["run_id"],
+                result=clean["disposition"],
+                source_hash=request_hash,
+                metadata={
+                    "schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+                    "reconciliation_id": clean["reconciliation_id"],
+                    "policy_id": clean["policy_id"],
+                    "preview_fingerprint": clean["preview_fingerprint"],
+                    "canonical_decision_id": clean["canonical_decision_id"],
+                    "decision_id": decision_id,
+                    "outcome_link_id": str(link_row["link_id"]),
+                },
+            )
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_items", item_id, dict(saved), gen)
+            enqueue_for_all_peers(
+                conn, "UPDATE", "kanban_item_links", str(link_row["link_id"]), dict(link_row), gen
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_decisions",
+                decision_id,
+                dict(decision_row),
+                gen,
+            )
+            enqueue_for_all_peers(conn, "UPDATE", "kanban_audit_log", audit_id, audit_row, gen)
+        return {
+            "ok": True,
+            "schema": KANBAN_PROPOSAL_RECONCILIATION_SCHEMA,
+            "mode": "apply",
+            "reconciliation_id": clean["reconciliation_id"],
+            "policy_id": clean["policy_id"],
+            "disposition": clean["disposition"],
+            "preview_fingerprint": clean["preview_fingerprint"],
+            "request_hash": request_hash,
+            "idempotent_replay": False,
+            "applied_count": len(saved_rows),
+            "items": [_row_to_work_item(row) for row in saved_rows],
+            "decision_ids": decision_ids,
+            "link_ids": link_ids,
+            "audit_ids": audit_ids,
+            "proposal_surfaces": _work_proposal_surfaces_status_from_conn(conn, 100),
+        }
 
 
 def _proposal_markdown_body(
@@ -25503,6 +26306,20 @@ async def get_work_proposal_surfaces_status(
             _work_proposal_surfaces_status_sync, limit
         ),
     }
+
+
+@router.post("/kanban/automation/proposal-surfaces/reconciliations/preview")
+async def preview_work_proposal_reconciliation(
+    body: WorkProposalReconciliationPreviewRequest,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_preview_work_proposal_reconciliation_sync, body)
+
+
+@router.post("/kanban/automation/proposal-surfaces/reconciliations/apply")
+async def apply_work_proposal_reconciliation(
+    body: WorkProposalReconciliationApplyRequest,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_apply_work_proposal_reconciliation_sync, body)
 
 
 @router.post("/kanban/automation/proposal-surfaces/inbox")

@@ -453,6 +453,10 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
             "automation_proposal_inbox_entry_count": 7,
             "automation_proposal_outbox_entry_count": 5,
             "automation_proposal_inbox_open_count": 2,
+            "automation_proposal_inbox_actionable_count": 2,
+            "automation_proposal_inbox_history_count": 5,
+            "automation_proposal_inbox_superseded_count": 3,
+            "automation_proposal_inbox_obsolete_count": 2,
             "automation_proposal_outbox_processed_count": 5,
             "automation_proposal_response_busy": True,
             "automation_proposal_response_busy_item_id": "kanban-request",
@@ -495,6 +499,10 @@ def test_active_browser_kanban_snapshot_exposes_automation_policy_fields():
     assert cleaned["automation_proposal_inbox_entry_count"] == 7
     assert cleaned["automation_proposal_outbox_entry_count"] == 5
     assert cleaned["automation_proposal_inbox_open_count"] == 2
+    assert cleaned["automation_proposal_inbox_actionable_count"] == 2
+    assert cleaned["automation_proposal_inbox_history_count"] == 5
+    assert cleaned["automation_proposal_inbox_superseded_count"] == 3
+    assert cleaned["automation_proposal_inbox_obsolete_count"] == 2
     assert cleaned["automation_proposal_outbox_processed_count"] == 5
     assert cleaned["automation_proposal_response_busy"] is True
     assert cleaned["automation_proposal_response_busy_item_id"] == "kanban-request"
@@ -1234,6 +1242,10 @@ def test_active_browser_view_report_updates_active_tab_and_page():
         "automation_proposal_inbox_entry_count": 0,
         "automation_proposal_outbox_entry_count": 0,
         "automation_proposal_inbox_open_count": 0,
+        "automation_proposal_inbox_actionable_count": 0,
+        "automation_proposal_inbox_history_count": 0,
+        "automation_proposal_inbox_superseded_count": 0,
+        "automation_proposal_inbox_obsolete_count": 0,
         "automation_proposal_outbox_processed_count": 0,
         "automation_proposal_response_busy": False,
         "automation_proposal_response_busy_item_id": "",

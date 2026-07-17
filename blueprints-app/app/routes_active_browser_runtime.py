@@ -2350,6 +2350,18 @@ def _clean_active_browser_kanban(raw: Any) -> dict[str, Any]:
         "automation_proposal_inbox_open_count": _clean_browser_page_int(
             kanban.get("automation_proposal_inbox_open_count"), maximum=5000
         ),
+        "automation_proposal_inbox_actionable_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_inbox_actionable_count"), maximum=5000
+        ),
+        "automation_proposal_inbox_history_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_inbox_history_count"), maximum=5000
+        ),
+        "automation_proposal_inbox_superseded_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_inbox_superseded_count"), maximum=5000
+        ),
+        "automation_proposal_inbox_obsolete_count": _clean_browser_page_int(
+            kanban.get("automation_proposal_inbox_obsolete_count"), maximum=5000
+        ),
         "automation_proposal_outbox_processed_count": _clean_browser_page_int(
             kanban.get("automation_proposal_outbox_processed_count"), maximum=5000
         ),
