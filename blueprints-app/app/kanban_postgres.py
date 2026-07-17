@@ -24,7 +24,7 @@ from .kanban_datastore import KANBAN_DATASTORE_TABLES
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _JSON_EXTRACT_RE = re.compile(
-    r"json_extract\((?P<expr>[^,]+),\s*'\$\.(?P<path>[A-Za-z0-9_.-]+)'\)",
+    r"json_extract\((?P<expr>[^,]+),\s*'\$\.(?P<path>[A-Za-z0-9_.-]+)'\s*\)",
     flags=re.IGNORECASE,
 )
 _PRAGMA_TABLE_INFO_RE = re.compile(

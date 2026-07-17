@@ -154,19 +154,29 @@ def _docs_root() -> Path:
 def _normalize_ownership(root: Path, target: Path) -> None:
     """Hand ownership of created doc paths back to the docs root owner."""
     try:
-        owner = root.stat()
+        root_path = root.resolve(strict=True)
+        target_path = target.resolve(strict=False)
+        target_path.relative_to(root_path)
+        owner = root_path.stat()
+    except ValueError:
+        log.warning(
+            "docs: refusing ownership hand-back outside root %s: %s",
+            root,
+            target,
+        )
+        return
     except Exception as exc:
         log.warning("docs: could not stat docs root %s for ownership hand-back: %s", root, exc)
         return
 
-    current = target
+    current = target_path
     while True:
         try:
             if current.exists():
                 os.chown(current, owner.st_uid, owner.st_gid)
         except Exception as exc:
             log.warning("docs: could not normalize ownership on %s: %s", current, exc)
-        if current == root or current.parent == current:
+        if current == root_path or current.parent == current:
             break
         current = current.parent
 
@@ -914,8 +924,8 @@ async def _generate_long_doc_speech(
     fingerprint = source_fingerprint(prepared_source)
     work_dir = _DOC_SPEECH_WORK_ROOT / doc_id / fingerprint
     work_dir.mkdir(parents=True, exist_ok=True)
-    _normalize_node_local_ownership(work_dir.parent)
-    _normalize_node_local_ownership(work_dir)
+    _normalize_ownership(_DOC_SPEECH_WORK_ROOT, work_dir.parent)
+    _normalize_ownership(_DOC_SPEECH_WORK_ROOT, work_dir)
 
     section_output_tokens = approx_output_tokens_for_words(max(120, min(max_words, 900)))
     max_input_tokens = int(
