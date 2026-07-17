@@ -11613,6 +11613,178 @@ def test_work_automation_missing_profile_api_key_is_retryable_failure(monkeypatc
     assert status["review_processor"]["retry_waiting_count"] == 1
 
 
+def test_operator_preprocessing_recovery_preflight_refuses_active_or_failed_marker(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-operator-preflight-leaf",
+                title="Operator preflight leaf",
+                body="Keep the preprocessing recovery preflight fail-closed.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    item_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-operator-preflight-leaf'"
+    ).fetchone()
+    source = routes_personal._work_preprocessing_context_source(conn, item_row)
+    row = routes_personal._work_preprocessing_marker_row(
+        existing=None,
+        item_id="work-operator-preflight-leaf",
+        source=source,
+        meta={
+            "actor": "kanban-idle-worker",
+            "source_surface": "kanban-automation-idle-worker",
+            "request_id": "operator-preflight-queue",
+            "run_id": "operator-preflight-queue",
+        },
+        now="2026-07-17T17:00:00Z",
+        reason="missing_readiness_marker",
+        scan_metadata={},
+    )
+    row["status"] = "processing"
+    routes_personal._write_work_review_processor_marker(conn, row)
+    conn.commit()
+
+    active = routes_personal._work_operator_authorized_preprocessing_recovery_preflight_sync(
+        "work-operator-preflight-leaf"
+    )
+    assert active["ok"] is False
+    assert active["reason"] == "preprocessing_processing"
+
+    conn.execute(
+        """
+        UPDATE kanban_review_processor_markers
+        SET status='failed', next_retry_at='2999-01-01T00:00:00Z', retry_attempt_count=1
+        WHERE marker_id=?
+        """,
+        (row["marker_id"],),
+    )
+    conn.commit()
+    failed = routes_personal._work_operator_authorized_preprocessing_recovery_preflight_sync(
+        "work-operator-preflight-leaf"
+    )
+    assert failed["ok"] is False
+    assert failed["reason"] == "preprocessing_retry_or_failure"
+
+
+def test_preprocessing_only_idle_tick_never_claims_a_review_marker(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-operator-preprocess-leaf",
+                title="Operator recovery leaf",
+                body="Perform one bounded preprocessing-only recovery proof.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="operator-preprocess-leaf-create",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.update_work_item_review_document(
+            "work-operator-preprocess-leaf",
+            routes_personal.WorkItemDetailDocumentUpdateRequest(
+                body="A Review marker exists but must not be claimed by this recovery.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="operator-preprocess-review-write",
+            ),
+        )
+    )
+    review_scan = asyncio.run(
+        routes_personal.trigger_work_review_processor_idle_scan(
+            routes_personal.WorkReviewProcessorIdleScanRequest(
+                item_id="work-operator-preprocess-leaf",
+                max_items=1,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="operator-preprocess-review-scan",
+            )
+        )
+    )
+    review_marker_id = review_scan["queued_markers"][0]["marker_id"]
+    item_row = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-operator-preprocess-leaf'"
+    ).fetchone()
+    source = routes_personal._work_preprocessing_context_source(conn, item_row)
+    preprocessing_row = routes_personal._work_preprocessing_marker_row(
+        existing=None,
+        item_id="work-operator-preprocess-leaf",
+        source=source,
+        meta={
+            "actor": "kanban-idle-worker",
+            "source_surface": "kanban-automation-idle-worker",
+            "request_id": "operator-preprocess-queue",
+            "run_id": "operator-preprocess-queue",
+        },
+        now="2026-07-17T17:00:00Z",
+        reason="missing_readiness_marker",
+        scan_metadata={},
+    )
+    routes_personal._write_work_review_processor_marker(conn, preprocessing_row)
+    conn.commit()
+    seen = []
+
+    async def fake_process(marker, *, holder_id, lease_token, run_id):
+        seen.append(marker)
+        return {
+            "ok": True,
+            "processor_kind": marker["processor_kind"],
+            "item_id": marker["item_id"],
+            "marker_id": marker["marker_id"],
+            "status": "synthetic-processed",
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_process_work_automation_claimed_marker",
+        fake_process,
+    )
+    tick = asyncio.run(
+        routes_personal.run_work_kanban_automation_idle_tick(
+            item_id="work-operator-preprocess-leaf",
+            max_scan_items=99,
+            max_process_items=99,
+            holder_id="kanban-idle-worker",
+            actor="kanban-idle-worker",
+            source_surface="kanban-automation-idle-worker",
+            request_id="operator-preprocess-tick",
+            run_id="operator-preprocess-tick",
+            processor_kind="preprocessing",
+        )
+    )
+
+    assert tick["processor_kind_filter"] == "preprocessing"
+    assert tick["review_scan"] == {
+        "ok": True,
+        "skipped": True,
+        "reason": "preprocessing_only_recovery",
+    }
+    assert tick["timeout_requeue"]["skipped"] is True
+    assert tick["processed_count"] == 1
+    assert [marker["processor_kind"] for marker in seen] == ["preprocessing"]
+    review_marker = conn.execute(
+        "SELECT status FROM kanban_review_processor_markers WHERE marker_id=?",
+        (review_marker_id,),
+    ).fetchone()
+    assert review_marker["status"] == "queued"
+
+
 def test_work_automation_idle_tick_does_not_claim_markers_queued_mid_tick(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

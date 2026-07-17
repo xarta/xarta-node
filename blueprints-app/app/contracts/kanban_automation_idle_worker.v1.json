@@ -46,7 +46,35 @@
     "scheduler_provider": "blueprints-kanban-automation",
     "scheduler_worker_template": "blueprints-kanban-automation:<configured-owner-node-id>",
     "status_surface": "GET /api/v1/personal/kanban/scheduler/status",
-    "manual_recovery_surface": "POST /api/v1/personal/kanban/automation/idle-worker/tick"
+    "manual_recovery_surface": "POST /api/v1/personal/kanban/automation/idle-worker/tick",
+    "operator_authorized_preprocessing_recovery_surface": {
+      "path": "POST /api/v1/personal/kanban/automation/preprocessing/operator-recovery",
+      "scope": "one exact ordinary open ToDo leaf",
+      "requires": [
+        "operator_authorized=true",
+        "nonempty authorization_ref",
+        "missing readiness marker or clean queued preprocessing marker for the current source",
+        "enabled owner-node manual recovery and healthy preprocessing profile"
+      ],
+      "server_bounds": {
+        "max_scan_items": 1,
+        "max_process_items": 1,
+        "processor_kind": "preprocessing"
+      },
+      "refuses": [
+        "current/stale/awaiting_operator readiness",
+        "processing, failed, retry, terminal, stale, or ambiguous target marker",
+        "active agent session or processor lease",
+        "excluded, non-leaf, non-ToDo, non-item, disabled, non-owner, or unhealthy-profile state"
+      ],
+      "provenance": "Requester identity and authorization reference are retained in durable scan/marker metadata; worker-produced decisions and readiness retain canonical kanban-idle-worker provenance.",
+      "non_effects": [
+        "does not write a client readiness marker",
+        "does not start a session or move a lane",
+        "does not change scheduler targets, schedules, producer mode, or runtime ownership",
+        "does not authorize implementation, commit, deploy, or restart"
+      ]
+    }
   },
   "provider_mode": {
     "active": "required-hermes-kanban-llm",
@@ -133,6 +161,7 @@
     "scan_coverage_rule": "A bounded global scan must not repeatedly select the same current marked leaves. Missing readiness remains first priority; marked candidates advance through one audited round-robin cursor so every eligible ToDo leaf is eventually rebuilt against the complete normalized context manifest without per-item heartbeat writes.",
     "scan_database_boundary": "Cursor lookup, candidate selection, context rebuilding, and marker writes remain inside the existing measured synchronous scan worker and Kanban connection boundary reached through _run_personal_sync_work. No synchronous SQLite or PostgreSQL work is added to the async route or Blueprints event loop.",
     "queue_rule": "Queue when an eligible ToDo leaf is not backed by a processed preprocessing marker for the exact current normalized source hash, unless a current queued or processing marker already exists. A fresh context_readiness_marker in agent hints is semantic evidence, not an operational readiness attestation by itself.",
+    "operator_authorized_recovery_rule": "An explicit current operator request to work one named leaf may use the dedicated recovery surface only for the initial missing-readiness case or a clean queued marker for the exact source. The server rechecks candidacy, owner/manual recovery, profile health, sessions, lease, marker state, and source; it forces one preprocessing-only scan/claim and preserves requester/authorization metadata separately from canonical worker provenance. It never writes readiness directly or bypasses failure, retry, awaiting_operator, stale, terminal, exclusion, lane, session, schedule, target, or ownership guards.",
     "ready_result": "Persist the accepted context_readiness_marked decision and fresh context_readiness_marker for the exact marker id and normalized source hash, then complete the processor marker with matching processed and last-successful source hashes.",
     "ready_leaf_no_decomposition_rule": "If the configured LLM route returns ready=false but supplies no blocking codes, no operator question, and no decomposition_items for an otherwise concrete actionable leaf, normalize the outcome to ready_leaf_no_decomposition and complete the marker successfully. Readiness is not completion, and retrying the same source should not be used as a substitute for doing the named investigation or implementation work.",
     "decomposition_result": "Create or confirm concrete child cards, move the former ToDo parent out of ToDo, write readiness marker and decision proof, then complete the marker.",
@@ -214,6 +243,8 @@
     "automation_excluded=true on a root or topic ancestor: no descendants are scanned, queued, claimed, or processed.",
     "GitHub Activity marked automation_excluded: no blockers, ToDos, or preprocessing markers are created there.",
     "New ToDo leaf with missing readiness marker: preprocessing marker is queued and processed.",
+    "A direct operator-authorized exact-leaf recovery with only missing/clean-queued preprocessing state runs one preprocessing-only pass, retains requester/authorization evidence, and never claims a Review marker or writes readiness directly.",
+    "Operator-authorized recovery refuses active processing/lease/session, retry or failed/terminal/stale marker state, current/stale/awaiting_operator readiness, non-candidate/excluded state, non-owner/manual fence, or unhealthy preprocessor profile.",
     "Backlog, Doing, Blocked, Done, archived, and non-leaf cards are not preprocessing candidates.",
     "Fresh readiness marker plus processed marker and unchanged normalized source hashes: no reprocessing.",
     "Fresh readiness marker without an exact accepted preprocessing decision and processed marker remains queued for a genuine pass; the agent hint alone never bypasses strict readiness.",

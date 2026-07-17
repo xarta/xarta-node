@@ -391,6 +391,9 @@ KANBAN_AUTOMATION_IDLE_WORKER_CONTRACT_PATH = (
 )
 KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS = 25
 KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP = 100
+KANBAN_OPERATOR_AUTHORIZED_PREPROCESSING_RECOVERY_SCHEMA = (
+    "xarta.kanban.operator_authorized_preprocessing_recovery.v1"
+)
 KANBAN_PROCESSOR_MARKER_BLOCKER_PROVENANCE_SCHEMA = (
     "xarta.kanban.processor_marker_blocker.provenance.v1"
 )
@@ -1258,6 +1261,20 @@ class WorkAutomationIdleTickRequest(BaseModel):
     holder_id: str | None = None
     lease_ttl_seconds: int | None = None
     marker_timeout_seconds: int | None = None
+    actor: str = "blueprints-ui"
+    source_surface: str = "kanban-automation-status"
+    request_id: str | None = None
+    run_id: str | None = None
+
+
+class WorkOperatorAuthorizedPreprocessingRecoveryRequest(BaseModel):
+    """One explicitly-authorized exact-leaf preprocessing recovery request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    operator_authorized: bool = False
+    authorization_ref: str = ""
     actor: str = "blueprints-ui"
     source_surface: str = "kanban-automation-status"
     request_id: str | None = None
@@ -5891,7 +5908,12 @@ def _work_preprocessing_decision_reconciliation_allowed(existing: Any | None) ->
     )
 
 
-def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[str]:
+def _work_queued_processor_marker_ids(
+    conn: Any,
+    scope_ids: list[str],
+    *,
+    processor_kind: str | None = None,
+) -> list[str]:
     now = _utc_now_iso()
     args: list[Any] = [now]
     where = (
@@ -5902,6 +5924,10 @@ def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[s
         placeholders = ",".join("?" for _ in scope_ids)
         where += f" AND marker.item_id IN ({placeholders})"
         args.extend(scope_ids)
+    clean_processor_kind = _clean_short_text(processor_kind or "", "", limit=80)
+    if clean_processor_kind:
+        where += " AND marker.processor_kind=?"
+        args.append(clean_processor_kind)
     rows = conn.execute(
         f"""
         SELECT marker.marker_id FROM kanban_review_processor_markers marker
@@ -22564,10 +22590,18 @@ async def _process_work_automation_claimed_marker(
         }
 
 
-def _work_queued_processor_marker_ids_for_item_sync(clean_item_id: str) -> list[str]:
+def _work_queued_processor_marker_ids_for_item_sync(
+    clean_item_id: str,
+    *,
+    processor_kind: str | None = None,
+) -> list[str]:
     with get_conn() as conn:
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
-        return _work_queued_processor_marker_ids(conn, scope_ids)
+        return _work_queued_processor_marker_ids(
+            conn,
+            scope_ids,
+            processor_kind=processor_kind,
+        )
 
 
 def _work_kanban_automation_shadow_snapshot_sync(
@@ -22838,6 +22872,322 @@ async def record_work_kanban_automation_tick_receipt(
     )
 
 
+def _work_operator_authorized_preprocessing_recovery_preflight_sync(
+    clean_item_id: str,
+) -> dict[str, Any]:
+    """Fail closed before a direct request can enqueue or claim one leaf.
+
+    This deliberately accepts only the initial missing-readiness case.  Stale,
+    failed, terminal, and explicitly paused states need their normal recovery
+    workflows rather than an operator-triggered bypass.
+    """
+
+    now_dt = datetime.now(timezone.utc)
+    with _kanban_automation_scan_conn(
+        operation="operator_authorized_preprocessing_recovery_preflight",
+        transactional=False,
+    ) as conn:
+        item = _work_item_or_404(conn, clean_item_id)
+        candidate = conn.execute(
+            f"""
+            SELECT item_id FROM kanban_items item
+            WHERE item.item_id=?
+              AND {_work_preprocessing_candidate_predicate("item")}
+            """,
+            (clean_item_id,),
+        ).fetchone()
+        marker_id = _preprocessing_marker_id(clean_item_id)
+        marker_row = conn.execute(
+            "SELECT * FROM kanban_review_processor_markers WHERE marker_id=?",
+            (marker_id,),
+        ).fetchone()
+        active_session = conn.execute(
+            """
+            SELECT * FROM kanban_agent_sessions
+            WHERE item_id=? AND status='active'
+            ORDER BY updated_at DESC, started_at DESC, session_id
+            LIMIT 1
+            """,
+            (clean_item_id,),
+        ).fetchone()
+        lease_row = conn.execute(
+            "SELECT * FROM kanban_review_processor_leases WHERE lease_id=?",
+            (_review_processor_lease_id(),),
+        ).fetchone()
+        lease = _row_to_work_review_processor_lease(lease_row, now_dt=now_dt)
+
+        report: dict[str, Any] = {
+            "ok": False,
+            "schema": KANBAN_OPERATOR_AUTHORIZED_PREPROCESSING_RECOVERY_SCHEMA,
+            "item_id": clean_item_id,
+            "item": _row_to_work_item(item),
+            "candidate": bool(candidate),
+            "source": {},
+            "marker": _row_to_work_review_processor_marker(marker_row)
+            if marker_row is not None
+            else {},
+            "active_session": _row_to_work_agent_session(active_session)
+            if active_session is not None
+            else {},
+            "lease": lease,
+            "reason": "",
+        }
+        if candidate is None:
+            report["reason"] = "preprocessing_candidate_ineligible"
+            return report
+
+        source = _work_preprocessing_context_source(conn, item)
+        report["source"] = {
+            "reason": source.get("reason") or "",
+            "needs_preprocessing": bool(source.get("needs_preprocessing")),
+            "document_source_hash": source.get("document_source_hash") or "",
+            "classification": source.get("classification") or {},
+        }
+        source_reason = str(source.get("reason") or "")
+        if source_reason == "awaiting_operator_input":
+            report["reason"] = "awaiting_operator"
+            return report
+        if source_reason == "ready" or not bool(source.get("needs_preprocessing")):
+            report["reason"] = "readiness_current"
+            return report
+        if source_reason != "missing_readiness_marker":
+            report["reason"] = "readiness_not_initial_missing"
+            return report
+
+        if marker_row is not None:
+            marker_status = str(marker_row["status"] or "")
+            if marker_status == "processing":
+                report["reason"] = "preprocessing_processing"
+                return report
+            if marker_status == "failed" or _work_review_marker_retry_state(marker_row) in {
+                "retry_waiting",
+                "retry_due",
+            }:
+                report["reason"] = "preprocessing_retry_or_failure"
+                return report
+            if marker_status != "queued":
+                report["reason"] = "preprocessing_marker_not_pending"
+                return report
+            if marker_row["document_source_hash"] != source["document_source_hash"]:
+                report["reason"] = "preprocessing_marker_source_stale"
+                return report
+            if any(
+                [
+                    str(marker_row["last_error"] or ""),
+                    str(marker_row["last_error_class"] or ""),
+                    str(marker_row["next_retry_at"] or ""),
+                    int(marker_row["retry_attempt_count"] or 0),
+                ]
+            ):
+                report["reason"] = "preprocessing_marker_has_error"
+                return report
+
+        if active_session is not None:
+            report["reason"] = "active_agent_session"
+            return report
+        if lease["active"]:
+            report["reason"] = "processor_lease_active"
+            return report
+
+        report["ok"] = True
+        report["reason"] = "initial_missing_or_queued"
+        return report
+
+
+def _work_operator_authorized_preprocessing_recovery_result(
+    *,
+    ok: bool,
+    item_id: str,
+    reason: str,
+    requester: dict[str, str],
+    authorization_ref: str,
+    config: dict[str, Any],
+    preflight: dict[str, Any] | None = None,
+    profile_drift: dict[str, Any] | None = None,
+    tick: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": ok,
+        "schema": KANBAN_OPERATOR_AUTHORIZED_PREPROCESSING_RECOVERY_SCHEMA,
+        "item_id": item_id,
+        "reason": reason,
+        "requester": requester,
+        "authorization": {
+            "operator_authorized": bool(authorization_ref),
+            "authorization_ref": authorization_ref,
+        },
+        "idle_worker": {
+            key: config.get(key)
+            for key in (
+                "enabled",
+                "manual_recovery_enabled",
+                "runs_on_this_node",
+                "current_node_id",
+                "owner_node_id",
+                "producer_mode",
+                "singleton_override",
+            )
+        },
+        "preflight": preflight or {},
+        "profile_drift": profile_drift or {},
+        "tick": tick or {},
+    }
+
+
+async def run_work_operator_authorized_preprocessing_recovery(
+    *,
+    item_id: str,
+    operator_authorized: bool,
+    authorization_ref: str,
+    requester: dict[str, str],
+) -> dict[str, Any]:
+    """Run one real, preprocessing-only recovery pass for an explicit request.
+
+    The requester is durable metadata, while all resulting processor artifacts
+    retain the canonical idle-worker identity.  This is not a readiness mark,
+    lane move, session start, or a scheduler/runtime configuration change.
+    """
+
+    clean_item_id = _clean_short_text(item_id, "", limit=180)
+    clean_authorization_ref = _clean_short_text(authorization_ref, "", limit=240)
+    clean_requester = {
+        key: _clean_short_text(requester.get(key) or "", "", limit=220)
+        for key in ("actor", "source_surface", "request_id", "run_id")
+    }
+    config = _work_automation_idle_worker_config()
+    if not operator_authorized or not clean_authorization_ref:
+        return _work_operator_authorized_preprocessing_recovery_result(
+            ok=False,
+            item_id=clean_item_id,
+            reason="operator_authorization_required",
+            requester=clean_requester,
+            authorization_ref="",
+            config=config,
+        )
+    if not clean_item_id:
+        return _work_operator_authorized_preprocessing_recovery_result(
+            ok=False,
+            item_id="",
+            reason="item_id_required",
+            requester=clean_requester,
+            authorization_ref=clean_authorization_ref,
+            config=config,
+        )
+    if not config["enabled"]:
+        return _work_operator_authorized_preprocessing_recovery_result(
+            ok=False,
+            item_id=clean_item_id,
+            reason="idle_worker_disabled_by_configuration",
+            requester=clean_requester,
+            authorization_ref=clean_authorization_ref,
+            config=config,
+        )
+    if not config["runs_on_this_node"]:
+        return _work_operator_authorized_preprocessing_recovery_result(
+            ok=False,
+            item_id=clean_item_id,
+            reason="idle_worker_not_owner_node",
+            requester=clean_requester,
+            authorization_ref=clean_authorization_ref,
+            config=config,
+        )
+    if not config["manual_recovery_enabled"]:
+        return _work_operator_authorized_preprocessing_recovery_result(
+            ok=False,
+            item_id=clean_item_id,
+            reason="manual_recovery_fenced",
+            requester=clean_requester,
+            authorization_ref=clean_authorization_ref,
+            config=config,
+        )
+
+    preflight = await _run_personal_sync_work(
+        _work_operator_authorized_preprocessing_recovery_preflight_sync,
+        clean_item_id,
+    )
+    if not preflight.get("ok"):
+        return _work_operator_authorized_preprocessing_recovery_result(
+            ok=False,
+            item_id=clean_item_id,
+            reason=str(preflight.get("reason") or "preflight_refused"),
+            requester=clean_requester,
+            authorization_ref=clean_authorization_ref,
+            config=config,
+            preflight=preflight,
+        )
+
+    profile_drift = await _run_personal_sync_work(
+        _work_automation_processor_profile_drift,
+        "preprocessing",
+    )
+    if list(profile_drift.get("problems") or []):
+        return _work_operator_authorized_preprocessing_recovery_result(
+            ok=False,
+            item_id=clean_item_id,
+            reason="preprocessor_profile_unhealthy",
+            requester=clean_requester,
+            authorization_ref=clean_authorization_ref,
+            config=config,
+            preflight=preflight,
+            profile_drift=profile_drift,
+        )
+
+    external_run_id = clean_requester["run_id"] or f"operator-request-{uuid.uuid4().hex[:12]}"
+    internal_run_id = _clean_short_text(
+        f"operator-authorized-preprocessing:{external_run_id}",
+        f"operator-authorized-preprocessing:{uuid.uuid4().hex[:12]}",
+        limit=220,
+    )
+    external_request_id = clean_requester["request_id"] or external_run_id
+    internal_request_id = _clean_short_text(
+        f"operator-authorized-preprocessing:{external_request_id}",
+        internal_run_id,
+        limit=220,
+    )
+    initiation = {
+        "schema": KANBAN_OPERATOR_AUTHORIZED_PREPROCESSING_RECOVERY_SCHEMA,
+        "operator_authorized": True,
+        "authorization_ref": clean_authorization_ref,
+        "requester": clean_requester,
+        "requested_item_id": clean_item_id,
+        "requested_at": _utc_now_iso(),
+        "bounded": {
+            "item_id": clean_item_id,
+            "max_scan_items": 1,
+            "max_process_items": 1,
+            "processor_kind": "preprocessing",
+        },
+    }
+    tick = await run_work_kanban_automation_idle_tick(
+        item_id=clean_item_id,
+        max_scan_items=1,
+        max_process_items=1,
+        holder_id="kanban-idle-worker",
+        run_id=internal_run_id,
+        actor="kanban-idle-worker",
+        source_surface="kanban-automation-idle-worker",
+        request_id=internal_request_id,
+        producer_source="manual",
+        processor_kind="preprocessing",
+        source_metadata_extra={"operator_authorized_recovery": initiation},
+    )
+    return _work_operator_authorized_preprocessing_recovery_result(
+        ok=bool(tick.get("ok")),
+        item_id=clean_item_id,
+        reason=(
+            "operator_authorized_preprocessing_triggered"
+            if tick.get("effective_enabled") is not False
+            else str(tick.get("reason") or "manual_recovery_fenced")
+        ),
+        requester=clean_requester,
+        authorization_ref=clean_authorization_ref,
+        config=config,
+        preflight=preflight,
+        profile_drift=profile_drift,
+        tick=tick,
+    )
+
+
 async def run_work_kanban_automation_idle_tick(
     *,
     item_id: str | None = None,
@@ -22851,11 +23201,16 @@ async def run_work_kanban_automation_idle_tick(
     source_surface: str | None = None,
     request_id: str | None = None,
     producer_source: str = "manual",
+    processor_kind: str | None = None,
+    source_metadata_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = _work_automation_idle_worker_config()
     clean_producer_source = _clean_short_text(producer_source, "manual", limit=40).lower()
     if clean_producer_source not in {"legacy", "scheduler", "manual"}:
         raise HTTPException(422, "Kanban automation producer_source is invalid")
+    clean_processor_kind = _clean_short_text(processor_kind or "", "", limit=80).lower()
+    if clean_processor_kind not in {"", "preprocessing"}:
+        raise HTTPException(422, "Kanban automation processor_kind filter is invalid")
     if not config["enabled"]:
         return {
             "ok": True,
@@ -22920,6 +23275,12 @@ async def run_work_kanban_automation_idle_tick(
     clean_item_id = _clean_short_text(item_id or config["root_item_id"], "", limit=180)
     scan_limit = _clean_review_scan_limit(max_scan_items or config["max_scan_items"])
     process_limit = max(1, min(int(max_process_items or config["max_process_items"]), 50))
+    if clean_processor_kind == "preprocessing":
+        # This internal mode is only used by the dedicated exact-leaf recovery
+        # endpoint.  Keep its bounds fixed even if a future caller mispasses
+        # larger values.
+        scan_limit = 1
+        process_limit = 1
     clean_holder_id = _clean_short_text(
         holder_id or config["holder_id"],
         config["holder_id"],
@@ -22951,29 +23312,49 @@ async def run_work_kanban_automation_idle_tick(
         "producer_mode": config["producer_mode"],
         "producer_source": clean_producer_source,
     }
+    if isinstance(source_metadata_extra, dict) and source_metadata_extra:
+        source_metadata.update(source_metadata_extra)
 
-    timeout_requeue = await requeue_timed_out_work_review_processor_markers(
-        WorkReviewProcessorTimeoutRequeueRequest(
-            item_id=clean_item_id or None,
-            actor=clean_actor,
-            source_surface=clean_source_surface,
-            request_id=f"{clean_request_id}-requeue-timeouts",
-            run_id=clean_run_id,
-            metadata=source_metadata,
+    timeout_requeue: dict[str, Any]
+    if clean_processor_kind == "preprocessing":
+        # The dedicated recovery path must not mutate a Review marker merely
+        # because it shares the leaf scope with the requested preprocessing.
+        timeout_requeue = {
+            "ok": True,
+            "skipped": True,
+            "reason": "preprocessing_only_recovery",
+        }
+    else:
+        timeout_requeue = await requeue_timed_out_work_review_processor_markers(
+            WorkReviewProcessorTimeoutRequeueRequest(
+                item_id=clean_item_id or None,
+                actor=clean_actor,
+                source_surface=clean_source_surface,
+                request_id=f"{clean_request_id}-requeue-timeouts",
+                run_id=clean_run_id,
+                metadata=source_metadata,
+            )
         )
-    )
-    review_scan = await trigger_work_review_processor_idle_scan(
-        WorkReviewProcessorIdleScanRequest(
-            item_id=clean_item_id or None,
-            max_items=scan_limit,
-            include_empty=False,
-            actor=clean_actor,
-            source_surface=clean_source_surface,
-            request_id=f"{clean_request_id}-review-scan",
-            run_id=clean_run_id,
-            metadata=source_metadata,
+    review_scan: dict[str, Any]
+    if clean_processor_kind == "preprocessing":
+        review_scan = {
+            "ok": True,
+            "skipped": True,
+            "reason": "preprocessing_only_recovery",
+        }
+    else:
+        review_scan = await trigger_work_review_processor_idle_scan(
+            WorkReviewProcessorIdleScanRequest(
+                item_id=clean_item_id or None,
+                max_items=scan_limit,
+                include_empty=False,
+                actor=clean_actor,
+                source_surface=clean_source_surface,
+                request_id=f"{clean_request_id}-review-scan",
+                run_id=clean_run_id,
+                metadata=source_metadata,
+            )
         )
-    )
     preprocessing_scan = await trigger_work_preprocessing_idle_scan(
         WorkPreprocessingIdleScanRequest(
             item_id=clean_item_id or None,
@@ -22988,6 +23369,7 @@ async def run_work_kanban_automation_idle_tick(
     eligible_marker_ids = await _run_personal_sync_work(
         _work_queued_processor_marker_ids_for_item_sync,
         clean_item_id,
+        processor_kind=clean_processor_kind or None,
     )
     lease = await acquire_work_review_processor_lease(
         WorkReviewProcessorLeaseRequest(
@@ -23018,6 +23400,7 @@ async def run_work_kanban_automation_idle_tick(
             "singleton_override": config["singleton_override"],
             "producer_mode": config["producer_mode"],
             "producer_source": clean_producer_source,
+            "processor_kind_filter": clean_processor_kind,
             "reason": lease.get("reason") or "lease_not_acquired",
             "lease_acquired": False,
             "timeout_requeue": timeout_requeue,
@@ -23117,6 +23500,7 @@ async def run_work_kanban_automation_idle_tick(
         "singleton_override": config["singleton_override"],
         "producer_mode": config["producer_mode"],
         "producer_source": clean_producer_source,
+        "processor_kind_filter": clean_processor_kind,
         "lease_acquired": True,
         "timeout_requeue": timeout_requeue,
         "review_scan": review_scan,
@@ -23184,6 +23568,20 @@ async def trigger_work_automation_idle_worker_tick(
         source_surface=meta["source_surface"],
         request_id=meta["request_id"],
         producer_source="manual",
+    )
+
+
+@router.post("/kanban/automation/preprocessing/operator-recovery")
+async def trigger_work_operator_authorized_preprocessing_recovery(
+    body: WorkOperatorAuthorizedPreprocessingRecoveryRequest,
+) -> dict[str, Any]:
+    """Run the guarded exact-item recovery path; never accept worker spoofing."""
+
+    return await run_work_operator_authorized_preprocessing_recovery(
+        item_id=body.item_id,
+        operator_authorized=body.operator_authorized,
+        authorization_ref=body.authorization_ref,
+        requester=_work_request_meta(body),
     )
 
 
