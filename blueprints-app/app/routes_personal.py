@@ -35,6 +35,7 @@ from starlette.responses import FileResponse
 from . import config as cfg
 from . import hermes_minutes, timing
 from .db import get_conn as _sqlite_get_conn
+from .db import get_read_conn as _sqlite_get_read_conn
 from .db import get_setting, increment_gen, set_setting
 from .kanban_datastore import (
     ACTIVE_STORE_POSTGRES,
@@ -148,6 +149,7 @@ KANBAN_PROPOSAL_ENTRY_SCHEMA = "xarta.kanban.proposal_entry.v1"
 KANBAN_PROPOSAL_RESPONSE_SCHEMA = "xarta.kanban.proposal_response.v1"
 KANBAN_PROPOSAL_OUTCOME_SCHEMA = "xarta.kanban.proposal_outcome.v1"
 KANBAN_EXECUTION_DIRECTIVE_SCHEMA = "xarta.kanban.preprocessing.execution_directive.v1"
+KANBAN_PREPROCESSING_VALIDATION_REPAIR_SCHEMA = "xarta.kanban.preprocessing.validation_repair.v1"
 KANBAN_ORIGINAL_OPERATOR_REQUESTS_SCHEMA = "xarta.kanban.original_operator_requests.v1"
 KANBAN_VERBATIM_OPERATOR_REQUEST_TAG = "operator-request-verbatim-v1"
 KANBAN_VERBATIM_OPERATOR_STEER_PREFIX = "operator-request-verbatim-"
@@ -243,13 +245,17 @@ KANBAN_PREPROCESSING_GUIDANCE_CATALOG: tuple[dict[str, Any], ...] = (
         ),
         "do_not_apply_when": "The deliverable has no database access or connection ownership.",
         "card_guidance": (
-            "Reuse the established database adapter and bounded long-lived pool for that store. "
-            "Do not add per-request asyncpg.connect calls, throwaway event loops, or a generic "
-            "SQLite pool that violates the existing thread/transaction ownership contract."
+            "Reuse the established database adapter and any existing bounded lifecycle-owned "
+            "pool for that store. Do not add per-request asyncpg.connect calls or throwaway "
+            "event loops. For SQLite, start with the measured mode=ro helper; consider bounded "
+            "thread- or lifecycle-owned reuse only when repeated open/setup work is the measured "
+            "owner, while preserving thread affinity, freshness, short transactions, cleanup, "
+            "and shutdown behavior."
         ),
         "proof_guidance": (
             "Check pool bounds and ownership, pg_stat_activity or equivalent connection churn, "
-            "transaction scope, and focused positive/negative concurrency tests."
+            "SQLite open/setup/use/close stages, transaction scope, thread affinity, cleanup, "
+            "and focused positive/negative concurrency tests."
         ),
         "source_refs": [
             "/xarta-node/.lone-wolf/docs/blueprints-event-loop-timing/README.md",
@@ -618,7 +624,7 @@ class _KanbanActivePostgresConnection:
 
 
 @contextmanager
-def _kanban_postgres_get_conn(*, operation: str) -> Any:
+def _kanban_postgres_get_conn(*, operation: str, transactional: bool = True) -> Any:
     start_perf_ns = time.perf_counter_ns()
     start_time_ns = time.time_ns()
     conn = None
@@ -628,11 +634,13 @@ def _kanban_postgres_get_conn(*, operation: str) -> Any:
     commit_end_ns = 0
     try:
         conn = postgres_candidate_connection(cfg.KANBAN_DATASTORE_CONFIG.candidate_database_url)
-        conn.begin()
+        if transactional:
+            conn.begin()
         yield conn
-        commit_start_ns = time.perf_counter_ns()
-        conn.commit()
-        commit_end_ns = time.perf_counter_ns()
+        if transactional:
+            commit_start_ns = time.perf_counter_ns()
+            conn.commit()
+            commit_end_ns = time.perf_counter_ns()
     except Exception as exc:
         ok = False
         error_type = type(exc).__name__
@@ -663,13 +671,20 @@ def _kanban_postgres_get_conn(*, operation: str) -> Any:
 
 
 @contextmanager
-def _kanban_automation_scan_conn(*, operation: str) -> Any:
+def _kanban_automation_scan_conn(
+    *,
+    operation: str,
+    transactional: bool = True,
+) -> Any:
     if _kanban_active_store_is_postgres() and getattr(
         cfg.KANBAN_DATASTORE_CONFIG,
         "candidate_database_url",
         "",
     ):
-        with _kanban_postgres_get_conn(operation=operation) as conn:
+        with _kanban_postgres_get_conn(
+            operation=operation,
+            transactional=transactional,
+        ) as conn:
             yield conn
         return
     with get_conn() as conn:
@@ -2838,37 +2853,40 @@ def _work_proposal_surface_item_projection(conn: Any, row: Any) -> dict[str, Any
     }
 
 
-def _work_proposal_surfaces_status_sync(limit: int = 20) -> dict[str, Any]:
+def _work_proposal_surfaces_status_from_conn(
+    conn: Any,
+    limit: int = 20,
+) -> dict[str, Any]:
     contract = _work_proposal_surfaces_contract()
-    with get_conn() as conn:
-        surfaces: dict[str, dict[str, Any]] = {}
-        for name, parent_id in (
-            ("inbox", KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID),
-            ("outbox", KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID),
-        ):
-            rows = conn.execute(
-                """
-                SELECT * FROM kanban_items
-                WHERE parent_item_id=? AND status != 'archived'
-                ORDER BY updated_at DESC, item_id
-                LIMIT ?
-                """,
-                (parent_id, max(1, min(int(limit or 20), 100))),
-            ).fetchall()
-            total_row = conn.execute(
-                "SELECT COUNT(*) AS count FROM kanban_items WHERE parent_item_id=? AND status != 'archived'",
-                (parent_id,),
-            ).fetchone()
-            entries = [_work_proposal_surface_item_projection(conn, row) for row in rows]
-            surfaces[name] = {
-                **dict(contract[name]),
-                "count": int(total_row["count"] if total_row else 0),
-                "open_count": sum(1 for entry in entries if not entry["processed"]),
-                "processed_count": sum(1 for entry in entries if entry["processed"]),
-                "failed_count": sum(1 for entry in entries if entry["failure"]),
-                "retry_count": sum(1 for entry in entries if entry["retry_state"]),
-                "entries": entries,
-            }
+    surfaces: dict[str, dict[str, Any]] = {}
+    for name, parent_id in (
+        ("inbox", KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID),
+        ("outbox", KANBAN_OPERATOR_PROPOSAL_OUTBOX_ITEM_ID),
+    ):
+        rows = conn.execute(
+            """
+            SELECT * FROM kanban_items
+            WHERE parent_item_id=? AND status != 'archived'
+            ORDER BY updated_at DESC, item_id
+            LIMIT ?
+            """,
+            (parent_id, max(1, min(int(limit or 20), 100))),
+        ).fetchall()
+        total_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_items "
+            "WHERE parent_item_id=? AND status != 'archived'",
+            (parent_id,),
+        ).fetchone()
+        entries = [_work_proposal_surface_item_projection(conn, row) for row in rows]
+        surfaces[name] = {
+            **dict(contract[name]),
+            "count": int(total_row["count"] if total_row else 0),
+            "open_count": sum(1 for entry in entries if not entry["processed"]),
+            "processed_count": sum(1 for entry in entries if entry["processed"]),
+            "failed_count": sum(1 for entry in entries if entry["failure"]),
+            "retry_count": sum(1 for entry in entries if entry["retry_state"]),
+            "entries": entries,
+        }
     return {
         **_compact_work_contract_header(contract),
         "surface_root": contract["surface_root"],
@@ -2879,6 +2897,11 @@ def _work_proposal_surfaces_status_sync(limit: int = 20) -> dict[str, Any]:
         "response_endpoint_template": contract["status_integration"]["response_endpoint_template"],
         "generated_at": _utc_now_iso(),
     }
+
+
+def _work_proposal_surfaces_status_sync(limit: int = 20) -> dict[str, Any]:
+    with get_conn() as conn:
+        return _work_proposal_surfaces_status_from_conn(conn, limit)
 
 
 def _proposal_markdown_body(
@@ -6361,7 +6384,8 @@ def _work_review_processor_marker_stats(
     )
     last_scan = conn.execute(
         """
-        SELECT * FROM kanban_audit_log
+        SELECT audit_id, created_at, result, metadata_json
+        FROM kanban_audit_log
         WHERE action=?
         ORDER BY created_at DESC, audit_id
         LIMIT 1
@@ -6961,32 +6985,56 @@ def _work_decision_commit_rows(conn: Any, commit_link_ids: list[str]) -> list[An
     clean_ids = _clean_event_list(commit_link_ids, limit=64)
     if not clean_ids:
         return []
-    placeholders = ",".join("?" for _ in clean_ids)
-    rows = conn.execute(
-        f"SELECT * FROM kanban_item_commits WHERE commit_link_id IN ({placeholders})",
-        clean_ids,
-    ).fetchall()
-    by_id = {row["commit_link_id"]: row for row in rows}
+    by_id = _work_commit_rows_by_id(conn, clean_ids)
     return [by_id[commit_id] for commit_id in clean_ids if commit_id in by_id]
 
 
-def _work_decision_commit_health(rows: list[Any], conn: Any) -> dict[str, Any]:
+def _work_commit_rows_by_id(conn: Any, commit_link_ids: list[str]) -> dict[str, Any]:
+    clean_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_id in commit_link_ids:
+        commit_id = _clean_short_text(str(raw_id or ""), "", limit=180)
+        if not commit_id or commit_id in seen:
+            continue
+        seen.add(commit_id)
+        clean_ids.append(commit_id)
+    by_id: dict[str, Any] = {}
+    for offset in range(0, len(clean_ids), 64):
+        chunk = clean_ids[offset : offset + 64]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT * FROM kanban_item_commits WHERE commit_link_id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        by_id.update({row["commit_link_id"]: row for row in rows})
+    return by_id
+
+
+def _work_decision_commit_health(
+    rows: list[Any],
+    conn: Any,
+    *,
+    decision_count: int | None = None,
+) -> dict[str, Any]:
     missing: list[str] = []
     linked_decisions = 0
     hook_failures = 0
+    commit_ids_by_decision: list[list[str]] = []
+    all_commit_ids: list[str] = []
     for row in rows:
         commit_ids = _clean_event_list(_json_value(row["commit_link_ids_json"], []), limit=64)
+        commit_ids_by_decision.append(commit_ids)
         if commit_ids:
             linked_decisions += 1
-            found = {
-                commit["commit_link_id"] for commit in _work_decision_commit_rows(conn, commit_ids)
-            }
-            missing.extend(commit_id for commit_id in commit_ids if commit_id not in found)
+            all_commit_ids.extend(commit_ids)
         metadata = _json_value(row["metadata_json"], {})
         if row["status"] == "hook_failed" or str(metadata.get("hook_status") or "") == "failed":
             hook_failures += 1
+    found = set(_work_commit_rows_by_id(conn, all_commit_ids))
+    for commit_ids in commit_ids_by_decision:
+        missing.extend(commit_id for commit_id in commit_ids if commit_id not in found)
     return {
-        "decision_count": len(rows),
+        "decision_count": len(rows) if decision_count is None else int(decision_count),
         "decisions_with_commits": linked_decisions,
         "missing_commit_link_count": len(missing),
         "missing_commit_link_ids": missing[:20],
@@ -9401,11 +9449,19 @@ def _search_payload(
     }
 
 
-def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
+def _collect_personal_search_documents(
+    conn: Any,
+    *,
+    kanban_conn: Any | None = None,
+    include_personal: bool = True,
+    include_kanban: bool = True,
+) -> list[dict[str, Any]]:
     docs: list[dict[str, Any]] = []
-    event_rows = conn.execute(
-        "SELECT * FROM personal_events WHERE privacy_level != 'pin'"
-    ).fetchall()
+    event_rows = (
+        conn.execute("SELECT * FROM personal_events WHERE privacy_level != 'pin'").fetchall()
+        if include_personal
+        else []
+    )
     for row in event_rows:
         record_type = _event_search_record_type(row)
         tags = _search_tags(row)
@@ -9439,9 +9495,11 @@ def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
             )
         )
 
-    task_rows = conn.execute(
-        "SELECT * FROM personal_time_tasks WHERE privacy_level != 'pin'"
-    ).fetchall()
+    task_rows = (
+        conn.execute("SELECT * FROM personal_time_tasks WHERE privacy_level != 'pin'").fetchall()
+        if include_personal
+        else []
+    )
     for row in task_rows:
         tags = _search_tags(row)
         related_refs = _search_related_refs(
@@ -9474,9 +9532,13 @@ def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
             )
         )
 
-    import_rows = conn.execute(
-        "SELECT * FROM personal_import_batches WHERE privacy_level != 'pin'"
-    ).fetchall()
+    import_rows = (
+        conn.execute(
+            "SELECT * FROM personal_import_batches WHERE privacy_level != 'pin'"
+        ).fetchall()
+        if include_personal
+        else []
+    )
     for row in import_rows:
         artifact_refs = _as_list(_json_value(row["artifact_refs_json"], []))
         blocker_refs = _as_list(_json_value(row["blocker_refs_json"], []))
@@ -9503,13 +9565,18 @@ def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
             )
         )
 
-    work_specs = [
-        ("kanban_items", "item_id", "kanban_item", "manual-kanban"),
-        ("kanban_blockers", "blocker_id", "kanban_blocker", "kanban"),
-        ("kanban_discussions", "discussion_id", "kanban_discussion", "kanban"),
-    ]
+    work_conn = kanban_conn if kanban_conn is not None else conn
+    work_specs = (
+        [
+            ("kanban_items", "item_id", "kanban_item", "manual-kanban"),
+            ("kanban_blockers", "blocker_id", "kanban_blocker", "kanban"),
+            ("kanban_discussions", "discussion_id", "kanban_discussion", "kanban"),
+        ]
+        if include_kanban
+        else []
+    )
     for table, id_col, record_type, default_source in work_specs:
-        for row in conn.execute(f"SELECT * FROM {table}").fetchall():
+        for row in work_conn.execute(f"SELECT * FROM {table}").fetchall():
             row_id = row[id_col]
             tags = _json_value(row["tags_json"], []) if "tags_json" in row.keys() else []
             related_refs = []
@@ -9565,119 +9632,188 @@ def _collect_personal_search_documents(conn: Any) -> list[dict[str, Any]]:
     return docs
 
 
-def _upsert_personal_search_document(conn: Any, doc: dict[str, Any], now: str) -> str:
-    existing = conn.execute(
-        "SELECT source_hash, embedding_ref, embedding_model, embedding_updated_at, "
-        "vector_index_status, vector_index_updated_at "
-        "FROM personal_search_documents WHERE document_id=?",
-        (doc["document_id"],),
-    ).fetchone()
+_PERSONAL_SEARCH_DOCUMENT_COMPARE_FIELDS = (
+    "record_type",
+    "record_table",
+    "record_id",
+    "source_type",
+    "source_ref",
+    "source_hash",
+    "title",
+    "body",
+    "search_text",
+    "local_date",
+    "status",
+    "mode",
+    "privacy_level",
+    "tags_json",
+    "related_refs_json",
+    "page_ref_json",
+    "source_refs_json",
+    "provenance_json",
+    "score_metadata_json",
+    "vector_index_key",
+    "updated_at",
+)
+
+
+def _personal_search_fts_values(doc: dict[str, Any]) -> tuple[str, ...]:
+    tags = " ".join(str(item) for item in _as_list(_json_value(doc["tags_json"], [])))
+    return (
+        str(doc["title"] or ""),
+        str(doc["body"] or ""),
+        str(doc["search_text"] or ""),
+        tags,
+        str(doc["source_type"] or ""),
+        str(doc["record_type"] or ""),
+    )
+
+
+def _upsert_personal_search_document(
+    conn: Any,
+    doc: dict[str, Any],
+    now: str,
+    *,
+    existing: Any | None,
+    existing_fts: Any | None,
+) -> str:
     source_changed = not existing or existing["source_hash"] != doc["source_hash"]
+    document_changed = not existing or any(
+        existing[field] != doc[field] for field in _PERSONAL_SEARCH_DOCUMENT_COMPARE_FIELDS
+    )
+    expected_fts = _personal_search_fts_values(doc)
+    fts_changed = (
+        not existing_fts
+        or tuple(
+            str(existing_fts[field] or "")
+            for field in ("title", "body", "search_text", "tags", "source_type", "record_type")
+        )
+        != expected_fts
+    )
+    if not document_changed and not fts_changed:
+        return "unchanged"
+
     embedding_ref = "" if source_changed else existing["embedding_ref"]
     embedding_model = "" if source_changed else existing["embedding_model"]
     embedding_updated_at = None if source_changed else existing["embedding_updated_at"]
     vector_status = "pending" if source_changed else existing["vector_index_status"]
     vector_updated_at = None if source_changed else existing["vector_index_updated_at"]
     created_at = now
-    conn.execute(
-        """
-        INSERT INTO personal_search_documents (
-            document_id, record_type, record_table, record_id, source_type, source_ref,
-            source_hash, title, body, search_text, local_date, status, mode,
-            privacy_level, tags_json, related_refs_json, page_ref_json,
-            source_refs_json, provenance_json, score_metadata_json, embedding_ref,
-            embedding_model, embedding_updated_at, vector_index_key,
-            vector_index_status, vector_index_updated_at, created_at, updated_at
+    if document_changed:
+        conn.execute(
+            """
+            INSERT INTO personal_search_documents (
+                document_id, record_type, record_table, record_id, source_type, source_ref,
+                source_hash, title, body, search_text, local_date, status, mode,
+                privacy_level, tags_json, related_refs_json, page_ref_json,
+                source_refs_json, provenance_json, score_metadata_json, embedding_ref,
+                embedding_model, embedding_updated_at, vector_index_key,
+                vector_index_status, vector_index_updated_at, created_at, updated_at
+            )
+            VALUES (
+                :document_id, :record_type, :record_table, :record_id, :source_type,
+                :source_ref, :source_hash, :title, :body, :search_text, :local_date,
+                :status, :mode, :privacy_level, :tags_json, :related_refs_json,
+                :page_ref_json, :source_refs_json, :provenance_json, :score_metadata_json,
+                :embedding_ref, :embedding_model, :embedding_updated_at, :vector_index_key,
+                :vector_index_status, :vector_index_updated_at, :created_at, :updated_at
+            )
+            ON CONFLICT(document_id) DO UPDATE SET
+                record_type=excluded.record_type,
+                record_table=excluded.record_table,
+                record_id=excluded.record_id,
+                source_type=excluded.source_type,
+                source_ref=excluded.source_ref,
+                source_hash=excluded.source_hash,
+                title=excluded.title,
+                body=excluded.body,
+                search_text=excluded.search_text,
+                local_date=excluded.local_date,
+                status=excluded.status,
+                mode=excluded.mode,
+                privacy_level=excluded.privacy_level,
+                tags_json=excluded.tags_json,
+                related_refs_json=excluded.related_refs_json,
+                page_ref_json=excluded.page_ref_json,
+                source_refs_json=excluded.source_refs_json,
+                provenance_json=excluded.provenance_json,
+                score_metadata_json=excluded.score_metadata_json,
+                embedding_ref=excluded.embedding_ref,
+                embedding_model=excluded.embedding_model,
+                embedding_updated_at=excluded.embedding_updated_at,
+                vector_index_key=excluded.vector_index_key,
+                vector_index_status=excluded.vector_index_status,
+                vector_index_updated_at=excluded.vector_index_updated_at,
+                updated_at=excluded.updated_at
+            """,
+            {
+                **doc,
+                "embedding_ref": embedding_ref,
+                "embedding_model": embedding_model,
+                "embedding_updated_at": embedding_updated_at,
+                "vector_index_status": vector_status,
+                "vector_index_updated_at": vector_updated_at,
+                "created_at": created_at,
+                "updated_at": doc["updated_at"] or now,
+            },
         )
-        VALUES (
-            :document_id, :record_type, :record_table, :record_id, :source_type,
-            :source_ref, :source_hash, :title, :body, :search_text, :local_date,
-            :status, :mode, :privacy_level, :tags_json, :related_refs_json,
-            :page_ref_json, :source_refs_json, :provenance_json, :score_metadata_json,
-            :embedding_ref, :embedding_model, :embedding_updated_at, :vector_index_key,
-            :vector_index_status, :vector_index_updated_at, :created_at, :updated_at
+    if fts_changed:
+        conn.execute("DELETE FROM personal_search_fts WHERE document_id=?", (doc["document_id"],))
+        conn.execute(
+            """
+            INSERT INTO personal_search_fts (
+                document_id, title, body, search_text, tags, source_type, record_type
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (doc["document_id"], *expected_fts),
         )
-        ON CONFLICT(document_id) DO UPDATE SET
-            record_type=excluded.record_type,
-            record_table=excluded.record_table,
-            record_id=excluded.record_id,
-            source_type=excluded.source_type,
-            source_ref=excluded.source_ref,
-            source_hash=excluded.source_hash,
-            title=excluded.title,
-            body=excluded.body,
-            search_text=excluded.search_text,
-            local_date=excluded.local_date,
-            status=excluded.status,
-            mode=excluded.mode,
-            privacy_level=excluded.privacy_level,
-            tags_json=excluded.tags_json,
-            related_refs_json=excluded.related_refs_json,
-            page_ref_json=excluded.page_ref_json,
-            source_refs_json=excluded.source_refs_json,
-            provenance_json=excluded.provenance_json,
-            score_metadata_json=excluded.score_metadata_json,
-            embedding_ref=excluded.embedding_ref,
-            embedding_model=excluded.embedding_model,
-            embedding_updated_at=excluded.embedding_updated_at,
-            vector_index_key=excluded.vector_index_key,
-            vector_index_status=excluded.vector_index_status,
-            vector_index_updated_at=excluded.vector_index_updated_at,
-            updated_at=excluded.updated_at
-        """,
-        {
-            **doc,
-            "embedding_ref": embedding_ref,
-            "embedding_model": embedding_model,
-            "embedding_updated_at": embedding_updated_at,
-            "vector_index_status": vector_status,
-            "vector_index_updated_at": vector_updated_at,
-            "created_at": created_at,
-            "updated_at": doc["updated_at"] or now,
-        },
-    )
-    conn.execute("DELETE FROM personal_search_fts WHERE document_id=?", (doc["document_id"],))
-    tags = " ".join(str(item) for item in _as_list(_json_value(doc["tags_json"], [])))
-    conn.execute(
-        """
-        INSERT INTO personal_search_fts (
-            document_id, title, body, search_text, tags, source_type, record_type
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            doc["document_id"],
-            doc["title"],
-            doc["body"],
-            doc["search_text"],
-            tags,
-            doc["source_type"],
-            doc["record_type"],
-        ),
-    )
     return "updated" if source_changed else "unchanged"
 
 
-def _sync_personal_search_documents(conn: Any, now: str) -> dict[str, Any]:
-    import_status = _sync_personal_import_status_batches(conn, now)
-    docs = _collect_personal_search_documents(conn)
+def _reconcile_personal_search_documents(
+    conn: Any,
+    now: str,
+    *,
+    docs: list[dict[str, Any]],
+    import_status: dict[str, Any],
+) -> dict[str, Any]:
     seen = {doc["document_id"] for doc in docs}
+    existing_by_id = {
+        row["document_id"]: row
+        for row in conn.execute("SELECT * FROM personal_search_documents").fetchall()
+    }
+    existing_fts_by_id = {
+        row["document_id"]: row
+        for row in conn.execute(
+            """
+            SELECT document_id, title, body, search_text, tags, source_type, record_type
+            FROM personal_search_fts
+            """
+        ).fetchall()
+    }
     updated = 0
     unchanged = 0
     for doc in docs:
-        status = _upsert_personal_search_document(conn, doc, now)
+        status = _upsert_personal_search_document(
+            conn,
+            doc,
+            now,
+            existing=existing_by_id.get(doc["document_id"]),
+            existing_fts=existing_fts_by_id.get(doc["document_id"]),
+        )
         if status == "updated":
             updated += 1
         else:
             unchanged += 1
-    stale_rows = conn.execute("SELECT document_id FROM personal_search_documents").fetchall()
     deleted = 0
-    for row in stale_rows:
-        if row["document_id"] in seen:
+    for document_id in existing_by_id:
+        if document_id in seen:
             continue
-        conn.execute("DELETE FROM personal_search_fts WHERE document_id=?", (row["document_id"],))
+        conn.execute("DELETE FROM personal_search_fts WHERE document_id=?", (document_id,))
         conn.execute(
-            "DELETE FROM personal_search_documents WHERE document_id=?", (row["document_id"],)
+            "DELETE FROM personal_search_documents WHERE document_id=?",
+            (document_id,),
         )
         deleted += 1
     return {
@@ -9689,10 +9825,13 @@ def _sync_personal_search_documents(conn: Any, now: str) -> dict[str, Any]:
     }
 
 
-def _sync_personal_import_status_batches(conn: Any, now: str) -> dict[str, Any]:
-    counts = _personal_source_counts_from_conn(conn)
-    interests = _parse_interests_dashboard()
-    git_activity = _git_activity_dashboard(counts)
+def _build_personal_import_status_rows(
+    *,
+    counts: dict[str, Any],
+    interests: dict[str, Any],
+    git_activity: dict[str, Any],
+    now: str,
+) -> list[dict[str, Any]]:
     today = now[:10]
 
     interest_artifacts = [
@@ -9787,7 +9926,15 @@ def _sync_personal_import_status_batches(conn: Any, now: str) -> dict[str, Any]:
             "provenance_json": json.dumps(git_provenance, sort_keys=True, ensure_ascii=True),
         },
     ]
+    return rows
 
+
+def _sync_personal_import_status_batches(
+    conn: Any,
+    now: str,
+    *,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
     inserted = 0
     updated = 0
     unchanged = 0
@@ -9860,6 +10007,101 @@ def _sync_personal_import_status_batches(conn: Any, now: str) -> dict[str, Any]:
     return {"inserted": inserted, "updated": updated, "unchanged": unchanged}
 
 
+def _prepare_personal_import_status_batches(now: str) -> list[dict[str, Any]]:
+    with _sqlite_get_read_conn(
+        busy_timeout_ms=100,
+        operation="personal_search_import_status_counts",
+    ) as sqlite_read_conn:
+        counts = _personal_source_counts_from_conn(sqlite_read_conn)
+    interests = _parse_interests_dashboard()
+    git_activity = _git_activity_dashboard(counts)
+    return _build_personal_import_status_rows(
+        counts=counts,
+        interests=interests,
+        git_activity=git_activity,
+        now=now,
+    )
+
+
+def _sync_personal_search_documents_isolated(now: str) -> dict[str, Any]:
+    import_rows = _prepare_personal_import_status_batches(now)
+    with _sqlite_get_conn() as sqlite_write_conn:
+        import_status = _sync_personal_import_status_batches(
+            sqlite_write_conn,
+            now,
+            rows=import_rows,
+        )
+
+    postgres_active = _kanban_active_store_is_postgres()
+    with _sqlite_get_read_conn(
+        busy_timeout_ms=100,
+        operation="personal_search_source_snapshot",
+    ) as sqlite_read_conn:
+        docs = _collect_personal_search_documents(
+            sqlite_read_conn,
+            include_kanban=not postgres_active,
+        )
+    if postgres_active:
+        with _kanban_postgres_get_conn(
+            operation="personal_search_source_snapshot",
+            transactional=False,
+        ) as kanban_conn:
+            docs.extend(
+                _collect_personal_search_documents(
+                    kanban_conn,
+                    include_personal=False,
+                )
+            )
+
+    with _sqlite_get_conn() as sqlite_write_conn:
+        return _reconcile_personal_search_documents(
+            sqlite_write_conn,
+            now,
+            docs=docs,
+            import_status=import_status,
+        )
+
+
+def _personal_search_vector_rows_sync(
+    *,
+    where: str,
+    params: tuple[Any, ...],
+) -> list[dict[str, Any]]:
+    with _sqlite_get_read_conn(
+        busy_timeout_ms=100,
+        operation="personal_search_vector_candidates",
+    ) as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT * FROM personal_search_documents
+                WHERE {where}
+                ORDER BY updated_at DESC, document_id
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        ]
+
+
+def _personal_search_vector_updates_sync(updates: list[tuple[Any, ...]]) -> None:
+    with _sqlite_get_conn() as conn:
+        conn.executemany(
+            """
+            UPDATE personal_search_documents
+            SET embedding_ref=?,
+                embedding_model=?,
+                embedding_updated_at=?,
+                vector_index_status='indexed',
+                vector_index_updated_at=?,
+                updated_at=?
+            WHERE document_id=?
+            """,
+            updates,
+        )
+
+
 async def _sync_personal_search_vectors(
     *,
     force_embeddings: bool,
@@ -9873,19 +10115,11 @@ async def _sync_personal_search_vectors(
     else:
         where = "search_text != '' AND vector_index_status != 'indexed'"
         params = (safe_limit,)
-    with get_conn() as conn:
-        rows = [
-            dict(row)
-            for row in conn.execute(
-                f"""
-                SELECT * FROM personal_search_documents
-                WHERE {where}
-                ORDER BY updated_at DESC, document_id
-                LIMIT ?
-                """,
-                params,
-            ).fetchall()
-        ]
+    rows = await _run_personal_sync_work(
+        _personal_search_vector_rows_sync,
+        where=where,
+        params=params,
+    )
     if not rows:
         return {
             "status": "ok",
@@ -9918,20 +10152,10 @@ async def _sync_personal_search_vectors(
                 }
             )
             updates.append((embedding_ref, embedding_model, now, now, now, row["document_id"]))
-        with get_conn() as conn:
-            conn.executemany(
-                """
-                UPDATE personal_search_documents
-                SET embedding_ref=?,
-                    embedding_model=?,
-                    embedding_updated_at=?,
-                    vector_index_status='indexed',
-                    vector_index_updated_at=?,
-                    updated_at=?
-                WHERE document_id=?
-                """,
-                updates,
-            )
+        await _run_personal_sync_work(
+            _personal_search_vector_updates_sync,
+            updates,
+        )
         return {
             "status": "ok",
             "attempted": len(rows),
@@ -9960,8 +10184,10 @@ async def _sync_personal_search_index(
     limit: int = 200,
 ) -> dict[str, Any]:
     now = _utc_now_iso()
-    with get_conn() as conn:
-        document_summary = _sync_personal_search_documents(conn, now)
+    document_summary = await _run_personal_sync_work(
+        _sync_personal_search_documents_isolated,
+        now,
+    )
     vector_summary = {
         "status": "skipped",
         "attempted": 0,
@@ -12012,6 +12238,18 @@ def _kanban_item_dir(conn: Any, item_id: str, *, ensure_project: bool = False) -
     return KANBAN_ROOT / project_slug / "items" / item_slug
 
 
+def _kanban_item_dir_from_root_row(root_item: Any, item_id: str) -> Path:
+    manifest = _read_kanban_projects_manifest()
+    projects = manifest.get("projects") if isinstance(manifest.get("projects"), dict) else {}
+    root_id = str(root_item["item_id"])
+    entry = projects.get(root_id) if isinstance(projects.get(root_id), dict) else {}
+    project_slug = str(entry.get("folder") or "").strip() or _safe_kanban_slug(
+        str(root_item["title"] or root_id),
+        "root-project",
+    )
+    return KANBAN_ROOT / project_slug / "items" / _safe_kanban_slug(item_id, "item")
+
+
 def _kanban_item_detail_path(conn: Any, item_id: str, *, ensure_project: bool = False) -> Path:
     return _kanban_item_dir(conn, item_id, ensure_project=ensure_project) / "detail.md"
 
@@ -12062,6 +12300,25 @@ def _work_item_detail_document(
     if cache is not None:
         cache[cache_key] = document
     return document
+
+
+def _work_item_document_from_path(
+    *,
+    path: Path,
+    item_id: str,
+    item_updated_at: str,
+    schema: str,
+) -> dict[str, Any]:
+    metadata, body, exists = _read_kanban_markdown_document(path)
+    return {
+        "schema": metadata.get("schema") or schema,
+        "item_id": item_id,
+        "body": body,
+        "exists": exists,
+        "file_ref": _kanban_document_ref(path),
+        "metadata": metadata,
+        "updated_at": metadata.get("updated_at") or item_updated_at,
+    }
 
 
 def _work_item_review_document(
@@ -12217,6 +12474,10 @@ def _write_work_item_review_document(
 
 def _work_discussion_document(conn: Any, row: Any) -> dict[str, Any]:
     path = _kanban_discussion_path(conn, row["item_id"], row["discussion_id"])
+    return _work_discussion_document_from_path(path, row)
+
+
+def _work_discussion_document_from_path(path: Path, row: Any) -> dict[str, Any]:
     metadata, body, exists = _read_kanban_markdown_document(path)
     if not exists:
         body = row["body_excerpt"] or ""
@@ -14622,6 +14883,440 @@ async def update_kanban_preferences(body: WorkPreferencesUpdateRequest) -> dict[
         return {"ok": True, "preferences": preferences, "audit": audit}
 
 
+def _blocker_discovery_row_is_live(row: Any) -> bool:
+    if str(row["archived_at"] or "").strip():
+        return False
+    if str(row["status"] or "").lower() in {
+        "resolved",
+        "closed",
+        "done",
+        "archived",
+        "deleted",
+    }:
+        return False
+    return str(row["state_id"] or "").lower() not in {"done", "archived", "deleted"}
+
+
+def _blocker_discovery_test_entry(row: Any) -> bool:
+    return KANBAN_AGENT_WORKING_OUT_TAG in {
+        str(tag).strip().lower() for tag in _json_value(row["tags_json"], []) if str(tag).strip()
+    }
+
+
+def _blocker_discovery_order_group(
+    rows: list[Any],
+    *,
+    priority_order: dict[str, tuple[int, int]],
+    edges: list[Any],
+) -> list[Any]:
+    if len(rows) <= 1:
+        return list(rows)
+    grouped: dict[str, list[Any]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["priority_id"] or "medium"), []).append(row)
+    ordered: list[Any] = []
+    for priority_id in sorted(
+        grouped,
+        key=lambda value: (
+            -priority_order.get(value, (0, 0))[0],
+            -priority_order.get(value, (0, 0))[1],
+            value,
+        ),
+    ):
+        priority_rows = grouped[priority_id]
+        fallback = sorted(
+            priority_rows,
+            key=lambda row: (
+                int(row["sort_order"] or 0),
+                str(row["created_at"] or ""),
+                str(row["item_id"]),
+            ),
+        )
+        if len(fallback) <= 1:
+            ordered.extend(fallback)
+            continue
+        fallback_index = {str(row["item_id"]): index for index, row in enumerate(fallback)}
+        row_by_id = {str(row["item_id"]): row for row in fallback}
+        item_ids = set(row_by_id)
+        adjacency: dict[str, set[str]] = {item_id: set() for item_id in item_ids}
+        indegree: dict[str, int] = {item_id: 0 for item_id in item_ids}
+        for edge in edges:
+            before = str(edge["before_item_id"] or "")
+            after = str(edge["after_item_id"] or "")
+            if before not in item_ids or after not in item_ids or before == after:
+                continue
+            if after in adjacency[before]:
+                continue
+            adjacency[before].add(after)
+            indegree[after] += 1
+        ready = sorted(
+            [item_id for item_id, count in indegree.items() if count == 0],
+            key=fallback_index.__getitem__,
+        )
+        ordered_ids: list[str] = []
+        while ready:
+            item_id = ready.pop(0)
+            ordered_ids.append(item_id)
+            for after in sorted(adjacency[item_id], key=fallback_index.__getitem__):
+                indegree[after] -= 1
+                if indegree[after] == 0:
+                    ready.append(after)
+                    ready.sort(key=fallback_index.__getitem__)
+        ordered_ids.extend(
+            str(row["item_id"]) for row in fallback if str(row["item_id"]) not in ordered_ids
+        )
+        ordered.extend(row_by_id[item_id] for item_id in ordered_ids)
+    return ordered
+
+
+def _blocker_discovery_tree_counts(
+    item_id: str,
+    *,
+    children_by_parent: dict[str, list[Any]],
+) -> dict[str, Any]:
+    counts: dict[str, Any] = {
+        "descendant_count": 0,
+        "blocked_descendant_count": 0,
+        "active_descendant_count": 0,
+        "done_descendant_count": 0,
+        "direct_child_state_counts": {},
+    }
+    seen: set[str] = set()
+
+    def walk(parent_id: str, *, direct: bool) -> None:
+        if parent_id in seen:
+            return
+        seen.add(parent_id)
+        for child in children_by_parent.get(parent_id, []):
+            if str(child["archived_at"] or "").strip():
+                continue
+            child_id = str(child["item_id"] or "")
+            if not child_id:
+                continue
+            state = str(child["state_id"] or "")
+            counts["descendant_count"] += 1
+            if state == "blocked":
+                counts["blocked_descendant_count"] += 1
+            if state in {"todo", "doing"}:
+                counts["active_descendant_count"] += 1
+            if state == "done":
+                counts["done_descendant_count"] += 1
+            if direct:
+                direct_counts = counts["direct_child_state_counts"]
+                direct_counts[state] = int(direct_counts.get(state) or 0) + 1
+            walk(child_id, direct=False)
+
+    walk(item_id, direct=True)
+    return counts
+
+
+def _work_blocker_processor_discovery_sync(
+    one_card: str | None,
+    include_test_entries: bool,
+    max_items: int,
+) -> dict[str, Any]:
+    clean_one_card = _clean_short_text(one_card, "", limit=180)
+    clean_max_items = max(0, min(int(max_items or 0), 1000))
+    tree_row_limit = 5000
+    blocker_row_limit = 10000
+    edge_row_limit = 20000
+    with _kanban_automation_scan_conn(
+        operation="kanban_blocker_processor_discovery",
+        transactional=False,
+    ) as conn:
+        item_rows = conn.execute(
+            """
+            SELECT * FROM kanban_items
+            WHERE status != 'archived'
+            ORDER BY item_id
+            LIMIT 5001
+            """
+        ).fetchall()
+        state_rows = conn.execute(
+            "SELECT * FROM kanban_item_states ORDER BY sort_order, state_id"
+        ).fetchall()
+        priority_rows = conn.execute(
+            "SELECT priority_id, weight, sort_order FROM kanban_item_priorities"
+        ).fetchall()
+        edge_rows = conn.execute(
+            """
+            SELECT * FROM kanban_item_order_edges
+            ORDER BY updated_at DESC, edge_id
+            LIMIT 20001
+            """
+        ).fetchall()
+        blocker_rows = conn.execute(
+            """
+            SELECT * FROM kanban_blockers
+            ORDER BY updated_at DESC, blocker_id
+            LIMIT 10001
+            """
+        ).fetchall()
+    if len(item_rows) > tree_row_limit:
+        raise HTTPException(503, "Kanban blocker discovery tree exceeds its 5000-row bound")
+    if len(edge_rows) > edge_row_limit:
+        raise HTTPException(503, "Kanban blocker discovery order edges exceed their row bound")
+    if len(blocker_rows) > blocker_row_limit:
+        raise HTTPException(503, "Kanban blocker discovery blockers exceed their row bound")
+
+    item_by_id = {str(row["item_id"]): row for row in item_rows}
+    children_by_parent: dict[str, list[Any]] = {}
+    for row in item_rows:
+        children_by_parent.setdefault(str(row["parent_item_id"] or ""), []).append(row)
+    state_order = [str(row["state_id"]) for row in state_rows]
+    priority_order = {
+        str(row["priority_id"]): (int(row["weight"] or 0), int(row["sort_order"] or 0))
+        for row in priority_rows
+    }
+    edges_by_parent_state: dict[tuple[str, str], list[Any]] = {}
+    for edge in edge_rows:
+        key = (
+            str(edge["parent_item_id"] or ""),
+            str(edge["state_id"] or ""),
+        )
+        edges_by_parent_state.setdefault(key, []).append(edge)
+
+    blockers_by_item: dict[str, list[Any]] = {}
+    blocker_item_id_by_id: dict[str, str] = {}
+    for row in blocker_rows:
+        item_id = str(row["item_id"] or "")
+        blocker_id = str(row["blocker_id"] or "")
+        blockers_by_item.setdefault(item_id, []).append(row)
+        if blocker_id:
+            blocker_item_id_by_id[blocker_id] = item_id
+    ordered_rows: list[tuple[Any, bool, bool]] = []
+    focused_item_id = (
+        clean_one_card
+        if clean_one_card in item_by_id
+        else blocker_item_id_by_id.get(clean_one_card, "")
+    )
+    focused = item_by_id.get(focused_item_id) if focused_item_id else None
+    if focused is not None:
+        ordered_rows.append(
+            (
+                focused,
+                bool(focused["automation_excluded"]),
+                _blocker_discovery_test_entry(focused),
+            )
+        )
+    else:
+        visited: set[str] = set()
+
+        def walk(
+            parent_item_id: str,
+            *,
+            ancestor_automation_excluded: bool,
+            ancestor_test_entry: bool,
+            depth: int,
+        ) -> None:
+            if depth > KANBAN_DEPTH_LIMIT or len(ordered_rows) >= clean_max_items:
+                return
+            parent_rows = children_by_parent.get(parent_item_id, [])
+            rows_by_state: dict[str, list[Any]] = {}
+            for row in parent_rows:
+                rows_by_state.setdefault(str(row["state_id"] or ""), []).append(row)
+            for state_id in state_order:
+                state_rows_for_parent = rows_by_state.pop(state_id, [])
+                for row in _blocker_discovery_order_group(
+                    state_rows_for_parent,
+                    priority_order=priority_order,
+                    edges=edges_by_parent_state.get((parent_item_id, state_id), []),
+                ):
+                    if len(ordered_rows) >= clean_max_items:
+                        return
+                    item_id = str(row["item_id"] or "")
+                    if not item_id or item_id in visited:
+                        continue
+                    visited.add(item_id)
+                    row_test_entry = _blocker_discovery_test_entry(row)
+                    test_entry = ancestor_test_entry or row_test_entry
+                    if not include_test_entries and row_test_entry:
+                        continue
+                    automation_excluded = ancestor_automation_excluded or bool(
+                        row["automation_excluded"]
+                    )
+                    ordered_rows.append((row, automation_excluded, test_entry))
+                    walk(
+                        item_id,
+                        ancestor_automation_excluded=automation_excluded,
+                        ancestor_test_entry=test_entry,
+                        depth=depth + 1,
+                    )
+            for state_id in sorted(rows_by_state):
+                for row in _blocker_discovery_order_group(
+                    rows_by_state[state_id],
+                    priority_order=priority_order,
+                    edges=[],
+                ):
+                    if len(ordered_rows) >= clean_max_items:
+                        return
+                    item_id = str(row["item_id"] or "")
+                    if not item_id or item_id in visited:
+                        continue
+                    visited.add(item_id)
+                    row_test_entry = _blocker_discovery_test_entry(row)
+                    test_entry = ancestor_test_entry or row_test_entry
+                    if not include_test_entries and row_test_entry:
+                        continue
+                    automation_excluded = ancestor_automation_excluded or bool(
+                        row["automation_excluded"]
+                    )
+                    ordered_rows.append((row, automation_excluded, test_entry))
+                    walk(
+                        item_id,
+                        ancestor_automation_excluded=automation_excluded,
+                        ancestor_test_entry=test_entry,
+                        depth=depth + 1,
+                    )
+
+        if clean_max_items:
+            walk(
+                "",
+                ancestor_automation_excluded=False,
+                ancestor_test_entry=False,
+                depth=0,
+            )
+
+    candidates: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    tree_status_by_item_id: dict[str, dict[str, Any]] = {}
+    for item_row, automation_excluded, test_entry in ordered_rows:
+        item_id = str(item_row["item_id"] or "")
+        item_has_open_blocker = False
+        open_blocker_count = 0
+        resolved_blocker_count = 0
+        for blocker_row in blockers_by_item.get(item_id, []):
+            blocker = _row_to_work_blocker(blocker_row)
+            blocker_id = str(blocker.get("blocker_id") or "")
+            blocker_status = str(blocker.get("status") or "").lower()
+            if blocker_status in {"resolved", "closed", "done", "archived", "deleted"}:
+                resolved_blocker_count += 1
+            elif not blocker_status or blocker_status in {
+                "open",
+                "active",
+                "pending",
+                "waiting",
+                "blocked",
+            }:
+                open_blocker_count += 1
+            if clean_one_card and clean_one_card not in {item_id, blocker_id}:
+                continue
+            candidate = {
+                "item_id": item_id,
+                "parent_item_id": item_row["parent_item_id"],
+                "title": str(item_row["title"] or ""),
+                "item_body": str(item_row["body_excerpt"] or ""),
+                "item_state": str(item_row["state_id"] or ""),
+                "item_status": str(item_row["status"] or ""),
+                "blocker_id": blocker_id,
+                "blocker_title": str(blocker.get("title") or ""),
+                "blocker_body": str(blocker.get("body") or blocker.get("body_excerpt") or ""),
+                "blocker_status": str(blocker.get("status") or ""),
+                "blocked_by_ref": str(blocker.get("blocked_by_ref") or ""),
+                "kind": "blocker",
+                "skip_reason": "",
+            }
+            if blocker_status in {"resolved", "closed", "done", "archived", "deleted"}:
+                candidate["skip_reason"] = "blocker_resolved"
+                skipped.append(candidate)
+                continue
+            if blocker_status and blocker_status not in {
+                "open",
+                "active",
+                "pending",
+                "waiting",
+                "blocked",
+            }:
+                candidate["skip_reason"] = f"blocker_status_{blocker_status}"
+                skipped.append(candidate)
+                continue
+            item_has_open_blocker = True
+            if not _blocker_discovery_row_is_live(item_row):
+                candidate["skip_reason"] = "item_not_live"
+                skipped.append(candidate)
+                continue
+            if automation_excluded:
+                candidate["skip_reason"] = "automation_excluded"
+                skipped.append(candidate)
+                continue
+            if not include_test_entries and test_entry:
+                candidate["skip_reason"] = "test_entry"
+                skipped.append(candidate)
+                continue
+            candidates.append(candidate)
+
+        item_focus_matches = not clean_one_card or clean_one_card == item_id
+        if (
+            item_focus_matches
+            and not item_has_open_blocker
+            and str(item_row["state_id"] or "").lower() == "blocked"
+        ):
+            candidate = {
+                "item_id": item_id,
+                "parent_item_id": item_row["parent_item_id"],
+                "title": str(item_row["title"] or ""),
+                "item_body": str(item_row["body_excerpt"] or ""),
+                "item_state": str(item_row["state_id"] or ""),
+                "item_status": str(item_row["status"] or ""),
+                "blocker_id": None,
+                "blocker_title": "",
+                "blocker_body": "",
+                "blocker_status": "",
+                "blocked_by_ref": "",
+                "kind": "blocked_lane",
+                "skip_reason": "",
+            }
+            if not _blocker_discovery_row_is_live(item_row):
+                candidate["skip_reason"] = "item_not_live"
+                skipped.append(candidate)
+            elif automation_excluded:
+                candidate["skip_reason"] = "automation_excluded"
+                skipped.append(candidate)
+            elif not include_test_entries and test_entry:
+                candidate["skip_reason"] = "test_entry"
+                skipped.append(candidate)
+            else:
+                candidates.append(candidate)
+        if any(candidate["item_id"] == item_id for candidate in candidates):
+            tree_status_by_item_id[item_id] = {
+                **_blocker_discovery_tree_counts(
+                    item_id,
+                    children_by_parent=children_by_parent,
+                ),
+                "open_blocker_count": open_blocker_count,
+                "resolved_blocker_count": resolved_blocker_count,
+            }
+    return {
+        "ok": True,
+        "schema": "xarta.kanban.blocker_processor.discovery.v1",
+        "one_card": clean_one_card,
+        "include_test_entries": include_test_entries,
+        "scan_item_limit": clean_max_items,
+        "tree_row_limit": tree_row_limit,
+        "scanned_item_count": len(ordered_rows),
+        "candidate_count": len(candidates),
+        "skipped_count": len(skipped),
+        "candidates": candidates[:2000],
+        "skipped": skipped[:2000],
+        "tree_status_by_item_id": tree_status_by_item_id,
+        "truncated": len(candidates) > 2000 or len(skipped) > 2000,
+    }
+
+
+@router.get("/kanban/automation/blocker-processor/discovery")
+async def get_work_blocker_processor_discovery(
+    one_card: Annotated[str | None, Query(max_length=180)] = None,
+    include_test_entries: Annotated[bool, Query()] = False,
+    scan_item_limit: Annotated[int, Query(ge=0, le=1000)] = 250,
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(
+        _work_blocker_processor_discovery_sync,
+        one_card,
+        include_test_entries,
+        scan_item_limit,
+    )
+
+
 @router.get("/kanban/board")
 async def get_work_root_board(
     show_test_entries: Annotated[bool | None, Query()] = None,
@@ -14630,7 +15325,10 @@ async def get_work_root_board(
 
 
 def _get_work_root_board_sync(show_test_entries: bool | None = None) -> dict[str, Any]:
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(
+        operation="kanban_root_board",
+        transactional=False,
+    ) as conn:
         return _work_board_payload(conn, show_test_entries=show_test_entries)
 
 
@@ -14650,7 +15348,10 @@ def _get_work_child_board_sync(
     item_id: str,
     show_test_entries: bool | None = None,
 ) -> dict[str, Any]:
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(
+        operation="kanban_child_board",
+        transactional=False,
+    ) as conn:
         return _work_board_payload(conn, item_id, show_test_entries=show_test_entries)
 
 
@@ -14660,67 +15361,92 @@ async def get_work_item_detail(item_id: str) -> dict[str, Any]:
 
 
 def _get_work_item_detail_sync(item_id: str) -> dict[str, Any]:
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(
+        operation="kanban_item_detail",
+        transactional=False,
+    ) as conn:
         try:
             with _kanban_read_store(conn) as store:
                 read = store.item_detail(item_id)
-                detail_document = store.item_detail_document(item_id)
-                review_document = store.item_review_document(item_id)
-                discussion_payloads = [
-                    _row_to_work_discussion(row, store.conn) for row in read.discussions
-                ]
         except (KanbanItemNotFound, KanbanItemCycleError) as exc:
             _raise_kanban_store_error(exc)
-        return {
-            "ok": True,
-            "item": _row_to_work_item(read.item),
-            "detail_document": detail_document,
-            "review_document": review_document,
-            "breadcrumbs": [_row_to_work_item(row) for row in read.breadcrumbs],
-            "depth_limit": read.depth_limit,
-            "remaining_depth": read.remaining_depth,
-            "children": [_row_to_work_item(row) for row in read.children],
-            "issues": [_row_to_work_issue(row) for row in read.issues],
-            "todos": [_row_to_work_todo(row) for row in read.todos],
-            "blockers": [_row_to_work_blocker(row) for row in read.blockers],
-            "discussions": discussion_payloads,
-            "links": [
-                {
-                    "link_id": row["link_id"],
-                    "source_item_id": row["source_item_id"],
-                    "target_item_id": row["target_item_id"],
-                    "link_type": row["link_type"],
-                    "metadata": _json_value(row["metadata_json"], {}),
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                }
-                for row in read.links
-            ],
-            "commits": [_row_to_work_commit(row) for row in read.commits],
-            "audit": [
-                {
-                    "audit_id": row["audit_id"],
-                    "action": row["action"],
-                    "actor": row["actor"],
-                    "source_surface": row["source_surface"],
-                    "created_at": row["created_at"],
-                    "metadata": _json_value(row["metadata_json"], {}),
-                }
-                for row in read.audit
-            ],
-            "rollup": read.rollup,
-            "counts": {
-                "children": len(read.children),
-                "issues": len(read.issues),
-                "todos": len(read.todos),
-                "blockers": len(read.blockers),
-                "links": len(read.links),
-                "commits": len(read.commits),
-                "audit": len(read.audit),
-                "discussions": len(read.discussions),
-                "review": 1 if (review_document.get("body") or "").strip() else 0,
-            },
-        }
+    root_item = read.breadcrumbs[0] if read.breadcrumbs else read.item
+    item_dir = _kanban_item_dir_from_root_row(root_item, str(read.item["item_id"]))
+    detail_document = _work_item_document_from_path(
+        path=item_dir / "detail.md",
+        item_id=str(read.item["item_id"]),
+        item_updated_at=str(read.item["updated_at"] or ""),
+        schema=KANBAN_ITEM_DETAIL_SCHEMA,
+    )
+    review_document = _work_item_document_from_path(
+        path=item_dir / "review.md",
+        item_id=str(read.item["item_id"]),
+        item_updated_at=str(read.item["updated_at"] or ""),
+        schema=KANBAN_ITEM_REVIEW_SCHEMA,
+    )
+    discussion_payloads = []
+    for row in read.discussions:
+        path = (
+            item_dir
+            / "discussions"
+            / f"{_safe_kanban_slug(str(row['discussion_id']), 'discussion')}.md"
+        )
+        document = _work_discussion_document_from_path(path, row)
+        payload = _row_to_work_discussion(row)
+        payload["body"] = document["body"]
+        payload["document"] = document
+        payload["file_refs"] = [document["file_ref"]]
+        discussion_payloads.append(payload)
+    return {
+        "ok": True,
+        "item": _row_to_work_item(read.item),
+        "detail_document": detail_document,
+        "review_document": review_document,
+        "breadcrumbs": [_row_to_work_item(row) for row in read.breadcrumbs],
+        "depth_limit": read.depth_limit,
+        "remaining_depth": read.remaining_depth,
+        "children": [_row_to_work_item(row) for row in read.children],
+        "issues": [_row_to_work_issue(row) for row in read.issues],
+        "todos": [_row_to_work_todo(row) for row in read.todos],
+        "blockers": [_row_to_work_blocker(row) for row in read.blockers],
+        "discussions": discussion_payloads,
+        "links": [
+            {
+                "link_id": row["link_id"],
+                "source_item_id": row["source_item_id"],
+                "target_item_id": row["target_item_id"],
+                "link_type": row["link_type"],
+                "metadata": _json_value(row["metadata_json"], {}),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in read.links
+        ],
+        "commits": [_row_to_work_commit(row) for row in read.commits],
+        "audit": [
+            {
+                "audit_id": row["audit_id"],
+                "action": row["action"],
+                "actor": row["actor"],
+                "source_surface": row["source_surface"],
+                "created_at": row["created_at"],
+                "metadata": _json_value(row["metadata_json"], {}),
+            }
+            for row in read.audit
+        ],
+        "rollup": read.rollup,
+        "counts": {
+            "children": len(read.children),
+            "issues": len(read.issues),
+            "todos": len(read.todos),
+            "blockers": len(read.blockers),
+            "links": len(read.links),
+            "commits": len(read.commits),
+            "audit": len(read.audit),
+            "discussions": len(read.discussions),
+            "review": 1 if (review_document.get("body") or "").strip() else 0,
+        },
+    }
 
 
 @router.get("/kanban/priorities")
@@ -17991,6 +18717,26 @@ class WorkProcessorRoutesExhausted(RuntimeError):
         )
 
 
+class WorkPreprocessingValidationRepairExhausted(ValueError):
+    def __init__(
+        self,
+        *,
+        initial_error: str,
+        repair_error: str,
+        attempts: list[dict[str, Any]],
+        validation_repair: dict[str, Any],
+    ) -> None:
+        self.initial_error = initial_error
+        self.repair_error = repair_error
+        self.attempts = attempts
+        self.validation_repair = validation_repair
+        self.error_class = "llm_response_validation"
+        super().__init__(
+            "preprocessing response validation failed after one bounded repair: "
+            f"initial={initial_error}; repair={repair_error}"
+        )
+
+
 def _work_processor_route_error_class(exc: Exception) -> str:
     text = str(exc).lower()
     if (
@@ -18127,6 +18873,7 @@ async def _work_automation_processor_profile_json_completion(
     processor_kind: str,
     source_hash: str = "",
     state_identity: dict[str, Any] | None = None,
+    required_route_id: str = "",
 ) -> dict[str, Any]:
     request_plan = await _run_personal_sync_work(
         _work_automation_processor_request_plan_sync,
@@ -18153,7 +18900,19 @@ async def _work_automation_processor_profile_json_completion(
         minimum=30,
         maximum=3600,
     )
-    for attempt_number, public_route in enumerate(routing["routes"], start=1):
+    clean_required_route_id = _clean_short_text(required_route_id, "", limit=80)
+    public_routes = list(routing["routes"])
+    if clean_required_route_id:
+        if clean_required_route_id not in KANBAN_PROCESSOR_MODEL_REGISTRY:
+            raise ValueError("required Kanban processor model route is not allowlisted")
+        public_routes = [
+            public_route
+            for public_route in public_routes
+            if public_route["route_id"] == clean_required_route_id
+        ]
+        if not public_routes:
+            raise ValueError("required Kanban processor model route is not configured")
+    for attempt_number, public_route in enumerate(public_routes, start=1):
         route_id = public_route["route_id"]
         definition = route_definitions[route_id]
         attempt_messages, prompt_variant = request_plan["prompt_variants"][route_id]
@@ -18176,6 +18935,7 @@ async def _work_automation_processor_profile_json_completion(
             "error_classification": "",
             "error": "",
             "prompt_variant": prompt_variant,
+            "required_route_id": clean_required_route_id,
         }
         if not public_route["available"]:
             attempt["outcome"] = "unavailable"
@@ -18221,6 +18981,8 @@ async def _work_automation_processor_profile_json_completion(
         attempt["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
         attempt["outcome"] = "chosen"
         attempts.append(attempt)
+        content_text = str(content or "")
+        content_excerpt = _body_excerpt(content_text, limit=4000)
         return {
             "provider_mode": KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
             "processor_engine": KANBAN_AUTOMATION_PROFILE_ENGINE,
@@ -18242,9 +19004,12 @@ async def _work_automation_processor_profile_json_completion(
                 limit=120,
             ),
             "usage": response.get("usage") if isinstance(response.get("usage"), dict) else {},
+            "max_tokens": config["local_ai_max_tokens"],
             "prompt_sha256": prompt_sha256,
             "prompt_variant": prompt_variant,
-            "content_excerpt": _body_excerpt(str(content or ""), limit=4000),
+            "content_excerpt": content_excerpt,
+            "content_length": len(content_text),
+            "content_excerpt_truncated": len(content_excerpt) < len(content_text),
             "payload": parsed,
             "routing_schema": KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
             "routing_revision": routing["revision"],
@@ -18255,6 +19020,7 @@ async def _work_automation_processor_profile_json_completion(
             "latency_ms": attempt["latency_ms"],
             "fallback_reason": attempt["fallback_reason"],
             "final_outcome": "completed",
+            "required_route_id": clean_required_route_id,
         }
     raise WorkProcessorRoutesExhausted(clean_kind, attempts)
 
@@ -18278,11 +19044,16 @@ def _work_automation_processor_ai_defaults(
         "response_model": "",
         "finish_reason": "",
         "usage": {},
+        "max_tokens": 0,
         "source_hash": "",
         "state_identity": {},
         "prompt_sha256": "",
         "content_excerpt": "",
+        "content_length": 0,
+        "content_excerpt_truncated": False,
         "payload": {},
+        "required_route_id": "",
+        "validation_repair": {},
     }
     merged.update(ai if isinstance(ai, dict) else {})
     return merged
@@ -18301,6 +19072,13 @@ def _work_automation_ai_routing_evidence(ai: dict[str, Any]) -> dict[str, Any]:
         "source_hash": ai.get("source_hash") or ai.get("prompt_sha256") or "",
         "state_identity": dict(ai.get("state_identity") or {}),
         "prompt_variant": dict(ai.get("prompt_variant") or {}),
+        "finish_reason": ai.get("finish_reason") or "",
+        "usage": dict(ai.get("usage") or {}),
+        "max_tokens": int(ai.get("max_tokens") or 0),
+        "content_length": int(ai.get("content_length") or 0),
+        "content_excerpt_truncated": bool(ai.get("content_excerpt_truncated")),
+        "required_route_id": ai.get("required_route_id") or "",
+        "validation_repair": dict(ai.get("validation_repair") or {}),
         "final_outcome": ai.get("final_outcome") or "",
     }
 
@@ -18695,7 +19473,7 @@ def _work_preprocessing_execution_directive(payload: dict[str, Any]) -> dict[str
     raw = payload.get("execution_directive")
     if not isinstance(raw, dict):
         raise ValueError("local AI response missing required object: execution_directive")
-    mode = _clean_short_text(str(raw.get("recommended_mode") or ""), "", limit=80).replace("-", "_")
+    mode = _clean_short_text(str(raw.get("recommended_mode") or ""), "", limit=80)
     allowed_modes = {
         "serial",
         "shared_worktree_parallel",
@@ -18712,52 +19490,102 @@ def _work_preprocessing_execution_directive(payload: dict[str, Any]) -> dict[str
     if not isinstance(raw_units, list) or not raw_units:
         raise ValueError("execution_directive requires at least one bounded work unit")
     units: list[dict[str, Any]] = []
+    seen_unit_ids: set[str] = set()
+    required_array_fields = (
+        "depends_on",
+        "repo_paths",
+        "write_scopes",
+        "required_skills",
+        "proof_expected",
+    )
     for index, value in enumerate(raw_units[:16]):
         if not isinstance(value, dict):
             raise ValueError(f"execution_directive work_units[{index}] must be an object")
-        unit_id = _clean_short_text(str(value.get("unit_id") or f"unit-{index + 1}"), "", limit=100)
+        unit_id = _clean_short_text(str(value.get("unit_id") or ""), "", limit=100)
         title = _clean_short_text(str(value.get("title") or ""), "", limit=180)
         scope = _body_excerpt(str(value.get("scope") or ""), limit=4000).strip()
         if not unit_id or not title or not scope:
             raise ValueError(
                 f"execution_directive work_units[{index}] requires unit_id, title, and scope"
             )
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", unit_id):
+            raise ValueError(f"execution_directive work_units[{index}] unit_id is invalid")
+        if unit_id in seen_unit_ids:
+            raise ValueError("execution_directive work unit ids must be unique")
+        seen_unit_ids.add(unit_id)
+        cleaned_arrays: dict[str, list[str]] = {}
+        for field in required_array_fields:
+            raw_values = value.get(field)
+            if not isinstance(raw_values, list):
+                raise ValueError(f"execution_directive work_units[{index}] {field} must be a list")
+            cleaned_arrays[field] = _clean_event_list(
+                raw_values,
+                limit=32 if field == "write_scopes" else 24,
+            )
         units.append(
             {
                 "unit_id": unit_id,
                 "title": title,
                 "scope": scope,
-                "depends_on": _clean_event_list(value.get("depends_on") or [], limit=16),
-                "repo_paths": _clean_event_list(value.get("repo_paths") or [], limit=16),
-                "write_scopes": _clean_event_list(value.get("write_scopes") or [], limit=32),
-                "required_skills": _clean_event_list(value.get("required_skills") or [], limit=24),
-                "proof_expected": _clean_event_list(value.get("proof_expected") or [], limit=24),
+                **cleaned_arrays,
             }
         )
 
-    def text_list(key: str, limit: int = 24) -> list[str]:
-        values = raw.get(key)
-        return _clean_event_list(values if isinstance(values, list) else [], limit=limit)
+    unit_ids = {unit["unit_id"] for unit in units}
+    for unit in units:
+        invalid_dependencies = [
+            dependency
+            for dependency in unit["depends_on"]
+            if dependency == unit["unit_id"] or dependency not in unit_ids
+        ]
+        if invalid_dependencies:
+            raise ValueError(
+                f"execution_directive work unit {unit['unit_id']} has invalid dependencies"
+            )
+
+    required_top_level_array_fields = (
+        "isolation_requirements",
+        "candidate_nodes",
+        "resource_requirements",
+        "required_context",
+        "cleanup_criteria",
+        "evidence",
+    )
+    top_level_errors = [
+        f"execution_directive {key} must be a list"
+        for key in required_top_level_array_fields
+        if not isinstance(raw.get(key), list)
+    ]
+
+    merge_owner = _clean_short_text(str(raw.get("merge_reconciliation_owner") or ""), "", limit=180)
+    if not merge_owner:
+        top_level_errors.append("execution_directive merge_reconciliation_owner is required")
+    timeout_behavior = _body_excerpt(
+        str(raw.get("timeout_checkin_failure_behavior") or ""), limit=4000
+    ).strip()
+    if not timeout_behavior:
+        top_level_errors.append("execution_directive timeout_checkin_failure_behavior is required")
+    if top_level_errors:
+        if len(top_level_errors) == 1:
+            raise ValueError(top_level_errors[0])
+        raise ValueError("execution_directive validation errors: " + "; ".join(top_level_errors))
+
+    def required_text_list(key: str, limit: int = 24) -> list[str]:
+        return _clean_event_list(raw[key], limit=limit)
 
     return {
         "schema": KANBAN_EXECUTION_DIRECTIVE_SCHEMA,
         "recommended_mode": mode,
         "rationale": rationale,
         "work_units": units,
-        "isolation_requirements": text_list("isolation_requirements"),
-        "candidate_nodes": text_list("candidate_nodes", 12),
-        "resource_requirements": text_list("resource_requirements"),
-        "required_context": text_list("required_context"),
-        "merge_reconciliation_owner": _clean_short_text(
-            str(raw.get("merge_reconciliation_owner") or "owning agent"),
-            "owning agent",
-            limit=180,
-        ),
-        "timeout_checkin_failure_behavior": _body_excerpt(
-            str(raw.get("timeout_checkin_failure_behavior") or ""), limit=4000
-        ),
-        "cleanup_criteria": text_list("cleanup_criteria"),
-        "evidence": text_list("evidence", 32),
+        "isolation_requirements": required_text_list("isolation_requirements"),
+        "candidate_nodes": required_text_list("candidate_nodes", 12),
+        "resource_requirements": required_text_list("resource_requirements"),
+        "required_context": required_text_list("required_context"),
+        "merge_reconciliation_owner": merge_owner,
+        "timeout_checkin_failure_behavior": timeout_behavior,
+        "cleanup_criteria": required_text_list("cleanup_criteria"),
+        "evidence": required_text_list("evidence", 32),
         "semantic_assessment": True,
         "lexical_trigger_used": False,
     }
@@ -18803,6 +19631,350 @@ def _work_preprocessing_proposal_entries(payload: dict[str, Any]) -> list[dict[s
             }
         )
     return entries
+
+
+def _work_preprocessing_validate_response_contract(
+    *,
+    payload: dict[str, Any],
+    item: Any,
+    discussions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    engineering_guidance = _work_preprocessing_guidance_selection(payload)
+    execution_directive = _work_preprocessing_execution_directive(payload)
+    proposal_entries = _work_preprocessing_proposal_entries(payload)
+    original_operator_requests = _work_preprocessing_original_operator_requests(
+        item,
+        discussions,
+    )
+    operator_request_assessment = _work_preprocessing_operator_request_assessment(
+        payload,
+        original_operator_requests,
+        execution_directive,
+    )
+    return {
+        "engineering_guidance": engineering_guidance,
+        "execution_directive": execution_directive,
+        "proposal_entries": proposal_entries,
+        "original_operator_requests": original_operator_requests,
+        "operator_request_assessment": operator_request_assessment,
+    }
+
+
+def _work_preprocessing_validation_repair_messages(
+    *,
+    messages: list[dict[str, str]],
+    ai: dict[str, Any],
+    validation_error: str,
+    source_hash: str,
+    marker_id: str,
+    item_id: str,
+) -> list[dict[str, str]]:
+    payload = ai.get("payload") if isinstance(ai.get("payload"), dict) else {}
+    serialized_payload = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload_bytes = len(serialized_payload.encode("utf-8"))
+    original_response: Any = payload
+    original_response_excerpt = ""
+    original_response_truncated = False
+    if payload_bytes > 64 * 1024:
+        original_response = None
+        original_response_excerpt = _body_excerpt(serialized_payload, limit=60_000)
+        original_response_truncated = True
+    repair_request = {
+        "schema": KANBAN_PREPROCESSING_VALIDATION_REPAIR_SCHEMA,
+        "task_kind": "kanban_preprocessing_validation_repair",
+        "attempt": 1,
+        "max_attempts": 1,
+        "item_id": item_id,
+        "marker_id": marker_id,
+        "document_source_hash": source_hash,
+        "validation_error": _body_excerpt(validation_error, limit=3000),
+        "original_response": original_response,
+        "original_response_excerpt": original_response_excerpt,
+        "original_response_sha256": _sha256_text(serialized_payload),
+        "original_response_bytes": payload_bytes,
+        "original_response_truncated": original_response_truncated,
+        "required_action": (
+            "Return one complete corrected JSON object for the original kanban_preprocessing "
+            "request, not a patch or explanation. Correct the stated validation failure and any "
+            "directly dependent schema defect while preserving the original bounded semantics."
+        ),
+        "execution_directive_contract": {
+            "recommended_mode_allowed_values": [
+                "serial",
+                "shared_worktree_parallel",
+                "isolated_worktrees",
+                "remote_node",
+                "delayed_overnight",
+            ],
+            "required_work_unit_fields": [
+                "unit_id",
+                "title",
+                "scope",
+                "depends_on",
+                "repo_paths",
+                "write_scopes",
+                "required_skills",
+                "proof_expected",
+            ],
+            "work_unit_array_fields": [
+                "depends_on",
+                "repo_paths",
+                "write_scopes",
+                "required_skills",
+                "proof_expected",
+            ],
+            "required_top_level_array_fields": [
+                "isolation_requirements",
+                "candidate_nodes",
+                "resource_requirements",
+                "required_context",
+                "cleanup_criteria",
+                "evidence",
+            ],
+            "required_nonempty_top_level_fields": [
+                "rationale",
+                "merge_reconciliation_owner",
+                "timeout_checkin_failure_behavior",
+            ],
+        },
+        "hard_rules": [
+            "Use the whole original bounded context; exact words and lexical matches never choose semantic mode or scope.",
+            "Do not invent broader authority, scope, nodes, paths, skills, or proof.",
+            "Preserve every source identity and original Operator request assessment requirement.",
+            "This is the only validation-guided repair attempt. A second invalid response remains a visible processor failure.",
+        ],
+    }
+    repaired_messages = [dict(message) for message in messages]
+    repaired_messages.append(
+        {
+            "role": "user",
+            "content": json.dumps(repair_request, ensure_ascii=True, sort_keys=True),
+        }
+    )
+    return repaired_messages
+
+
+async def _work_automation_local_ai_json_repair(
+    *,
+    messages: list[dict[str, str]],
+    run_id: str,
+    processor_kind: str,
+    source_hash: str,
+    state_identity: dict[str, Any],
+    required_route_id: str,
+) -> dict[str, Any]:
+    return await _work_automation_processor_profile_json_completion(
+        messages=messages,
+        run_id=run_id,
+        processor_kind=processor_kind,
+        source_hash=source_hash,
+        state_identity=state_identity,
+        required_route_id=required_route_id,
+    )
+
+
+def _work_preprocessing_attempts_with_phase(
+    ai: dict[str, Any],
+    phase: str,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **dict(attempt),
+            "validation_phase": phase,
+        }
+        for attempt in ai.get("model_attempts") or []
+        if isinstance(attempt, dict)
+    ]
+
+
+def _work_preprocessing_validation_repair_evidence(
+    *,
+    initial_ai: dict[str, Any],
+    repair_ai: dict[str, Any] | None,
+    initial_error: str,
+    repair_error: str,
+    source_hash: str,
+    marker_id: str,
+    item_id: str,
+) -> dict[str, Any]:
+    repair_ai = repair_ai if isinstance(repair_ai, dict) else {}
+    chosen_route_id = str(initial_ai.get("chosen_route_id") or "")
+    return {
+        "schema": KANBAN_PREPROCESSING_VALIDATION_REPAIR_SCHEMA,
+        "attempted": True,
+        "attempt_count": 1,
+        "max_attempts": 1,
+        "outcome": "repaired" if not repair_error else "exhausted",
+        "initial_validation_error": _body_excerpt(initial_error, limit=3000),
+        "repair_validation_error": _body_excerpt(repair_error, limit=3000),
+        "item_id": item_id,
+        "marker_id": marker_id,
+        "document_source_hash": source_hash,
+        "required_route_id": chosen_route_id,
+        "repair_route_id": repair_ai.get("chosen_route_id") or chosen_route_id,
+        "same_route": bool(
+            chosen_route_id
+            and (repair_ai.get("chosen_route_id") or chosen_route_id) == chosen_route_id
+        ),
+        "initial_prompt_sha256": initial_ai.get("prompt_sha256") or "",
+        "repair_prompt_sha256": repair_ai.get("prompt_sha256") or "",
+        "initial_response_id": initial_ai.get("response_id") or "",
+        "repair_response_id": repair_ai.get("response_id") or "",
+        "initial_finish_reason": initial_ai.get("finish_reason") or "",
+        "repair_finish_reason": repair_ai.get("finish_reason") or "",
+        "initial_usage": dict(initial_ai.get("usage") or {}),
+        "repair_usage": dict(repair_ai.get("usage") or {}),
+        "initial_max_tokens": int(initial_ai.get("max_tokens") or 0),
+        "repair_max_tokens": int(repair_ai.get("max_tokens") or 0),
+        "initial_content_length": int(initial_ai.get("content_length") or 0),
+        "repair_content_length": int(repair_ai.get("content_length") or 0),
+        "initial_content_excerpt_truncated": bool(initial_ai.get("content_excerpt_truncated")),
+        "repair_content_excerpt_truncated": bool(repair_ai.get("content_excerpt_truncated")),
+        "initial_content_excerpt": _body_excerpt(
+            str(initial_ai.get("content_excerpt") or ""), limit=2500
+        ),
+        "repair_content_excerpt": _body_excerpt(
+            str(repair_ai.get("content_excerpt") or ""), limit=2500
+        ),
+        "retry_ownership": {
+            "validation_repair": "one in-attempt same-route semantic repair",
+            "marker_retry": "existing capped Kanban marker backoff after exhausted repair",
+            "scheduler_retry": "transport/invocation failure only; never semantic reclassification",
+        },
+    }
+
+
+def _work_preprocessing_merge_repaired_ai(
+    *,
+    initial_ai: dict[str, Any],
+    repair_ai: dict[str, Any],
+    validation_repair: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(repair_ai)
+    merged["model_attempts"] = [
+        *_work_preprocessing_attempts_with_phase(initial_ai, "initial"),
+        *_work_preprocessing_attempts_with_phase(repair_ai, "validation_repair"),
+    ]
+    merged["latency_ms"] = round(
+        float(initial_ai.get("latency_ms") or 0) + float(repair_ai.get("latency_ms") or 0),
+        3,
+    )
+    merged["fallback_reason"] = initial_ai.get("fallback_reason") or ""
+    merged["source_hash"] = validation_repair["document_source_hash"]
+    merged["validation_repair"] = validation_repair
+    return merged
+
+
+async def _work_preprocessing_validate_with_one_repair(
+    *,
+    ai: dict[str, Any],
+    messages: list[dict[str, str]],
+    item: Any,
+    discussions: list[dict[str, Any]],
+    source_hash: str,
+    marker_id: str,
+    run_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = ai.get("payload") if isinstance(ai.get("payload"), dict) else {}
+    try:
+        return ai, _work_preprocessing_validate_response_contract(
+            payload=payload,
+            item=item,
+            discussions=discussions,
+        )
+    except ValueError as initial_exc:
+        initial_error = _body_excerpt(str(initial_exc), limit=3000)
+
+    chosen_route_id = _clean_short_text(str(ai.get("chosen_route_id") or ""), "", limit=80)
+    repair_ai: dict[str, Any] = {}
+    repair_error = ""
+    initial_attempts = _work_preprocessing_attempts_with_phase(ai, "initial")
+    if not chosen_route_id:
+        repair_error = "initial preprocessing response did not preserve a chosen semantic route"
+    else:
+        repair_messages = _work_preprocessing_validation_repair_messages(
+            messages=messages,
+            ai=ai,
+            validation_error=initial_error,
+            source_hash=source_hash,
+            marker_id=marker_id,
+            item_id=str(item["item_id"]),
+        )
+        try:
+            repair_ai = await _work_automation_local_ai_json_repair(
+                messages=repair_messages,
+                run_id=run_id,
+                processor_kind="preprocessing",
+                source_hash=source_hash,
+                state_identity={
+                    **dict(ai.get("state_identity") or {}),
+                    "item_id": str(item["item_id"]),
+                    "marker_id": marker_id,
+                    "validation_repair_attempt": "1",
+                },
+                required_route_id=chosen_route_id,
+            )
+            repair_ai = _work_automation_processor_ai_defaults(repair_ai, "preprocessing")
+            if repair_ai.get("chosen_route_id") != chosen_route_id:
+                raise ValueError("validation repair changed the selected semantic route")
+            repaired_contract = _work_preprocessing_validate_response_contract(
+                payload=repair_ai.get("payload")
+                if isinstance(repair_ai.get("payload"), dict)
+                else {},
+                item=item,
+                discussions=discussions,
+            )
+        except WorkProcessorRoutesExhausted as exc:
+            repair_error = str(exc)
+            repair_ai = {
+                "model_attempts": list(exc.attempts),
+                "chosen_route_id": chosen_route_id,
+            }
+        except ValueError as exc:
+            repair_error = _body_excerpt(str(exc), limit=3000)
+        else:
+            validation_repair = _work_preprocessing_validation_repair_evidence(
+                initial_ai=ai,
+                repair_ai=repair_ai,
+                initial_error=initial_error,
+                repair_error="",
+                source_hash=source_hash,
+                marker_id=marker_id,
+                item_id=str(item["item_id"]),
+            )
+            return (
+                _work_preprocessing_merge_repaired_ai(
+                    initial_ai=ai,
+                    repair_ai=repair_ai,
+                    validation_repair=validation_repair,
+                ),
+                repaired_contract,
+            )
+
+    validation_repair = _work_preprocessing_validation_repair_evidence(
+        initial_ai=ai,
+        repair_ai=repair_ai,
+        initial_error=initial_error,
+        repair_error=repair_error,
+        source_hash=source_hash,
+        marker_id=marker_id,
+        item_id=str(item["item_id"]),
+    )
+    attempts = [
+        *initial_attempts,
+        *_work_preprocessing_attempts_with_phase(repair_ai, "validation_repair"),
+    ]
+    raise WorkPreprocessingValidationRepairExhausted(
+        initial_error=initial_error,
+        repair_error=repair_error,
+        attempts=attempts,
+        validation_repair=validation_repair,
+    )
 
 
 def _materialize_work_review_proposal_entries_sync(
@@ -19074,6 +20246,15 @@ def _work_processor_prompt_variant(
         "request_sha256": _sha256_text(
             json.dumps(selected_messages, ensure_ascii=True, sort_keys=True)
         ),
+        "request_bytes": len(
+            json.dumps(
+                selected_messages,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ),
+        "message_count": len(selected_messages),
     }
     return selected_messages, evidence
 
@@ -19487,6 +20668,9 @@ def _work_preprocessing_local_ai_messages(
             "The unattended processor must not browse arbitrary skills or run implementation tools. The supplied catalog is the bounded skill-derived context; implementation cards may point the later implementation agent to its source_refs.",
             "For decomposition, put guidance_ids only on the child whose deliverable needs those patterns. Do not add database, HTTP, permission, browser, or event-loop work to unrelated children.",
             "Semantically assess execution candidacy from the whole deliverable and current state. Exact words such as parallel, branch, worktree, subagent, overnight, or node never decide recommended_mode.",
+            "For execution_directive.recommended_mode use exactly one underscore-delimited enum token: serial, shared_worktree_parallel, isolated_worktrees, remote_node, or delayed_overnight.",
+            "Every execution_directive work unit must include nonempty unit_id, title, and scope plus explicit depends_on, repo_paths, write_scopes, required_skills, and proof_expected arrays. Do not omit required fields or rely on server defaults.",
+            "Every execution_directive must also include explicit isolation_requirements, candidate_nodes, resource_requirements, required_context, cleanup_criteria, and evidence arrays plus nonempty rationale, merge_reconciliation_owner, and timeout_checkin_failure_behavior. Use empty arrays when no list values apply.",
             "Return proposal_entries=[] when no operator input is warranted; do not create INBOX noise for ordinary implementation uncertainty.",
         ],
         "required_output": {
@@ -20180,8 +21364,9 @@ def _retarget_work_preprocessing_marker_source_sync(
     *,
     original_source_hash: str,
     updated_source: dict[str, Any],
+    reason: str = "self_mutation",
 ) -> dict[str, Any]:
-    """Retarget one active attempt after its own deterministic tree/context writes."""
+    """Retarget one active attempt to the exact context it will process."""
     now = _utc_now_iso()
     with get_conn() as conn:
         row = conn.execute(
@@ -20195,12 +21380,19 @@ def _retarget_work_preprocessing_marker_source_sync(
         if row["document_source_hash"] != original_source_hash:
             raise HTTPException(409, "Preprocessing marker source changed during materialization")
         metadata = _json_value(row["metadata_json"], {})
-        metadata["self_mutation_retarget"] = {
-            "schema": "xarta.kanban.preprocessing.self_mutation_retarget.v1",
+        retarget_metadata = {
+            "schema": "xarta.kanban.preprocessing.source_retarget.v1",
             "original_source_hash": original_source_hash,
             "updated_source_hash": updated_source["document_source_hash"],
             "retargeted_at": now,
+            "reason": _clean_short_text(reason, "self_mutation", limit=120),
         }
+        metadata["source_retarget"] = retarget_metadata
+        if reason == "self_mutation":
+            metadata["self_mutation_retarget"] = {
+                **retarget_metadata,
+                "schema": "xarta.kanban.preprocessing.self_mutation_retarget.v1",
+            }
         conn.execute(
             """
             UPDATE kanban_review_processor_markers
@@ -20316,6 +21508,14 @@ async def _process_work_preprocessing_idle_marker(
     recent_decisions = context["recent_decisions"]
     hints = context["hints"]
     ancestor_context = context["ancestor_context"]
+    if marker["document_source_hash"] != source["document_source_hash"]:
+        marker = await _run_personal_sync_work(
+            _retarget_work_preprocessing_marker_source_sync,
+            marker["marker_id"],
+            original_source_hash=marker["document_source_hash"],
+            updated_source=source,
+            reason="context_refreshed_before_model_wait",
+        )
     messages = await _run_personal_sync_work(
         _work_preprocessing_local_ai_messages,
         item=item,
@@ -20332,21 +21532,27 @@ async def _process_work_preprocessing_idle_marker(
         messages=messages,
         run_id=run_id,
         processor_kind="preprocessing",
+        source_hash=source["document_source_hash"],
+        state_identity={
+            "item_id": item_id,
+            "marker_id": marker["marker_id"],
+        },
     )
     ai = _work_automation_processor_ai_defaults(ai, "preprocessing")
+    ai, validated_contract = await _work_preprocessing_validate_with_one_repair(
+        ai=ai,
+        messages=messages,
+        item=item,
+        discussions=discussions,
+        source_hash=source["document_source_hash"],
+        marker_id=marker["marker_id"],
+        run_id=run_id,
+    )
     payload = ai["payload"]
-    engineering_guidance = _work_preprocessing_guidance_selection(payload)
-    execution_directive = _work_preprocessing_execution_directive(payload)
-    proposal_entries = _work_preprocessing_proposal_entries(payload)
-    original_operator_requests = _work_preprocessing_original_operator_requests(
-        item,
-        discussions,
-    )
-    operator_request_assessment = _work_preprocessing_operator_request_assessment(
-        payload,
-        original_operator_requests,
-        execution_directive,
-    )
+    engineering_guidance = validated_contract["engineering_guidance"]
+    execution_directive = validated_contract["execution_directive"]
+    proposal_entries = validated_contract["proposal_entries"]
+    operator_request_assessment = validated_contract["operator_request_assessment"]
     if operator_request_assessment["requires_operator_input"] and not any(
         entry["lifecycle_required"] for entry in proposal_entries
     ):
@@ -21148,16 +22354,31 @@ async def _process_work_automation_claimed_marker(
         }
     except Exception as exc:
         failed_complete: dict[str, Any] | None = None
-        error_class = _work_review_failure_error_class(str(exc), {})
+        explicit_error_class = _clean_short_text(
+            str(getattr(exc, "error_class", "") or ""), "", limit=120
+        )
+        error_class = explicit_error_class or _work_review_failure_error_class(str(exc), {})
         route = await _run_personal_sync_work(
             _work_automation_processor_profile_route,
             processor_kind if processor_kind in KANBAN_PROCESSOR_PROFILE_SPECS else "review",
         )
-        route_attempts = list(exc.attempts) if isinstance(exc, WorkProcessorRoutesExhausted) else []
+        route_attempts = [
+            dict(attempt)
+            for attempt in list(getattr(exc, "attempts", []) or [])
+            if isinstance(attempt, dict)
+        ]
+        validation_repair = (
+            dict(getattr(exc, "validation_repair", {}) or {})
+            if processor_kind == "preprocessing"
+            else {}
+        )
+        chosen_route_id = _clean_short_text(
+            str(validation_repair.get("required_route_id") or ""), "", limit=80
+        )
         routing_failure = {
             "schema": KANBAN_PROCESSOR_ROUTING_ATTEMPTS_SCHEMA,
             "attempts": route_attempts,
-            "chosen_route_id": "",
+            "chosen_route_id": chosen_route_id,
             "chosen_provider": "",
             "chosen_model": "",
             "latency_ms": round(
@@ -21165,14 +22386,23 @@ async def _process_work_automation_claimed_marker(
                 3,
             ),
             "fallback_reason": (
-                f"all_configured_{processor_kind}_routes_failed"
+                "validation_repair_exhausted"
+                if validation_repair
+                else f"all_configured_{processor_kind}_routes_failed"
                 if route_attempts
                 else "processor_failed_before_model_routing"
             ),
             "source_hash": marker.get("document_source_hash") or "",
             "marker_id": marker.get("marker_id") or "",
             "lease_holder": holder_id,
-            "final_outcome": ("all_routes_failed" if route_attempts else "processor_failed"),
+            "validation_repair": validation_repair,
+            "final_outcome": (
+                "validation_repair_exhausted"
+                if validation_repair
+                else "all_routes_failed"
+                if route_attempts
+                else "processor_failed"
+            ),
         }
         with suppress(Exception):
             failed_complete = await complete_work_review_processor_marker(
@@ -21198,6 +22428,7 @@ async def _process_work_automation_claimed_marker(
                         "model_alias": route["model_alias"],
                         "error_class": error_class,
                         "model_routing": routing_failure,
+                        "validation_repair": validation_repair,
                     },
                 ),
             )
@@ -21214,12 +22445,13 @@ async def _process_work_automation_claimed_marker(
             "primary_provider": route["primary_provider"],
             "primary_model": route["primary_model"],
             "model_alias": route["model_alias"],
-            "chosen_route_id": "",
+            "chosen_route_id": chosen_route_id,
             "chosen_model": "",
             "model_attempt_count": len(route_attempts),
             "model_attempts": route_attempts,
             "latency_ms": routing_failure["latency_ms"],
             "fallback_reason": routing_failure["fallback_reason"],
+            "validation_repair": validation_repair,
             "final_outcome": routing_failure["final_outcome"],
         }
 
@@ -21238,7 +22470,10 @@ def _work_kanban_automation_shadow_snapshot_sync(
     clean_item_id = _clean_short_text(item_id or config["root_item_id"], "", limit=180)
     scan_limit = _clean_review_scan_limit(max_scan_items or config["max_scan_items"])
     now_dt = datetime.now(timezone.utc)
-    with _kanban_automation_scan_conn(operation="kanban_automation_shadow_snapshot") as conn:
+    with _kanban_automation_scan_conn(
+        operation="kanban_automation_shadow_snapshot",
+        transactional=False,
+    ) as conn:
         scope_ids = _work_scope_item_ids(conn, clean_item_id) if clean_item_id else []
         scope_args: list[Any] = []
         scope_where = ""
@@ -21405,7 +22640,10 @@ async def work_kanban_automation_shadow_snapshot(
 
 
 def _work_kanban_automation_tick_receipt_sync(tick_id: str) -> dict[str, Any] | None:
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(
+        operation="kanban_automation_tick_receipt",
+        transactional=False,
+    ) as conn:
         row = conn.execute(
             """
             SELECT * FROM kanban_audit_log
@@ -21435,7 +22673,9 @@ def _record_work_kanban_automation_tick_receipt_sync(
 ) -> dict[str, Any]:
     now = _utc_now_iso()
     audit_id = f"audit-kanban-scheduler-{hashlib.sha256(tick_id.encode()).hexdigest()[:24]}"
-    with get_conn() as conn:
+    with _kanban_automation_scan_conn(
+        operation="record_kanban_automation_tick_receipt",
+    ) as conn:
         _kanban_begin_write_transaction(conn)
         audit_row = _write_work_audit(
             conn,
@@ -24208,7 +25448,10 @@ def _get_work_automation_status_sync(
         )
     )
     idle_worker_config = _work_automation_idle_worker_config()
-    with _kanban_automation_scan_conn(operation="automation_status") as conn:
+    with _kanban_automation_scan_conn(
+        operation="automation_status",
+        transactional=False,
+    ) as conn:
         scope_ids: list[str] = []
         item_payload: dict[str, Any] | None = None
         if clean_item_id:
@@ -24229,10 +25472,24 @@ def _get_work_automation_status_sync(
             """,
             [*args, limit],
         ).fetchall()
-        recent_decisions = []
+        recent_decision_commit_ids: list[str] = []
+        recent_commit_ids_by_decision: list[list[str]] = []
         for row in rows:
             commit_ids = _json_value(row["commit_link_ids_json"], [])
-            commit_rows = _work_decision_commit_rows(conn, commit_ids)
+            clean_commit_ids = _clean_event_list(commit_ids, limit=64)
+            recent_commit_ids_by_decision.append(clean_commit_ids)
+            recent_decision_commit_ids.extend(clean_commit_ids)
+        recent_commit_rows_by_id = _work_commit_rows_by_id(
+            conn,
+            recent_decision_commit_ids,
+        )
+        recent_decisions = []
+        for row, commit_ids in zip(rows, recent_commit_ids_by_decision, strict=True):
+            commit_rows = [
+                recent_commit_rows_by_id[commit_id]
+                for commit_id in commit_ids
+                if commit_id in recent_commit_rows_by_id
+            ]
             recent_decisions.append(
                 _compact_work_review_decision(
                     _row_to_work_review_decision(
@@ -24336,11 +25593,20 @@ def _get_work_automation_status_sync(
             """,
             args,
         ).fetchone()
-        all_decision_rows = conn.execute(
+        decision_count = sum(int(row["count"]) for row in status_rows)
+        health_where = (
+            f"{where} {'AND' if where else 'WHERE'} "
+            "("
+            "status='hook_failed' "
+            "OR metadata_json LIKE '%\"hook_status\"%' "
+            "OR COALESCE(commit_link_ids_json, '') NOT IN ('', '[]', 'null')"
+            ")"
+        )
+        commit_health_rows = conn.execute(
             f"""
             SELECT decision_id, status, commit_link_ids_json, metadata_json
             FROM kanban_review_decisions
-            {where}
+            {health_where}
             """,
             args,
         ).fetchall()
@@ -24351,7 +25617,7 @@ def _get_work_automation_status_sync(
         )
         preprocessing_contract = _work_preprocessing_readiness_contract(raw_processing_policy)
         proposal_surfaces_contract = _work_proposal_surfaces_contract()
-        proposal_surfaces = _work_proposal_surfaces_status_sync(limit)
+        proposal_surfaces = _work_proposal_surfaces_status_from_conn(conn, limit)
         if include_contracts:
             proposal_surfaces["contract"] = proposal_surfaces_contract
         idle_worker_contract = _work_automation_idle_worker_contract()
@@ -24469,11 +25735,15 @@ def _get_work_automation_status_sync(
                 "next_retry_at": preprocessing_marker_stats["next_retry_at"],
             },
             "decisions": {
-                "count": len(all_decision_rows),
+                "count": decision_count,
                 "by_status": {row["status"]: int(row["count"]) for row in status_rows},
                 "recent": recent_decisions,
             },
-            "commit_link_health": _work_decision_commit_health(all_decision_rows, conn),
+            "commit_link_health": _work_decision_commit_health(
+                commit_health_rows,
+                conn,
+                decision_count=decision_count,
+            ),
         }
 
 
@@ -30228,9 +31498,18 @@ def _personal_source_counts_from_conn(conn: Any) -> dict[str, Any]:
 
 def _personal_source_counts() -> dict[str, Any]:
     now = _utc_now_iso()
-    with get_conn() as conn:
-        _sync_personal_import_status_batches(conn, now)
-        return _personal_source_counts_from_conn(conn)
+    rows = _prepare_personal_import_status_batches(now)
+    with _sqlite_get_conn() as sqlite_write_conn:
+        _sync_personal_import_status_batches(
+            sqlite_write_conn,
+            now,
+            rows=rows,
+        )
+    with _sqlite_get_read_conn(
+        busy_timeout_ms=100,
+        operation="personal_imports_dashboard_counts",
+    ) as sqlite_read_conn:
+        return _personal_source_counts_from_conn(sqlite_read_conn)
 
 
 def _git_activity_dashboard(counts: dict[str, Any]) -> dict[str, Any]:
@@ -30268,8 +31547,7 @@ def _git_activity_dashboard(counts: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@router.get("/imports-dashboard")
-async def get_imports_dashboard() -> dict[str, Any]:
+def _get_imports_dashboard_sync() -> dict[str, Any]:
     counts = _personal_source_counts()
     interests = _parse_interests_dashboard()
     openclaw_coverage = _openclaw_candidate_audit(interests)
@@ -30368,6 +31646,11 @@ async def get_imports_dashboard() -> dict[str, Any]:
             "timestamp": _utc_now_iso(),
         },
     }
+
+
+@router.get("/imports-dashboard")
+async def get_imports_dashboard() -> dict[str, Any]:
+    return await _run_personal_sync_work(_get_imports_dashboard_sync)
 
 
 def _resolve_file_ref(file_ref: str) -> Path:

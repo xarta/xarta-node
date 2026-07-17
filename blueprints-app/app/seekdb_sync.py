@@ -10,8 +10,9 @@ import time
 from collections import Counter
 from urllib.parse import urlparse
 
+from . import timing
 from .ai_client import embed
-from .db import get_conn, get_setting, increment_gen, set_setting
+from .db import get_conn, get_read_conn, get_setting, increment_gen, set_setting
 from .events import AppEvent, bus
 from .seekdb import (
     bookmark_embedding_by_normalized_url_async,
@@ -61,6 +62,7 @@ SYNC_TIMEOUT_SECONDS = 30.0
 SYNC_BACKOFF_BASE_SECONDS = 5.0
 SYNC_BACKOFF_MAX_SECONDS = 60.0
 SYNC_EVENT_DEDUPE_SECONDS = 300.0
+SEEKDB_SYNC_SQLITE_BUSY_TIMEOUT_MS = 100
 
 # Progress state for full reindex operations (in-memory, resets on restart)
 _reindex_state: dict = {"running": False, "done": 0, "total": 0, "error": None}
@@ -129,30 +131,38 @@ async def _publish_seekdb_status_event(
         payload=payload,
     )
     try:
-        with get_conn() as conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO events
-                  (event_id, event_type, severity, title, message, source, created_at, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.event_id,
-                    event.event_type,
-                    event.severity,
-                    event.title,
-                    event.message,
-                    event.source,
-                    event.created_at,
-                    json.dumps(event.payload),
-                ),
-            )
+        await timing.to_thread(
+            "seekdb_sync.status_event.persist",
+            _persist_seekdb_status_event_sync,
+            event,
+        )
     except Exception as exc:  # noqa: BLE001
         log.debug("seekdb_sync: failed to persist status event: %s", exc)
     try:
         await bus.publish(event)
     except Exception as exc:  # noqa: BLE001
         log.debug("seekdb_sync: failed to publish status event: %s", exc)
+
+
+def _persist_seekdb_status_event_sync(event: AppEvent) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO events
+              (event_id, event_type, severity, title, message, source, created_at, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                event.event_type,
+                event.severity,
+                event.title,
+                event.message,
+                event.source,
+                event.created_at,
+                json.dumps(event.payload),
+            ),
+        )
 
 
 async def _record_sync_failure(exc: BaseException) -> None:
@@ -220,21 +230,101 @@ def _parse_tags(tags_json: str) -> list[str]:
     return []
 
 
-def _get_excluded_tags() -> set[str]:
-    with get_conn() as conn:
-        val = get_setting(conn, SETTING_EXCLUDED_TAGS, DEFAULT_EXCLUDED_TAGS)
+def _excluded_tags_from_value(value: str | None) -> set[str]:
+    val = value or ""
     if not val:
         return set()
     return {t.strip().lower() for t in val.split(",") if t.strip()}
 
 
-def _get_rare_domains() -> set[str]:
-    with get_conn() as conn:
-        val = get_setting(conn, SETTING_RARE_DOMAINS, "[]")
+def _rare_domains_from_value(value: str | None) -> set[str]:
     try:
-        return set(json.loads(val or "[]"))
+        return set(json.loads(value or "[]"))
     except (json.JSONDecodeError, TypeError):
         return set()
+
+
+def _load_embedding_settings_sync() -> tuple[set[str], set[str]]:
+    with get_read_conn(
+        busy_timeout_ms=SEEKDB_SYNC_SQLITE_BUSY_TIMEOUT_MS,
+        operation="seekdb_sync_embedding_settings",
+    ) as conn:
+        excluded_value = get_setting(
+            conn,
+            SETTING_EXCLUDED_TAGS,
+            DEFAULT_EXCLUDED_TAGS,
+        )
+        rare_value = get_setting(conn, SETTING_RARE_DOMAINS, "[]")
+    return (
+        _excluded_tags_from_value(excluded_value),
+        _rare_domains_from_value(rare_value),
+    )
+
+
+def _load_reindex_source_sync() -> tuple[set[str], set[str], list[dict]]:
+    with get_read_conn(
+        busy_timeout_ms=SEEKDB_SYNC_SQLITE_BUSY_TIMEOUT_MS,
+        operation="seekdb_sync_reindex_source",
+    ) as conn:
+        excluded_value = get_setting(
+            conn,
+            SETTING_EXCLUDED_TAGS,
+            DEFAULT_EXCLUDED_TAGS,
+        )
+        rare_value = get_setting(conn, SETTING_RARE_DOMAINS, "[]")
+        rows = conn.execute("SELECT * FROM bookmarks ORDER BY updated_at ASC").fetchall()
+    return (
+        _excluded_tags_from_value(excluded_value),
+        _rare_domains_from_value(rare_value),
+        [dict(row) for row in rows],
+    )
+
+
+def _load_bookmark_rows_sync() -> list[dict]:
+    with get_read_conn(
+        busy_timeout_ms=SEEKDB_SYNC_SQLITE_BUSY_TIMEOUT_MS,
+        operation="seekdb_sync_bookmark_source",
+    ) as conn:
+        rows = conn.execute("SELECT * FROM bookmarks").fetchall()
+    return [dict(row) for row in rows]
+
+
+def _load_visit_rows_sync() -> list[dict]:
+    with get_read_conn(
+        busy_timeout_ms=SEEKDB_SYNC_SQLITE_BUSY_TIMEOUT_MS,
+        operation="seekdb_sync_visit_source",
+    ) as conn:
+        rows = conn.execute("SELECT * FROM visits").fetchall()
+    return [dict(row) for row in rows]
+
+
+def _bookmark_visit_stats_sync(
+    normalized_urls: list[str],
+) -> dict[str, tuple[int, str | None]]:
+    clean_urls = list(dict.fromkeys(str(value or "") for value in normalized_urls))
+    if not clean_urls:
+        return {}
+    placeholders = ",".join("?" for _ in clean_urls)
+    with get_read_conn(
+        busy_timeout_ms=SEEKDB_SYNC_SQLITE_BUSY_TIMEOUT_MS,
+        operation="seekdb_sync_bookmark_visit_stats",
+    ) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT normalized_url, COUNT(*) AS cnt, MAX(visited_at) AS last_v
+            FROM visits
+            WHERE normalized_url IN ({placeholders})
+            GROUP BY normalized_url
+            """,
+            clean_urls,
+        ).fetchall()
+    return {
+        str(row["normalized_url"] or ""): (
+            int(row["cnt"] or 0),
+            row["last_v"],
+        )
+        for row in rows
+    }
 
 
 def _sld_from_netloc(netloc: str) -> str:
@@ -286,7 +376,10 @@ def analyze_domains(threshold: int | None = None) -> list[str]:
 
     Returns the sorted list of rare domain hostnames.
     """
-    with get_conn() as conn:
+    with get_read_conn(
+        busy_timeout_ms=SEEKDB_SYNC_SQLITE_BUSY_TIMEOUT_MS,
+        operation="seekdb_sync_analyze_domains_source",
+    ) as conn:
         if threshold is None:
             threshold = int(
                 get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD)
@@ -367,13 +460,10 @@ async def reindex_all() -> None:
     global _reindex_state
     _reindex_state = {"running": True, "done": 0, "total": 0, "error": None}
     try:
-        excluded_tags = _get_excluded_tags()
-        rare_domains = _get_rare_domains()
-
-        with get_conn() as conn:
-            rows = conn.execute("SELECT * FROM bookmarks ORDER BY updated_at ASC").fetchall()
-
-        row_dicts = [dict(r) for r in rows]
+        excluded_tags, rare_domains, row_dicts = await timing.to_thread(
+            "seekdb_sync.reindex_source",
+            _load_reindex_source_sync,
+        )
         _reindex_state["total"] = len(row_dicts)
         log.info(
             "reindex_all: starting, %d bookmarks, excluded_tags=%r, rare_domains=%d",
@@ -387,21 +477,23 @@ async def reindex_all() -> None:
             texts = [_build_bookmark_text(row, excluded_tags, rare_domains) for row in batch]
             embeddings = await _embed_texts(texts)
 
-            with get_conn() as conn:
-                for idx, row in enumerate(batch):
-                    stats = conn.execute(
-                        "SELECT COUNT(*) AS cnt, MAX(visited_at) AS last_v FROM visits WHERE normalized_url = ?",
-                        (row["normalized_url"],),
-                    ).fetchone()
-                    visit_count = int(stats["cnt"] if stats else 0)
-                    last_visited = stats["last_v"] if stats else None
-                    await upsert_bookmark_index_async(
-                        row=row,
-                        embedding=embeddings[idx],
-                        visit_count=visit_count,
-                        last_visited=last_visited,
-                        document=texts[idx],
-                    )
+            stats_by_url = await timing.to_thread(
+                "seekdb_sync.reindex_visit_stats",
+                _bookmark_visit_stats_sync,
+                [str(row.get("normalized_url") or "") for row in batch],
+            )
+            for idx, row in enumerate(batch):
+                visit_count, last_visited = stats_by_url.get(
+                    str(row.get("normalized_url") or ""),
+                    (0, None),
+                )
+                await upsert_bookmark_index_async(
+                    row=row,
+                    embedding=embeddings[idx],
+                    visit_count=visit_count,
+                    last_visited=last_visited,
+                    document=texts[idx],
+                )
 
             _reindex_state["done"] = min(i + EMBED_BATCH_SIZE, len(row_dicts))
 
@@ -445,9 +537,11 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
     updated_at stored in SeekDB metadata at the time it was last embedded.
     Returns (embedded_count, deleted_count).
     """
-    with get_conn() as conn:
-        sqlite_rows = conn.execute("SELECT * FROM bookmarks").fetchall()
-    sqlite_dict = {r["bookmark_id"]: dict(r) for r in sqlite_rows}
+    sqlite_rows = await timing.to_thread(
+        "seekdb_sync.bookmark_source",
+        _load_bookmark_rows_sync,
+    )
+    sqlite_dict = {row["bookmark_id"]: row for row in sqlite_rows}
 
     try:
         raw_ids, raw_metas = await bookmark_index_metadata_async()
@@ -480,35 +574,29 @@ async def _sync_bookmarks_stale() -> tuple[int, int]:
     # Stale rows not processed here will be picked up next cycle.
     stale = stale[:SYNC_MAX_STALE_PER_CYCLE]
 
-    excluded_tags = _get_excluded_tags()
-    rare_domains = _get_rare_domains()
+    excluded_tags, rare_domains = await timing.to_thread(
+        "seekdb_sync.embedding_settings",
+        _load_embedding_settings_sync,
+    )
     texts = [_build_bookmark_text(row, excluded_tags, rare_domains) for row in stale]
     embeddings = await _embed_texts(texts)
 
-    prepared: list[tuple[dict, list[float], int, str | None, str]] = []
-    with get_conn() as conn:
-        for idx, row in enumerate(stale):
-            stats = conn.execute(
-                "SELECT COUNT(*) AS cnt, MAX(visited_at) AS last_v FROM visits WHERE normalized_url = ?",
-                (row["normalized_url"],),
-            ).fetchone()
-            prepared.append(
-                (
-                    row,
-                    embeddings[idx],
-                    int(stats["cnt"] if stats else 0),
-                    stats["last_v"] if stats else None,
-                    texts[idx],
-                )
-            )
-
-    for row, embedding, visit_count, last_visited, document in prepared:
+    stats_by_url = await timing.to_thread(
+        "seekdb_sync.bookmark_visit_stats",
+        _bookmark_visit_stats_sync,
+        [str(row.get("normalized_url") or "") for row in stale],
+    )
+    for idx, row in enumerate(stale):
+        visit_count, last_visited = stats_by_url.get(
+            str(row.get("normalized_url") or ""),
+            (0, None),
+        )
         await upsert_bookmark_index_async(
             row=row,
-            embedding=embedding,
+            embedding=embeddings[idx],
             visit_count=visit_count,
             last_visited=last_visited,
-            document=document,
+            document=texts[idx],
         )
 
     return len(stale), deleted
@@ -521,9 +609,11 @@ async def _sync_visits_stale() -> tuple[int, int]:
     avoiding an unnecessary LiteLLM call.
     Returns (embedded_count, deleted_count).
     """
-    with get_conn() as conn:
-        sqlite_rows = conn.execute("SELECT * FROM visits").fetchall()
-    sqlite_dict = {r["visit_id"]: dict(r) for r in sqlite_rows}
+    sqlite_rows = await timing.to_thread(
+        "seekdb_sync.visit_source",
+        _load_visit_rows_sync,
+    )
+    sqlite_dict = {row["visit_id"]: row for row in sqlite_rows}
 
     try:
         raw_ids, raw_metas = await visit_index_metadata_async()

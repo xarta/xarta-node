@@ -42,7 +42,7 @@ os.environ.setdefault("SEEKDB_DB", "blueprints_test")
 os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
-from app import routes_sync  # noqa: E402
+from app import db, routes_sync, timing  # noqa: E402
 from app.models import SyncAction  # noqa: E402
 
 
@@ -89,15 +89,16 @@ def test_sync_status_reads_queue_depths_with_single_sqlite_connection(monkeypatc
         "INSERT INTO sync_queue (target_node_id, sent) VALUES (?, ?)",
         [("peer-a", 0), ("peer-a", 0), ("peer-a", 1)],
     )
+    conn.commit()
     opened = []
 
     @contextmanager
-    def fake_get_conn():
+    def fake_get_read_conn(**kwargs):
         opened.append("open")
+        assert kwargs == {"busy_timeout_ms": 100, "operation": "sync_status"}
         yield conn
-        conn.commit()
 
-    monkeypatch.setattr(routes_sync, "get_conn", fake_get_conn)
+    monkeypatch.setattr(routes_sync, "get_read_conn", fake_get_read_conn)
     monkeypatch.setattr(routes_sync.cfg, "NODE_ID", "self")
     monkeypatch.setattr(routes_sync.cfg, "NODE_NAME", "Self Node")
 
@@ -107,6 +108,48 @@ def test_sync_status_reads_queue_depths_with_single_sqlite_connection(monkeypatc
     assert status.gen == 42
     assert status.queue_depths == {"peer-a": 2, "peer-b": 0}
     assert status.peer_count == 2
+    assert conn.in_transaction is False
+
+
+def test_read_only_sqlite_connection_records_open_setup_use_and_close_stages(
+    tmp_path,
+    monkeypatch,
+):
+    timing.reset_for_tests()
+    db_path = tmp_path / "timing-read.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE sample (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sample (value) VALUES ('ok')")
+    monkeypatch.setattr(db.cfg, "DB_PATH", str(db_path))
+
+    with db.get_read_conn(operation="unit_read") as conn:
+        assert conn.execute("SELECT value FROM sample").fetchone()[0] == "ok"
+
+    rows = timing.snapshot()
+    assert [row["event"] for row in rows] == [
+        "sqlite_connection.open",
+        "sqlite_connection.setup",
+        "sqlite_connection.use",
+        "sqlite_connection.close",
+        "sqlite_connection",
+    ]
+    assert all(row["operation"] == "unit_read" for row in rows)
+    assert all(row["readonly"] is True for row in rows)
+
+
+def test_sync_status_returns_retryable_503_when_sqlite_read_is_locked(monkeypatch):
+    async def locked_status():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(routes_sync, "_sync_status_coalesced", locked_status)
+
+    try:
+        asyncio.run(routes_sync.sync_status())
+    except routes_sync.HTTPException as exc:
+        assert exc.status_code == 503
+        assert exc.detail == "database_locked"
+    else:
+        raise AssertionError("expected sync status to fail fast with HTTP 503")
 
 
 def test_sync_status_coalesces_inflight_and_short_cache(monkeypatch):

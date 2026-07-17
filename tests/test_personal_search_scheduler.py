@@ -150,10 +150,15 @@ def test_source_signature_covers_imports_and_discussions(monkeypatch):
         conn.execute(f"CREATE TABLE {table} (record_id TEXT, updated_at TEXT)")
 
     @contextmanager
-    def fake_conn():
+    def fake_conn(**_kwargs):
         yield conn
 
-    monkeypatch.setattr(scheduler.routes_personal, "get_conn", fake_conn)
+    monkeypatch.setattr(scheduler.routes_personal, "_sqlite_get_read_conn", fake_conn)
+    monkeypatch.setattr(
+        scheduler.routes_personal,
+        "_kanban_active_store_is_postgres",
+        lambda: False,
+    )
     first = scheduler._source_signature_sync()
     second = scheduler._source_signature_sync()
     assert first == second
@@ -166,6 +171,70 @@ def test_source_signature_covers_imports_and_discussions(monkeypatch):
     conn.execute("INSERT INTO kanban_discussions VALUES ('discussion-1', '2026-07-15T12:00:01Z')")
     after_discussion = scheduler._source_signature_sync()
     assert after_discussion["source_signature"] != after_import["source_signature"]
+
+
+def test_source_signature_separates_sqlite_and_nontransactional_postgres(monkeypatch):
+    sqlite_conn = sqlite3.connect(":memory:")
+    sqlite_conn.row_factory = sqlite3.Row
+    postgres_conn = sqlite3.connect(":memory:")
+    postgres_conn.row_factory = sqlite3.Row
+    for table in scheduler.PERSONAL_SOURCE_TABLES:
+        sqlite_conn.execute(f"CREATE TABLE {table} (record_id TEXT, updated_at TEXT)")
+        sqlite_conn.execute(
+            f"INSERT INTO {table} VALUES (?, ?)",
+            (f"{table}-row", "2026-07-16T15:00:00Z"),
+        )
+    for table in scheduler.KANBAN_SOURCE_TABLES:
+        postgres_conn.execute(f"CREATE TABLE {table} (record_id TEXT, updated_at TEXT)")
+        postgres_conn.execute(
+            f"INSERT INTO {table} VALUES (?, ?)",
+            (f"{table}-row", "2026-07-16T15:00:01Z"),
+        )
+
+    lifecycle = []
+
+    @contextmanager
+    def sqlite_read(**kwargs):
+        assert kwargs == {
+            "busy_timeout_ms": 100,
+            "operation": "personal_search_source_signature",
+        }
+        lifecycle.append("sqlite-open")
+        try:
+            yield sqlite_conn
+        finally:
+            lifecycle.append("sqlite-close")
+
+    @contextmanager
+    def postgres_read(**kwargs):
+        assert kwargs == {
+            "operation": "personal_search_source_signature",
+            "transactional": False,
+        }
+        lifecycle.append("postgres-open")
+        try:
+            yield postgres_conn
+        finally:
+            lifecycle.append("postgres-close")
+
+    monkeypatch.setattr(scheduler.routes_personal, "_sqlite_get_read_conn", sqlite_read)
+    monkeypatch.setattr(scheduler.routes_personal, "_kanban_postgres_get_conn", postgres_read)
+    monkeypatch.setattr(
+        scheduler.routes_personal,
+        "_kanban_active_store_is_postgres",
+        lambda: True,
+    )
+
+    signature = scheduler._source_signature_sync()
+
+    assert [item["table"] for item in signature["tables"]] == list(scheduler.SOURCE_TABLES)
+    assert signature["source_rows"] == len(scheduler.SOURCE_TABLES)
+    assert lifecycle == [
+        "sqlite-open",
+        "sqlite-close",
+        "postgres-open",
+        "postgres-close",
+    ]
 
 
 @async_test

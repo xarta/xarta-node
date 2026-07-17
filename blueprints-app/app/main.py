@@ -22,8 +22,8 @@ from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import Response
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -36,6 +36,10 @@ from .kanban_automation_scheduler import router as kanban_automation_scheduler_r
 from .kanban_automation_scheduler import (
     start_kanban_automation_scheduler,
     stop_kanban_automation_scheduler,
+)
+from .kanban_postgres import (
+    KanbanPostgresPoolTimeout,
+    close_postgres_candidate_pools,
 )
 from .middleware_auth import AuthMiddleware
 from .personal_search_scheduler import router as personal_search_scheduler_router
@@ -140,6 +144,24 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
+
+
+async def _handle_kanban_postgres_pool_timeout(
+    _request: Request,
+    exc: KanbanPostgresPoolTimeout,
+) -> JSONResponse:
+    log.warning("kanban_postgres_pool_saturated: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={
+            "detail": "Kanban Postgres is busy; retry shortly.",
+            "error": {
+                "code": "kanban_postgres_pool_saturated",
+                "retryable": True,
+            },
+        },
+    )
 
 
 class ProcessTimingHeaderMiddleware:
@@ -351,6 +373,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await _cancel_background_task(timing_lag_task, "timing_event_loop_lag_sampler")
     await _cancel_background_task(timing_disk_task, "timing_disk_log_writer")
     await _close_work_processor_http_clients()
+    await timing.to_thread("kanban.postgres_pool_close", close_postgres_candidate_pools)
     await stop_seekdb_sync_loop()
     await stop_drain_loop()
 
@@ -511,6 +534,10 @@ def create_app() -> FastAPI:
         description="Distributed peer-to-peer service index",
         version="0.1.0",
         lifespan=lifespan,
+    )
+    application.add_exception_handler(
+        KanbanPostgresPoolTimeout,
+        _handle_kanban_postgres_pool_timeout,
     )
 
     # App-side timing header used by local contention probes to distinguish

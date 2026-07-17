@@ -14,6 +14,7 @@ import sqlite3
 import time
 from contextlib import contextmanager, suppress
 from typing import Generator
+from urllib.parse import quote
 
 from . import config as cfg
 from . import timing
@@ -2536,6 +2537,60 @@ def get_conn() -> Generator[sqlite3.Connection, None, None]:
             if commit_start_ns and commit_end_ns
             else None,
         )
+
+
+@contextmanager
+def get_read_conn(
+    *,
+    busy_timeout_ms: int = 100,
+    operation: str = "read",
+) -> Generator[sqlite3.Connection, None, None]:
+    """Yield a bounded read-only connection with stage-level timing."""
+    timeout_ms = max(0, int(busy_timeout_ms))
+    db_uri = f"file:{quote(cfg.DB_PATH)}?mode=ro"
+    with timing.span(
+        "sqlite_connection",
+        db_path=cfg.DB_PATH,
+        readonly=True,
+        operation=operation,
+    ):
+        with timing.span(
+            "sqlite_connection.open",
+            db_path=cfg.DB_PATH,
+            readonly=True,
+            operation=operation,
+        ):
+            conn = sqlite3.connect(
+                db_uri,
+                uri=True,
+                check_same_thread=False,
+                timeout=timeout_ms / 1000,
+                isolation_level=None,
+            )
+        conn.row_factory = sqlite3.Row
+        with timing.span(
+            "sqlite_connection.setup",
+            db_path=cfg.DB_PATH,
+            readonly=True,
+            operation=operation,
+        ):
+            conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
+        try:
+            with timing.span(
+                "sqlite_connection.use",
+                db_path=cfg.DB_PATH,
+                readonly=True,
+                operation=operation,
+            ):
+                yield conn
+        finally:
+            with timing.span(
+                "sqlite_connection.close",
+                db_path=cfg.DB_PATH,
+                readonly=True,
+                operation=operation,
+            ):
+                conn.close()
 
 
 def increment_gen(conn: sqlite3.Connection, source: str = "human") -> int:

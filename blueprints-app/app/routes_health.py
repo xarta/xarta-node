@@ -6,13 +6,12 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Generator
-from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
 
 from . import config as cfg
 from . import timing
-from .db import get_gen, get_meta
+from .db import get_gen, get_meta, get_read_conn
 from .models import HealthOut, RepoVersionOut, RepoVersionsOut
 
 router = APIRouter(tags=["health"])
@@ -138,26 +137,12 @@ async def health() -> HealthOut:
 
 @contextmanager
 def get_health_conn() -> Generator[sqlite3.Connection, None, None]:
-    """Open a read-only health connection without per-request WAL pragmas."""
-    db_uri = f"file:{quote(cfg.DB_PATH)}?mode=ro"
-    with timing.span(
-        "sqlite_connection",
-        db_path=cfg.DB_PATH,
-        readonly=True,
+    """Use the shared bounded read-only connection contract for health."""
+    with get_read_conn(
+        busy_timeout_ms=_HEALTH_SQLITE_BUSY_TIMEOUT_MS,
         operation="health",
-    ):
-        conn = sqlite3.connect(
-            db_uri,
-            uri=True,
-            check_same_thread=False,
-            timeout=_HEALTH_SQLITE_BUSY_TIMEOUT_MS / 1000,
-        )
-        conn.row_factory = sqlite3.Row
-        conn.execute(f"PRAGMA busy_timeout={_HEALTH_SQLITE_BUSY_TIMEOUT_MS}")
-        try:
-            yield conn
-        finally:
-            conn.close()
+    ) as conn:
+        yield conn
 
 
 def _health_sync() -> HealthOut:
