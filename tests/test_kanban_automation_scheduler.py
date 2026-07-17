@@ -550,6 +550,103 @@ async def test_manual_tick_preserves_request_identity(monkeypatch):
 
 
 @async_test
+async def test_operator_authorized_preprocessing_recovery_keeps_requester_separate(
+    monkeypatch,
+):
+    captured = {}
+
+    def worker_config():
+        return {
+            "enabled": True,
+            "manual_recovery_enabled": True,
+            "runs_on_this_node": True,
+            "current_node_id": "test-node",
+            "owner_node_id": "test-node",
+            "producer_mode": "scheduler",
+            "singleton_override": {},
+        }
+
+    async def fake_sync(func, *args, **kwargs):
+        if func is routes_personal._work_operator_authorized_preprocessing_recovery_preflight_sync:
+            assert args == ("leaf-1",)
+            return {"ok": True, "reason": "initial_missing_or_queued"}
+        if func is routes_personal._work_automation_processor_profile_drift:
+            assert args == ("preprocessing",)
+            return {"problems": [], "warnings": []}
+        raise AssertionError(f"unexpected sync function: {func}")
+
+    async def fake_tick(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "effective_enabled": True, "processed_count": 1}
+
+    monkeypatch.setattr(routes_personal, "_work_automation_idle_worker_config", worker_config)
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", fake_sync)
+    monkeypatch.setattr(routes_personal, "run_work_kanban_automation_idle_tick", fake_tick)
+
+    result = await routes_personal.trigger_work_operator_authorized_preprocessing_recovery(
+        routes_personal.WorkOperatorAuthorizedPreprocessingRecoveryRequest(
+            item_id="leaf-1",
+            operator_authorized=True,
+            authorization_ref="operator-turn-2026-07-17",
+            actor="codex",
+            source_surface="blueprints-work-management",
+            request_id="request-1",
+            run_id="run-1",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "operator_authorized_preprocessing_triggered"
+    assert result["requester"] == {
+        "actor": "codex",
+        "source_surface": "blueprints-work-management",
+        "request_id": "request-1",
+        "run_id": "run-1",
+    }
+    assert captured["item_id"] == "leaf-1"
+    assert captured["max_scan_items"] == 1
+    assert captured["max_process_items"] == 1
+    assert captured["processor_kind"] == "preprocessing"
+    assert captured["holder_id"] == "kanban-idle-worker"
+    assert captured["actor"] == "kanban-idle-worker"
+    assert captured["source_surface"] == "kanban-automation-idle-worker"
+    initiation = captured["source_metadata_extra"]["operator_authorized_recovery"]
+    assert initiation["authorization_ref"] == "operator-turn-2026-07-17"
+    assert initiation["requester"] == result["requester"]
+
+
+@async_test
+async def test_operator_authorized_preprocessing_recovery_requires_explicit_authorization(
+    monkeypatch,
+):
+    called = False
+
+    def forbidden_preflight(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("preflight must not run without explicit authorization")
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_operator_authorized_preprocessing_recovery_preflight_sync",
+        forbidden_preflight,
+    )
+    result = await routes_personal.trigger_work_operator_authorized_preprocessing_recovery(
+        routes_personal.WorkOperatorAuthorizedPreprocessingRecoveryRequest(
+            item_id="leaf-1",
+            operator_authorized=False,
+            authorization_ref="",
+            actor="codex",
+            source_surface="blueprints-work-management",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "operator_authorization_required"
+    assert called is False
+
+
+@async_test
 async def test_blocker_resolver_command_is_fixed_and_bounded(monkeypatch):
     seen = {}
 
