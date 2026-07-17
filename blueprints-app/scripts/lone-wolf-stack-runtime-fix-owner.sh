@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Repair known container-runtime ownership exceptions under node-local stacks.
+# Audit or repair known ownership sentinels under node-local stacks.
 
 set -euo pipefail
 
 LONE_WOLF_ROOT="${LONE_WOLF_ROOT:-/xarta-node/.lone-wolf}"
 STACKS_DIR="${STACKS_DIR:-$LONE_WOLF_ROOT/stacks}"
-MODE="apply"
+MODE="check"
+AUDIT_LEVEL="default"
 VERBOSE="${VERBOSE:-0}"
 
 usage() {
     cat <<'EOF'
-Usage: lone-wolf-stack-runtime-fix-owner.sh [--check] [--apply] [--verbose]
+Usage: lone-wolf-stack-runtime-fix-owner.sh [--check] [--apply] [--expanded] [--verbose]
 
-Repairs known service-owned runtime mounts under /xarta-node/.lone-wolf/stacks.
-It intentionally does not normalize source/docs ownership.
+The default is a bounded, read-only check of known service ownership sentinels.
+--expanded recursively checks those service paths without crossing filesystems;
+it is read-only and can be expensive.  --apply repairs only the known path
+itself, never all of its descendants.  Source, docs, Syncthing trees, caches,
+backups, databases, and other runtime state are not generically normalized.
 EOF
 }
 
@@ -24,6 +28,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --apply)
             MODE="apply"
+            ;;
+        --expanded)
+            AUDIT_LEVEL="expanded"
             ;;
         --verbose)
             VERBOSE="1"
@@ -41,6 +48,11 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+if [[ "$MODE" == "apply" && "$AUDIT_LEVEL" == "expanded" ]]; then
+    echo "ERROR: expanded audit is read-only; run checking and repair separately" >&2
+    exit 2
+fi
+
 [[ -d "$STACKS_DIR" ]] || exit 0
 
 drift=0
@@ -57,17 +69,25 @@ repair_path() {
     local owner_drift=0
     local mode_drift=0
 
-    if find "$path" -xdev \( ! -uid "${owner%:*}" -o ! -gid "${owner#*:}" \) -print -quit 2>/dev/null | grep -q .; then
-        owner_drift=1
-    fi
-
-    if [[ -n "$mode" ]]; then
-        while IFS= read -r item; do
-            [[ "$(stat -c '%a' "$item")" == "$mode" ]] || {
-                mode_drift=1
-                break
-            }
-        done < <(find "$path" -xdev -print 2>/dev/null)
+    if [[ "$AUDIT_LEVEL" == "expanded" ]]; then
+        if find -P "$path" -xdev \( ! -uid "${owner%:*}" -o ! -gid "${owner#*:}" \) -print -quit 2>/dev/null | grep -q .; then
+            owner_drift=1
+        fi
+        if [[ -n "$mode" ]]; then
+            while IFS= read -r -d '' item; do
+                [[ "$(stat -c '%a' -- "$item")" == "$mode" ]] || {
+                    mode_drift=1
+                    break
+                }
+            done < <(find -P "$path" -xdev -print0 2>/dev/null)
+        fi
+    else
+        if [[ "$(stat -c '%u:%g' -- "$path")" != "$owner" ]]; then
+            owner_drift=1
+        fi
+        if [[ -n "$mode" && "$(stat -c '%a' -- "$path")" != "$mode" ]]; then
+            mode_drift=1
+        fi
     fi
 
     if [[ "$owner_drift" == "0" && "$mode_drift" == "0" ]]; then
@@ -81,11 +101,11 @@ repair_path() {
         return 0
     fi
 
-    if [[ "$owner_drift" == "1" ]]; then
-        find "$path" -xdev \( ! -uid "${owner%:*}" -o ! -gid "${owner#*:}" \) -exec chown "$owner" {} +
-    fi
+    # Apply is intentionally sentinel-only.  Distribution workflows must use
+    # their exact touched-path manifest for copied/replaced descendants.
+    [[ "$owner_drift" == "1" ]] && chown --no-dereference "$owner" "$path"
     if [[ "$mode_drift" == "1" ]]; then
-        find "$path" -xdev ! -perm "$mode" -exec chmod "$mode" {} +
+        chmod "$mode" "$path"
     fi
     changed=$((changed + 1))
     [[ "$VERBOSE" == "1" ]] && echo "FIXED: $label $path owner=$owner${mode:+ mode=$mode}"
@@ -124,7 +144,7 @@ repair_path_self() {
     fi
 
     if [[ "$owner_drift" == "1" ]]; then
-        chown "$owner" "$path"
+        chown --no-dereference "$owner" "$path"
     fi
     if [[ "$mode_drift" == "1" ]]; then
         chmod "$mode" "$path"
@@ -216,4 +236,4 @@ if [[ "$MODE" == "check" && "$drift" -gt 0 ]]; then
     exit 1
 fi
 
-[[ "$VERBOSE" == "1" ]] && echo "runtime_owner_guard mode=$MODE drift=$drift changed=$changed"
+[[ "$VERBOSE" == "1" ]] && echo "runtime_owner_guard mode=$MODE audit_level=$AUDIT_LEVEL drift=$drift changed=$changed"
