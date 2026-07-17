@@ -39,7 +39,7 @@ OWNER_CRON_MARKER="lone-wolf-docs-fix-owner"
 OWNER_CRON_LINE="* * * * * root bash $OWNER_FIX_SCRIPT"
 STACK_RUNTIME_OWNER_CRON_FILE="/etc/cron.d/lone-wolf-stack-runtime-owner"
 STACK_RUNTIME_OWNER_CRON_MARKER="lone-wolf-stack-runtime-fix-owner"
-STACK_RUNTIME_OWNER_CRON_LINE="* * * * * root bash $STACK_RUNTIME_OWNER_FIX_SCRIPT"
+STACK_RUNTIME_OWNER_CRON_LINE="* * * * * root bash $STACK_RUNTIME_OWNER_FIX_SCRIPT --check"
 
 commit_gitignore_change() {
     local message="$1"
@@ -126,11 +126,11 @@ else
     echo "  docs-owner-cron: already installed — OK"
 fi
 
-if ! grep -q "$STACK_RUNTIME_OWNER_CRON_MARKER" "$STACK_RUNTIME_OWNER_CRON_FILE" 2>/dev/null; then
-    echo "# $STACK_RUNTIME_OWNER_CRON_MARKER" > "$STACK_RUNTIME_OWNER_CRON_FILE"
-    echo "$STACK_RUNTIME_OWNER_CRON_LINE" >> "$STACK_RUNTIME_OWNER_CRON_FILE"
+if [[ "$(cat "$STACK_RUNTIME_OWNER_CRON_FILE" 2>/dev/null || true)" != "# $STACK_RUNTIME_OWNER_CRON_MARKER
+$STACK_RUNTIME_OWNER_CRON_LINE" ]]; then
+    printf '# %s\n%s\n' "$STACK_RUNTIME_OWNER_CRON_MARKER" "$STACK_RUNTIME_OWNER_CRON_LINE" > "$STACK_RUNTIME_OWNER_CRON_FILE"
     chmod 644 "$STACK_RUNTIME_OWNER_CRON_FILE"
-    echo "  stack-runtime-owner-cron: installed — runtime ownership guard runs every minute"
+    echo "  stack-runtime-owner-cron: installed — bounded read-only sentinel check runs every minute"
 else
     echo "  stack-runtime-owner-cron: already installed — OK"
 fi
