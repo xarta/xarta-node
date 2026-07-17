@@ -11605,6 +11605,31 @@ def test_work_automation_idle_tick_does_not_claim_markers_queued_mid_tick(monkey
             ),
         )
     )
+    processed_row = routes_personal._work_preprocessing_marker_row(
+        existing=None,
+        item_id="work-preprocess-snapshot-second",
+        source=second_source,
+        meta={
+            "actor": "codex-test",
+            "source_surface": "pytest",
+            "request_id": "preprocess-snapshot-second-processed",
+            "run_id": "preprocess-snapshot-second-processed",
+        },
+        now="2026-06-27T04:40:00Z",
+        reason="test_current_processed_marker",
+        scan_metadata={},
+    )
+    processed_row.update(
+        {
+            "status": "processed",
+            "processed_document_updated_at": second_source["document_updated_at"],
+            "processed_source_hash": second_source["document_source_hash"],
+            "processed_at": "2026-06-27T04:40:00Z",
+            "last_successful_source_hash": second_source["document_source_hash"],
+        }
+    )
+    routes_personal._write_work_review_processor_marker(conn, processed_row)
+    conn.commit()
 
     async def fake_process_claimed_marker(marker, *, holder_id, lease_token, run_id):
         assert marker["item_id"] == "work-preprocess-snapshot-first"
@@ -11873,7 +11898,145 @@ def test_work_preprocessing_idle_scan_resolves_stale_self_marker_blocker_only(
     assert "resolve_stale_processor_marker_blocker" in audit_actions
 
 
-def test_work_preprocessing_idle_scan_resolves_current_failed_marker_blocker(monkeypatch, tmp_path):
+def _record_trusted_preprocessing_readiness_decision(
+    *,
+    item_id: str,
+    marker_id: str,
+    source: dict,
+    readiness_marker: dict,
+) -> dict:
+    return asyncio.run(
+        routes_personal.record_work_item_review_decision(
+            item_id,
+            routes_personal.WorkReviewDecisionCreateRequest(
+                decision_id=f"trusted-preprocessing-{item_id}",
+                processor_kind="preprocessing",
+                decision_type="context_readiness_marked",
+                title="Current preprocessing readiness",
+                summary="The configured preprocessing model accepted the current context.",
+                rationale="Regression proof for durable readiness-marker reconciliation.",
+                affected_refs=[f"kanban_items:{item_id}"],
+                confidence="high",
+                proof_refs=[f"kanban_review_processor_markers:{marker_id}"],
+                status="accepted",
+                provider_mode=routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+                metadata={
+                    "schema": "xarta.kanban.preprocessing.hermes_profile_decision.v1",
+                    "worker_schema": routes_personal.KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+                    "marker_id": marker_id,
+                    "document_source_hash": source["document_source_hash"],
+                    "readiness_marker": readiness_marker,
+                },
+                actor="kanban-idle-worker",
+                source_surface="kanban-automation-idle-worker",
+                request_id=f"trusted-preprocessing-{item_id}",
+                run_id=f"trusted-preprocessing-{item_id}",
+            ),
+        )
+    )["decision"]
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "document_source_hash",
+        "marker_id",
+        "provider_mode",
+        "provenance",
+        "affected_ref",
+        "schema",
+        "worker_schema",
+        "ready",
+    ],
+)
+def test_work_preprocessing_readiness_decision_rejects_tampered_attestation(tamper):
+    item_id = "work-preprocess-attestation"
+    marker_id = routes_personal._preprocessing_marker_id(item_id)
+    document_source_hash = "sha256:current"
+    metadata = {
+        "schema": "xarta.kanban.preprocessing.hermes_profile_decision.v1",
+        "worker_schema": routes_personal.KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
+        "marker_id": marker_id,
+        "document_source_hash": document_source_hash,
+        "readiness_marker": {
+            "item_id": item_id,
+            "processor_marker_id": marker_id,
+            "context_hash": document_source_hash,
+            "ready": True,
+            "preprocessing_outcome": "ready",
+            "processor_profile": "hermes-kanban-preprocessor",
+            "processor_provider_mode": (routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE),
+        },
+    }
+    row = {
+        "decision_id": "trusted-preprocessing-attestation",
+        "source_hash": "sha256:decision",
+        "provider_mode": routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+        "metadata_json": json.dumps(metadata),
+        "provenance_json": json.dumps(
+            {
+                "recorded_by": "kanban-idle-worker",
+                "source_surface": "kanban-automation-idle-worker",
+            }
+        ),
+        "affected_refs_json": json.dumps([f"kanban_items:{item_id}"]),
+    }
+    if tamper == "document_source_hash":
+        metadata["document_source_hash"] = "sha256:stale"
+    elif tamper == "marker_id":
+        metadata["readiness_marker"]["processor_marker_id"] = "wrong-marker"
+    elif tamper == "provider_mode":
+        row["provider_mode"] = "manual"
+    elif tamper == "provenance":
+        row["provenance_json"] = json.dumps({"recorded_by": "manual"})
+    elif tamper == "affected_ref":
+        row["affected_refs_json"] = json.dumps(["kanban_items:other"])
+    elif tamper == "schema":
+        metadata["schema"] = "unknown"
+    elif tamper == "worker_schema":
+        metadata["worker_schema"] = "unknown"
+    elif tamper == "ready":
+        metadata["readiness_marker"]["ready"] = False
+    row["metadata_json"] = json.dumps(metadata)
+
+    assert (
+        routes_personal._work_preprocessing_matching_readiness_decision(
+            [row],
+            item_id=item_id,
+            marker_id=marker_id,
+            document_source_hash=document_source_hash,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "last_error", "expected"),
+    [
+        ("queued", "", True),
+        ("failed", "provider_timeout", True),
+        ("cancelled", "preprocessing_current", True),
+        ("cancelled", "operator_cancelled", False),
+        ("cancelled", "automation_excluded", False),
+        ("skipped", "", False),
+        ("processed", "", False),
+    ],
+)
+def test_work_preprocessing_reconciliation_preserves_terminal_cancellation(
+    status, last_error, expected
+):
+    assert (
+        routes_personal._work_preprocessing_decision_reconciliation_allowed(
+            {"status": status, "last_error": last_error}
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("interrupted_status", ["failed", "cancelled"])
+def test_work_preprocessing_idle_scan_reconciles_trusted_current_interrupted_marker(
+    monkeypatch, tmp_path, interrupted_status
+):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
@@ -11906,6 +12069,13 @@ def test_work_preprocessing_idle_scan_resolves_current_failed_marker_blocker(mon
         "marked_at": "2026-06-27T04:20:00Z",
         "marked_by": "codex-test",
         "context_hash": initial_source["document_source_hash"],
+        "processor_marker_id": routes_personal._preprocessing_marker_id(
+            "work-preprocess-current-failed"
+        ),
+        "processor_profile": "hermes-kanban-preprocessor",
+        "processor_provider_mode": routes_personal.KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE,
+        "ready": True,
+        "preprocessing_outcome": "ready",
         "component_hashes": {},
         "counts": initial_source["counts"],
         "source_refs": initial_source["source_refs"],
@@ -11939,15 +12109,26 @@ def test_work_preprocessing_idle_scan_resolves_current_failed_marker_blocker(mon
     )
     failed_row["status"] = "failed"
     failed_row["last_error"] = "open_blockers;llm_reported_not_ready"
-    saved_failed = routes_personal._write_work_review_processor_marker(conn, failed_row)
+    saved_interrupted = routes_personal._write_work_review_processor_marker(conn, failed_row)
     marker_blocker = routes_personal._upsert_work_processor_marker_blocker(
         conn,
-        saved_failed,
+        saved_interrupted,
         meta=meta,
         now="2026-06-27T04:21:00Z",
     )
     assert marker_blocker is not None
     assert marker_blocker["blocker_row"]["status"] == "open"
+    if interrupted_status == "cancelled":
+        cancelled_row = dict(saved_interrupted)
+        cancelled_row["status"] = "cancelled"
+        cancelled_row["last_error"] = "preprocessing_current"
+        saved_interrupted = routes_personal._write_work_review_processor_marker(conn, cancelled_row)
+    decision = _record_trusted_preprocessing_readiness_decision(
+        item_id="work-preprocess-current-failed",
+        marker_id=saved_interrupted["marker_id"],
+        source=initial_source,
+        readiness_marker=current_marker,
+    )
     conn.commit()
 
     scan = asyncio.run(
@@ -11963,11 +12144,17 @@ def test_work_preprocessing_idle_scan_resolves_current_failed_marker_blocker(mon
     )
     assert scan["queued_count"] == 0
     assert scan["current_ready_count"] == 1
-    assert scan["cancelled_current_count"] == 1
-    cancelled = scan["cancelled_markers"][0]
-    assert cancelled["status"] == "cancelled"
-    assert cancelled["last_error"] == "preprocessing_current"
-    assert cancelled["metadata"]["cancelled_previous_status"] == "failed"
+    assert scan["cancelled_current_count"] == 0
+    assert scan["reconciled_current_count"] == 1
+    reconciled = scan["reconciled_markers"][0]
+    assert reconciled["status"] == "processed"
+    assert reconciled["processed_source_hash"] == initial_source["document_source_hash"]
+    assert reconciled["last_successful_source_hash"] == initial_source["document_source_hash"]
+    assert reconciled["decision_id"] == decision["decision_id"]
+    assert reconciled["last_error"] == ""
+    assert reconciled["retry_state"] == "processed"
+    assert reconciled["metadata"]["reconciled_previous_status"] == interrupted_status
+    assert reconciled["metadata"]["readiness_decision_id"] == decision["decision_id"]
 
     blocker_row = conn.execute(
         "SELECT * FROM kanban_blockers WHERE blocker_id=?",
@@ -12062,6 +12249,8 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
     conn.execute("DELETE FROM sync_queue")
     conn.commit()
 
+    traced_statements = []
+    conn.set_trace_callback(traced_statements.append)
     scan = asyncio.run(
         routes_personal.trigger_work_preprocessing_idle_scan(
             routes_personal.WorkPreprocessingIdleScanRequest(
@@ -12073,21 +12262,39 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
             )
         )
     )
+    conn.set_trace_callback(None)
     assert scan["ok"] is True
     assert scan["schema"] == routes_personal.KANBAN_PREPROCESSING_QUEUE_SCHEMA
     assert scan["idle"] is True
     assert scan["scanned_count"] == 2
-    assert scan["eligible_preprocessing_count"] == 1
-    assert scan["current_ready_count"] == 1
-    assert scan["queued_count"] == 1
-    marker = scan["queued_markers"][0]
+    assert scan["eligible_preprocessing_count"] == 2
+    assert scan["current_ready_count"] == 0
+    assert scan["queued_count"] == 2
+    marker = next(
+        queued_marker
+        for queued_marker in scan["queued_markers"]
+        if queued_marker["item_id"] == "work-preprocess-missing"
+    )
     assert marker["processor_kind"] == "preprocessing"
     assert marker["document_type"] == "context_readiness"
     assert marker["item_id"] == "work-preprocess-missing"
     assert marker["status"] == "queued"
     assert marker["metadata"]["reason"] == "missing_readiness_marker"
     assert marker["metadata"]["readiness_reason"] == "missing_readiness_marker"
-    assert scan["scheduler"]["queue_length"] == 1
+    current_unattested = next(
+        queued_marker
+        for queued_marker in scan["queued_markers"]
+        if queued_marker["item_id"] == "work-preprocess-current"
+    )
+    assert current_unattested["status"] == "queued"
+    assert current_unattested["metadata"]["reason"] == ("preprocessing_readiness_unattested")
+    assert scan["scheduler"]["queue_length"] == 2
+    readiness_queries = [
+        statement
+        for statement in traced_statements
+        if "FROM kanban_review_decisions decision" in statement
+    ]
+    assert len(readiness_queries) == 1
 
     status = asyncio.run(routes_personal.get_work_automation_status(item_id="work-preprocess-root"))
     max_scan_range = status["idle_worker"]["range_config"]["max_scan_items"]
@@ -12096,8 +12303,8 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
     assert max_scan_range["default"] == routes_personal.KANBAN_AUTOMATION_DEFAULT_MAX_SCAN_ITEMS
     assert max_scan_range["min"] == 1
     assert max_scan_range["max"] == routes_personal.KANBAN_AUTOMATION_MAX_SCAN_ITEMS_CAP
-    assert status["preprocessing"]["queue_length"] == 1
-    assert status["preprocessing"]["scheduler"]["queue_length"] == 1
+    assert status["preprocessing"]["queue_length"] == 2
+    assert status["preprocessing"]["scheduler"]["queue_length"] == 2
     assert status["preprocessing"]["markers"][0]["processor_kind"] == "preprocessing"
     assert status["review_processor"]["queue_length"] == 0
 
@@ -12113,7 +12320,7 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
         )
     )
     assert same_scan["queued_count"] == 0
-    assert same_scan["unchanged_pending_count"] == 1
+    assert same_scan["unchanged_pending_count"] == 2
 
     conn.execute(
         """
@@ -12189,12 +12396,18 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
         )
     )
     assert cancel_scan["queued_count"] == 0
-    assert cancel_scan["cancelled_current_count"] == 1
-    assert cancel_scan["scheduler"]["queue_length"] == 0
-    cancelled = cancel_scan["cancelled_markers"][0]
-    assert cancelled["status"] == "cancelled"
-    assert cancelled["last_error"] == "preprocessing_current"
-    assert cancelled["metadata"]["cancelled_previous_status"] == "queued"
+    assert cancel_scan["cancelled_current_count"] == 0
+    assert cancel_scan["reconciled_current_count"] == 0
+    assert cancel_scan["current_ready_count"] == 0
+    assert cancel_scan["unchanged_pending_count"] == 2
+    assert cancel_scan["scheduler"]["queue_length"] == 2
+    untrusted = next(
+        marker
+        for marker in cancel_scan["scheduler"]["recent_markers"]
+        if marker["item_id"] == "work-preprocess-missing"
+    )
+    assert untrusted["status"] == "queued"
+    assert untrusted["processed_source_hash"] == ""
 
     sync_tables = {
         row["table_name"] for row in conn.execute("SELECT table_name FROM sync_queue").fetchall()
