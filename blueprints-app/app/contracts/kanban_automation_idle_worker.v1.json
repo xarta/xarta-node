@@ -1,7 +1,7 @@
 {
   "schema": "xarta.kanban.automation.idle_worker.contract.v1",
   "status": "active",
-  "version": "2026-07-16",
+  "version": "2026-07-17",
   "title": "Kanban automation idle worker contract",
   "source_of_truth": true,
   "summary": "Kanban semantic discovery and processing remain in Blueprints/Hermes while an explicit producer mode fences the legacy 60-second Blueprints loop and hourly Hermes blocker job from two typed xarta-scheduler targets. Only the nominated singleton owner may run automatic or manual recovery work. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff. Range-type runtime config values must expose raw, default, accepted range, effective value, source, and state in Automation Status.",
@@ -130,8 +130,8 @@
       "rollups"
     ],
     "readiness_marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
-    "queue_rule": "Queue when the readiness marker is missing or stale for an eligible ToDo leaf, unless a current queued or processing marker already exists.",
-    "ready_result": "Write a fresh context_readiness_marker and complete the marker.",
+    "queue_rule": "Queue when an eligible ToDo leaf is not backed by a processed preprocessing marker for the exact current normalized source hash, unless a current queued or processing marker already exists. A fresh context_readiness_marker in agent hints is semantic evidence, not an operational readiness attestation by itself.",
+    "ready_result": "Persist the accepted context_readiness_marked decision and fresh context_readiness_marker for the exact marker id and normalized source hash, then complete the processor marker with matching processed and last-successful source hashes.",
     "ready_leaf_no_decomposition_rule": "If the configured LLM route returns ready=false but supplies no blocking codes, no operator question, and no decomposition_items for an otherwise concrete actionable leaf, normalize the outcome to ready_leaf_no_decomposition and complete the marker successfully. Readiness is not completion, and retrying the same source should not be used as a substitute for doing the named investigation or implementation work.",
     "decomposition_result": "Create or confirm concrete child cards, move the former ToDo parent out of ToDo, write readiness marker and decision proof, then complete the marker.",
     "blocked_result": "Create a visible blocker or question on the smallest useful leaf, write decision proof, and fail the marker visibly as retryable queue state unless the operator/work state makes it terminal."
@@ -193,8 +193,12 @@
         "action": "re-scan and requeue current source or cancel old marker"
       },
       {
-        "condition": "current readiness marker is already fresh",
-        "action": "cancel preprocessing marker as current"
+        "condition": "fresh readiness marker and exact accepted real-preprocessor decision exist for the same item, processor marker id, normalized source hash, worker schema, configured profile/provider mode, and worker provenance, but a queued/failed marker or the legacy preprocessing_current cancellation shows finalization was interrupted",
+        "action": "reconcile the existing marker to processed, clear active failure/retry state, resolve its synthetic blocker, and retain the durable decision and failure history"
+      },
+      {
+        "condition": "fresh readiness marker exists without an exact accepted real-preprocessor decision and processed marker",
+        "action": "keep or enqueue genuine preprocessing work; never cancel or mark processed from the agent hint alone"
       },
       {
         "condition": "Hermes processor profile, auth, or model route is missing/unavailable",
@@ -202,14 +206,19 @@
       }
     ]
   },
-  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> B2{Current node is owner or override?}\n  B2 -- no --> Z2[Skip without scan/lease/claim]\n  B2 -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker through hermes-kanban-review-processor]\n  I --> I2{Failure?}\n  I2 -- yes --> I3[Record failure event and next_retry_at]\n  I3 --> I4[Retry when due unless superseded/cancelled]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Readiness marker missing or stale?}\n  L -- no --> M[No preprocessing work]\n  L -- yes --> N[Queue/process preprocessing marker through hermes-kanban-preprocessor]\n  N --> O{Result}\n  O -- ready --> P[Write readiness marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n  O -- failure --> S[Record failure event and next_retry_at]\n",
+  "flowchart_mermaid": "flowchart TD\n  A[Idle interval] --> B{Automation enabled?}\n  B -- no --> Z[Stop]\n  B -- yes --> B2{Current node is owner or override?}\n  B2 -- no --> Z2[Skip without scan/lease/claim]\n  B2 -- yes --> C[Scan Kanban automatically]\n  C --> D{Item or ancestor automation_excluded?}\n  D -- yes --> X[Skip/cancel branch markers]\n  D -- no --> E[Review Processor]\n  D -- no --> F[Preprocessing Processor]\n  E --> G{Review text exists and source changed?}\n  G -- no --> H[No review work]\n  G -- yes --> I[Queue/process review marker through hermes-kanban-review-processor]\n  I --> I2{Failure?}\n  I2 -- yes --> I3[Record failure event and next_retry_at]\n  I3 --> I4[Retry when due unless superseded/cancelled]\n  F --> J{Open ordinary leaf in ToDo lane?}\n  J -- no --> K[No preprocessing work]\n  J -- yes --> L{Processed marker matches current source?}\n  L -- yes --> M[No preprocessing work]\n  L -- no --> L2{Exact accepted preprocessing decision proves interrupted finalization?}\n  L2 -- yes --> L3[Reconcile existing marker to processed]\n  L2 -- no --> N[Queue/process preprocessing marker through hermes-kanban-preprocessor]\n  N --> O{Result}\n  O -- ready --> P[Persist decision and readiness marker, then complete processor marker]\n  O -- decomposition --> Q[Create/confirm children and move parent out of ToDo]\n  O -- blocked/question --> R[Create visible blocker/question]\n  O -- failure --> S[Record failure event and next_retry_at]\n",
   "must_pass_tests": [
     "No root env var set: idle worker still scans automatically.",
     "automation_excluded=true on a root or topic ancestor: no descendants are scanned, queued, claimed, or processed.",
     "GitHub Activity marked automation_excluded: no blockers, ToDos, or preprocessing markers are created there.",
     "New ToDo leaf with missing readiness marker: preprocessing marker is queued and processed.",
     "Backlog, Doing, Blocked, Done, archived, and non-leaf cards are not preprocessing candidates.",
-    "Fresh readiness marker and unchanged source hashes: no reprocessing.",
+    "Fresh readiness marker plus processed marker and unchanged normalized source hashes: no reprocessing.",
+    "Fresh readiness marker without an exact accepted preprocessing decision and processed marker remains queued for a genuine pass; the agent hint alone never bypasses strict readiness.",
+    "An interrupted failed or cancelled marker is reconciled to processed only when an exact accepted real-preprocessor decision matches item, marker id, normalized source hash, schema, profile/provider mode, affected ref, and worker provenance.",
+    "Explicit operator, exclusion, or other terminal cancellation is never reconciled from decision evidence and remains terminal for the unchanged source.",
+    "Attestations with mismatched source hash, marker id, schema, profile/provider mode, affected ref, provenance, or ready state are rejected.",
+    "Decision evidence for a scan batch is loaded with one bounded batched query rather than per-card lookup.",
     "Detail, Review, proof, or explicit feedback capture on a Done card does not queue Review Processor or preprocessing work unless the named reprocess_completed field is true.",
     "Actionable leaf with no blocker/question/decomposition from local AI is marked ready_leaf_no_decomposition, not failed.",
     "Body/detail/review/discussion/tree/link/blocker/commit/todo/count drift makes readiness stale and requeues preprocessing.",

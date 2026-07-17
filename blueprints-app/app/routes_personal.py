@@ -5783,6 +5783,114 @@ def _work_marker_successful_source_hash(existing: Any | None) -> str:
     return ""
 
 
+def _work_preprocessing_recent_decisions_by_item(
+    conn: Any,
+    item_ids: list[str],
+    *,
+    per_item_limit: int = 12,
+) -> dict[str, list[Any]]:
+    clean_item_ids = list(
+        dict.fromkeys(
+            _clean_short_text(item_id, "", limit=180)
+            for item_id in item_ids
+            if str(item_id or "").strip()
+        )
+    )
+    clean_item_ids = [item_id for item_id in clean_item_ids if item_id]
+    if not clean_item_ids:
+        return {}
+    bounded_limit = max(1, min(int(per_item_limit or 12), 12))
+    placeholders = ",".join("?" for _ in clean_item_ids)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM (
+          SELECT decision.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY decision.item_id
+                   ORDER BY decision.updated_at DESC,
+                            decision.created_at DESC,
+                            decision.decision_id DESC
+                 ) AS readiness_proof_rank
+          FROM kanban_review_decisions decision
+          WHERE decision.item_id IN ({placeholders})
+            AND decision.processor_kind='preprocessing'
+            AND decision.decision_type='context_readiness_marked'
+            AND decision.status='accepted'
+        ) ranked
+        WHERE readiness_proof_rank <= ?
+        ORDER BY item_id, readiness_proof_rank
+        """,
+        [*clean_item_ids, bounded_limit],
+    ).fetchall()
+    decisions_by_item: dict[str, list[Any]] = {}
+    for row in rows:
+        decisions_by_item.setdefault(str(row["item_id"]), []).append(row)
+    return decisions_by_item
+
+
+def _work_preprocessing_matching_readiness_decision(
+    rows: list[Any],
+    *,
+    item_id: str,
+    marker_id: str,
+    document_source_hash: str,
+) -> Any | None:
+    for row in rows:
+        metadata = _json_value(row["metadata_json"], {})
+        provenance = _json_value(row["provenance_json"], {})
+        readiness_marker = metadata.get("readiness_marker")
+        if not isinstance(readiness_marker, dict):
+            continue
+        if metadata.get("worker_schema") != KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA:
+            continue
+        if metadata.get("schema") != "xarta.kanban.preprocessing.hermes_profile_decision.v1":
+            continue
+        if str(metadata.get("marker_id") or "") != marker_id:
+            continue
+        if str(metadata.get("document_source_hash") or "") != document_source_hash:
+            continue
+        if str(readiness_marker.get("item_id") or "") != item_id:
+            continue
+        if str(readiness_marker.get("processor_marker_id") or "") != marker_id:
+            continue
+        if str(readiness_marker.get("context_hash") or "") != document_source_hash:
+            continue
+        if readiness_marker.get("ready") is not True:
+            continue
+        if readiness_marker.get("processor_profile") != "hermes-kanban-preprocessor":
+            continue
+        if readiness_marker.get("processor_provider_mode") != (
+            KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE
+        ):
+            continue
+        if str(readiness_marker.get("preprocessing_outcome") or "") in {
+            "awaiting_operator",
+            "blocked",
+        }:
+            continue
+        if str(provenance.get("recorded_by") or "") != "kanban-idle-worker":
+            continue
+        if str(provenance.get("source_surface") or "") != ("kanban-automation-idle-worker"):
+            continue
+        affected_refs = _json_value(row["affected_refs_json"], [])
+        if f"kanban_items:{item_id}" not in affected_refs:
+            continue
+        if str(row["provider_mode"] or "") != KANBAN_AUTOMATION_PROFILE_PROVIDER_MODE:
+            continue
+        return row
+    return None
+
+
+def _work_preprocessing_decision_reconciliation_allowed(existing: Any | None) -> bool:
+    status = str(_row_value(existing, "status", "") or "")
+    if status in {"queued", "failed"}:
+        return True
+    return (
+        status == "cancelled"
+        and str(_row_value(existing, "last_error", "") or "") == "preprocessing_current"
+    )
+
+
 def _work_queued_processor_marker_ids(conn: Any, scope_ids: list[str]) -> list[str]:
     now = _utc_now_iso()
     args: list[Any] = [now]
@@ -23425,12 +23533,15 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "eligible_preprocessing_count": 0,
                 "queued_count": 0,
                 "cancelled_current_count": 0,
+                "reconciled_current_count": 0,
                 "cancelled_invalid_count": len(cancelled_invalid_markers),
                 "unchanged_current_count": 0,
                 "unchanged_pending_count": 0,
                 "unchanged_failed_count": 0,
+                "unchanged_cancelled_count": 0,
                 "queued_markers": [],
                 "cancelled_markers": [],
+                "reconciled_markers": [],
                 "cancelled_invalid_markers": cancelled_invalid_markers,
                 "scheduler": _work_review_processor_marker_stats(
                     conn,
@@ -23523,11 +23634,14 @@ def _trigger_work_preprocessing_idle_scan_sync(
 
         queued_rows: list[Any] = []
         cancelled_rows: list[Any] = []
+        reconciled_rows: list[Any] = []
         cancelled_marker_blockers: list[dict[str, Any]] = []
+        reconciled_marker_blockers: list[dict[str, Any]] = []
         stale_marker_blockers: list[dict[str, Any]] = []
         unchanged_current = 0
         unchanged_pending = 0
         unchanged_failed = 0
+        unchanged_cancelled = 0
         current_ready = 0
         eligible_preprocessing = 0
         marker_ids = [_preprocessing_marker_id(entry["item"]["item_id"]) for entry in scan_entries]
@@ -23542,6 +23656,10 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 marker_ids,
             ).fetchall()
             existing_markers_by_id = {row["marker_id"]: row for row in marker_rows}
+        readiness_decisions_by_item = _work_preprocessing_recent_decisions_by_item(
+            conn,
+            [str(entry["item"]["item_id"] or "") for entry in scan_entries],
+        )
         for entry in scan_entries:
             item_id = entry["item"]["item_id"]
             source = entry["source"]
@@ -23564,7 +23682,101 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 existing is not None
                 and _work_marker_successful_source_hash(existing) == source["document_source_hash"]
             )
-            if source["ready"] or not source.get("needs_preprocessing", True):
+            if source["ready"]:
+                readiness_decision = _work_preprocessing_matching_readiness_decision(
+                    readiness_decisions_by_item.get(str(item_id), []),
+                    item_id=str(item_id),
+                    marker_id=marker_id,
+                    document_source_hash=str(source["document_source_hash"]),
+                )
+                if already_processed and existing is not None and existing["status"] == "processed":
+                    current_ready += 1
+                    unchanged_current += 1
+                    continue
+                if (
+                    existing is not None
+                    and readiness_decision is not None
+                    and _work_preprocessing_decision_reconciliation_allowed(existing)
+                ):
+                    reconciled_row = _work_review_processor_marker_update_row(
+                        existing,
+                        updates={
+                            "status": "processed",
+                            "document_ref": source["document_ref"],
+                            "document_updated_at": source["document_updated_at"],
+                            "document_source_hash": source["document_source_hash"],
+                            "processed_document_updated_at": source["document_updated_at"],
+                            "processed_source_hash": source["document_source_hash"],
+                            "processed_at": now,
+                            "last_successful_source_hash": source["document_source_hash"],
+                            "last_seen_at": now,
+                            "processing_started_at": "",
+                            "processing_expires_at": "",
+                            "decision_id": readiness_decision["decision_id"],
+                            "last_error": "",
+                            "next_retry_at": "",
+                            "retry_after_seconds": 0,
+                            "retry_attempt_count": 0,
+                            "last_failure_event_id": "",
+                            "last_failure_source_hash": "",
+                            "last_error_class": "",
+                            "retry_policy_version": "",
+                        },
+                        meta=meta,
+                        now=now,
+                        reason="preprocessing_current_decision_reconciled",
+                        metadata={
+                            **dict(body.metadata or {}),
+                            "readiness_reason": source["reason"],
+                            "reconciled_previous_status": existing["status"],
+                            "readiness_decision_id": readiness_decision["decision_id"],
+                            "readiness_decision_source_hash": readiness_decision["source_hash"],
+                            "last_outcome_at": now,
+                            "last_outcome_status": ("preprocessing_current_decision_reconciled"),
+                        },
+                    )
+                    saved_reconciled_row = _write_work_review_processor_marker(conn, reconciled_row)
+                    reconciled_rows.append(saved_reconciled_row)
+                    current_ready += 1
+                    marker_blocker = _upsert_work_processor_marker_blocker(
+                        conn,
+                        saved_reconciled_row,
+                        meta=meta,
+                        now=now,
+                    )
+                    if marker_blocker is not None:
+                        reconciled_marker_blockers.append(marker_blocker)
+                    continue
+
+                # A current agent-hints marker is semantic evidence, but it is
+                # not an operational readiness attestation by itself. Keep an
+                # existing genuine processor attempt pending, or enqueue one,
+                # until a matching accepted preprocessing decision and durable
+                # processed marker agree on the exact normalized source hash.
+                eligible_preprocessing += 1
+                if existing is not None:
+                    if same_source and existing["status"] in {"queued", "processing"}:
+                        unchanged_pending += 1
+                        continue
+                    if same_source and existing["status"] == "failed":
+                        unchanged_failed += 1
+                        continue
+                    if same_source and existing["status"] == "cancelled":
+                        unchanged_cancelled += 1
+                        continue
+                marker_row = _work_preprocessing_marker_row(
+                    existing=existing,
+                    item_id=item_id,
+                    source=source,
+                    meta=meta,
+                    now=now,
+                    reason="preprocessing_readiness_unattested",
+                    scan_metadata=dict(body.metadata or {}),
+                )
+                queued_rows.append(_write_work_review_processor_marker(conn, marker_row))
+                continue
+
+            if not source.get("needs_preprocessing", True):
                 current_ready += 1
                 if existing is not None and existing["status"] in {
                     "queued",
@@ -23638,6 +23850,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "eligible_preprocessing_count": eligible_preprocessing,
                 "queued_count": len(queued_rows),
                 "cancelled_current_count": len(cancelled_rows),
+                "reconciled_current_count": len(reconciled_rows),
                 "cancelled_invalid_count": len(cancelled_invalid_rows),
                 "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
                 "satisfied_parent_context_blocker_resolved_count": len(
@@ -23647,6 +23860,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
                 "unchanged_failed_count": unchanged_failed,
+                "unchanged_cancelled_count": unchanged_cancelled,
             }
         )
         audit_row = _write_work_audit(
@@ -23670,6 +23884,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "eligible_preprocessing_count": eligible_preprocessing,
                 "queued_count": len(queued_rows),
                 "cancelled_current_count": len(cancelled_rows),
+                "reconciled_current_count": len(reconciled_rows),
                 "cancelled_invalid_count": len(cancelled_invalid_rows),
                 "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
                 "satisfied_parent_context_blocker_resolved_count": len(
@@ -23679,6 +23894,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "unchanged_current_count": unchanged_current,
                 "unchanged_pending_count": unchanged_pending,
                 "unchanged_failed_count": unchanged_failed,
+                "unchanged_cancelled_count": unchanged_cancelled,
                 "provider_mode": _work_review_processing_policy()["active_mode"],
             },
         )
@@ -23701,7 +23917,33 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 dict(marker_row),
                 gen,
             )
+        for marker_row in reconciled_rows:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_review_processor_markers",
+                marker_row["marker_id"],
+                dict(marker_row),
+                gen,
+            )
         for marker_blocker in cancelled_marker_blockers:
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_blockers",
+                marker_blocker["blocker_row"]["blocker_id"],
+                dict(marker_blocker["blocker_row"]),
+                gen,
+            )
+            enqueue_for_all_peers(
+                conn,
+                "UPDATE",
+                "kanban_audit_log",
+                marker_blocker["audit_row"]["audit_id"],
+                marker_blocker["audit_row"],
+                gen,
+            )
+        for marker_blocker in reconciled_marker_blockers:
             enqueue_for_all_peers(
                 conn,
                 "UPDATE",
@@ -23785,6 +24027,9 @@ def _trigger_work_preprocessing_idle_scan_sync(
         cancelled_markers = [
             _row_to_work_review_processor_marker(marker_row) for marker_row in cancelled_rows
         ]
+        reconciled_markers = [
+            _row_to_work_review_processor_marker(marker_row) for marker_row in reconciled_rows
+        ]
         cancelled_invalid_markers = [
             _row_to_work_review_processor_marker(marker_row)
             for marker_row in cancelled_invalid_rows
@@ -23804,6 +24049,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
         "eligible_preprocessing_count": eligible_preprocessing,
         "queued_count": len(queued_markers),
         "cancelled_current_count": len(cancelled_markers),
+        "reconciled_current_count": len(reconciled_markers),
         "cancelled_invalid_count": len(cancelled_invalid_markers),
         "stale_marker_blocker_resolved_count": len(stale_marker_blockers),
         "satisfied_parent_context_blocker_resolved_count": len(satisfied_parent_context_blockers),
@@ -23811,8 +24057,10 @@ def _trigger_work_preprocessing_idle_scan_sync(
         "unchanged_current_count": unchanged_current,
         "unchanged_pending_count": unchanged_pending,
         "unchanged_failed_count": unchanged_failed,
+        "unchanged_cancelled_count": unchanged_cancelled,
         "queued_markers": queued_markers,
         "cancelled_markers": cancelled_markers,
+        "reconciled_markers": reconciled_markers,
         "cancelled_invalid_markers": cancelled_invalid_markers,
         "scheduler": scheduler,
         "audit": {
