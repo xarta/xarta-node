@@ -130,6 +130,8 @@
       "rollups"
     ],
     "readiness_marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
+    "scan_coverage_rule": "A bounded global scan must not repeatedly select the same current marked leaves. Missing readiness remains first priority; marked candidates advance through one audited round-robin cursor so every eligible ToDo leaf is eventually rebuilt against the complete normalized context manifest without per-item heartbeat writes.",
+    "scan_database_boundary": "Cursor lookup, candidate selection, context rebuilding, and marker writes remain inside the existing measured synchronous scan worker and Kanban connection boundary reached through _run_personal_sync_work. No synchronous SQLite or PostgreSQL work is added to the async route or Blueprints event loop.",
     "queue_rule": "Queue when an eligible ToDo leaf is not backed by a processed preprocessing marker for the exact current normalized source hash, unless a current queued or processing marker already exists. A fresh context_readiness_marker in agent hints is semantic evidence, not an operational readiness attestation by itself.",
     "ready_result": "Persist the accepted context_readiness_marked decision and fresh context_readiness_marker for the exact marker id and normalized source hash, then complete the processor marker with matching processed and last-successful source hashes.",
     "ready_leaf_no_decomposition_rule": "If the configured LLM route returns ready=false but supplies no blocking codes, no operator question, and no decomposition_items for an otherwise concrete actionable leaf, normalize the outcome to ready_leaf_no_decomposition and complete the marker successfully. Readiness is not completion, and retrying the same source should not be used as a substitute for doing the named investigation or implementation work.",
@@ -219,6 +221,8 @@
     "Explicit operator, exclusion, or other terminal cancellation is never reconciled from decision evidence and remains terminal for the unchanged source.",
     "Attestations with mismatched source hash, marker id, schema, profile/provider mode, affected ref, provenance, or ready state are rejected.",
     "Decision evidence for a scan batch is loaded with one bounded batched query rather than per-card lookup.",
+    "Successive bounded global scans advance an audited cursor across marked candidates, so a link or other context-only change on an older leaf cannot starve behind the same current batch.",
+    "The scan cursor and all Kanban database work remain inside the measured synchronous worker/connection boundary; the async route performs no synchronous database work.",
     "Detail, Review, proof, or explicit feedback capture on a Done card does not queue Review Processor or preprocessing work unless the named reprocess_completed field is true.",
     "Actionable leaf with no blocker/question/decomposition from local AI is marked ready_leaf_no_decomposition, not failed.",
     "Body/detail/review/discussion/tree/link/blocker/commit/todo/count drift makes readiness stale and requeues preprocessing.",

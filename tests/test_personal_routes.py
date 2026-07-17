@@ -12420,6 +12420,112 @@ def test_work_preprocessing_idle_scan_queues_missing_readiness(monkeypatch, tmp_
     assert "trigger_preprocessing_idle_scan" in audit_actions
 
 
+def test_work_preprocessing_idle_scan_rotates_marked_candidates_without_per_item_writes(
+    monkeypatch, tmp_path
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+
+    for suffix in ("a", "b", "c", "d", "e"):
+        item_id = f"work-preprocess-cursor-{suffix}"
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    title=f"Cursor candidate {suffix}",
+                    body="Every marked ToDo leaf must eventually be rescanned for context drift.",
+                    state_id="todo",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"preprocess-cursor-create-{suffix}",
+                )
+            )
+        )
+        asyncio.run(
+            routes_personal.update_work_item_agent_hints(
+                item_id,
+                routes_personal.WorkAgentHintsUpdateRequest(
+                    metadata={
+                        "context_readiness_marker": {
+                            "schema": "xarta.kanban.context_readiness_marker.v1",
+                            "item_id": item_id,
+                            "context_hash": "sha256:prior-context",
+                            "ready": True,
+                        }
+                    },
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"preprocess-cursor-hints-{suffix}",
+                ),
+            )
+        )
+    conn.execute("DELETE FROM sync_queue")
+    conn.execute("DELETE FROM kanban_audit_log")
+    conn.commit()
+
+    first = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                max_items=2,
+                actor="kanban-idle-worker",
+                source_surface="kanban-automation-idle-worker",
+                request_id="preprocess-cursor-first",
+                run_id="preprocess-cursor-first",
+            )
+        )
+    )
+    assert [marker["item_id"] for marker in first["queued_markers"]] == [
+        "work-preprocess-cursor-a",
+        "work-preprocess-cursor-b",
+    ]
+    assert first["scan_cursor"] == {
+        "schema": "xarta.kanban.preprocessing.scan_cursor.v1",
+        "scope": "global",
+        "previous_audit_id": "",
+        "audit_id": first["audit"]["audit_id"],
+        "previous_item_id": "",
+        "item_id": "work-preprocess-cursor-b",
+        "wrapped": False,
+    }
+
+    second = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                max_items=2,
+                actor="kanban-idle-worker",
+                source_surface="kanban-automation-idle-worker",
+                request_id="preprocess-cursor-second",
+                run_id="preprocess-cursor-second",
+            )
+        )
+    )
+    assert [marker["item_id"] for marker in second["queued_markers"]] == [
+        "work-preprocess-cursor-c",
+        "work-preprocess-cursor-d",
+    ]
+    assert second["scan_cursor"]["previous_item_id"] == "work-preprocess-cursor-b"
+    assert second["scan_cursor"]["item_id"] == "work-preprocess-cursor-d"
+    assert second["scan_cursor"]["wrapped"] is False
+    assert second["scan_cursor"]["previous_audit_id"] == first["audit"]["audit_id"]
+
+    stored_cursor = routes_personal._work_preprocessing_scan_cursor(conn)
+    assert stored_cursor == {
+        "audit_id": second["audit"]["audit_id"],
+        "item_id": "work-preprocess-cursor-d",
+    }
+    marker_rows = conn.execute(
+        "SELECT item_id, updated_at FROM kanban_review_processor_markers ORDER BY item_id"
+    ).fetchall()
+    assert [row["item_id"] for row in marker_rows] == [
+        "work-preprocess-cursor-a",
+        "work-preprocess-cursor-b",
+        "work-preprocess-cursor-c",
+        "work-preprocess-cursor-d",
+    ]
+
+
 def test_work_kanban_shadow_snapshot_matches_real_scan_candidates(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)

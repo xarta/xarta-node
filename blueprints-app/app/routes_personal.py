@@ -23432,6 +23432,42 @@ async def trigger_work_preprocessing_idle_scan(
     return await _run_personal_sync_work(_trigger_work_preprocessing_idle_scan_sync, body)
 
 
+def _work_preprocessing_scan_cursor(conn: Any) -> dict[str, str]:
+    """Return the tip of the global scan-cursor chain without per-item writes."""
+    row = conn.execute(
+        """
+        SELECT cursor.audit_id, cursor.metadata_json
+        FROM kanban_audit_log cursor
+        WHERE cursor.action='trigger_preprocessing_idle_scan'
+          AND cursor.result='ok'
+          AND COALESCE(cursor.item_id, '')=''
+          AND NOT EXISTS (
+            SELECT 1
+            FROM kanban_audit_log successor
+            WHERE successor.action='trigger_preprocessing_idle_scan'
+              AND successor.result='ok'
+              AND COALESCE(successor.item_id, '')=''
+              AND COALESCE(
+                    json_extract(
+                      successor.metadata_json,
+                      '$.scan_cursor_previous_audit_id'
+                    ),
+                    ''
+                  )=cursor.audit_id
+          )
+        ORDER BY cursor.created_at DESC, cursor.audit_id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    metadata = _json_value(row["metadata_json"], {}) if row is not None else {}
+    return {
+        "audit_id": _clean_short_text(
+            str(row["audit_id"] if row is not None else ""), "", limit=180
+        ),
+        "item_id": _clean_short_text(str(metadata.get("scan_cursor_item_id") or ""), "", limit=180),
+    }
+
+
 def _trigger_work_preprocessing_idle_scan_sync(
     body: WorkPreprocessingIdleScanRequest,
 ) -> dict[str, Any]:
@@ -23555,6 +23591,11 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 },
             }
 
+        scan_cursor = (
+            {"audit_id": "", "item_id": ""} if scope_ids else _work_preprocessing_scan_cursor(conn)
+        )
+        scan_cursor_audit_id = scan_cursor["audit_id"]
+        scan_cursor_item_id = scan_cursor["item_id"]
         args: list[Any] = []
         where = f"""
         WHERE {_work_preprocessing_candidate_predicate("item")}
@@ -23581,19 +23622,36 @@ def _trigger_work_preprocessing_idle_scan_sync(
                       OR COALESCE(json_extract(hints.metadata_json, '$.context_readiness_marker.schema'), '')=''
                     THEN 0 ELSE 1
                   END,
-                  CASE item.priority_id
-                    WHEN 'critical' THEN 0
-                    WHEN 'high' THEN 1
-                    WHEN 'medium' THEN 2
-                    WHEN 'low' THEN 3
+                  CASE
+                    WHEN hints.hint_id IS NOT NULL
+                      AND COALESCE(json_extract(hints.metadata_json, '$.context_readiness_marker.schema'), '')!=''
+                    THEN 0
+                    WHEN item.priority_id='critical' THEN 0
+                    WHEN item.priority_id='high' THEN 1
+                    WHEN item.priority_id='medium' THEN 2
+                    WHEN item.priority_id='low' THEN 3
                     ELSE 4
                   END,
-                  item.updated_at DESC,
+                  CASE
+                    WHEN hints.hint_id IS NULL
+                      OR COALESCE(json_extract(hints.metadata_json, '$.context_readiness_marker.schema'), '')=''
+                    THEN 0
+                    WHEN ?='' OR item.item_id > ? THEN 0
+                    ELSE 1
+                  END,
                   item.item_id
                 LIMIT ?
                 """,
-                [*args, scan_limit],
+                [*args, scan_cursor_item_id, scan_cursor_item_id, scan_limit],
             ).fetchall()
+        next_scan_cursor_item_id = (
+            str(item_rows[-1]["item_id"] or "") if item_rows else scan_cursor_item_id
+        )
+        scan_cursor_wrapped = bool(
+            scan_cursor_item_id
+            and next_scan_cursor_item_id
+            and next_scan_cursor_item_id <= scan_cursor_item_id
+        )
         document_cache: dict[tuple[str, str], dict[str, Any]] = {}
         satisfied_parent_context_blockers: list[dict[str, Any]] = []
         with timing.span(
@@ -23861,6 +23919,10 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "unchanged_pending_count": unchanged_pending,
                 "unchanged_failed_count": unchanged_failed,
                 "unchanged_cancelled_count": unchanged_cancelled,
+                "scan_cursor_previous_item_id": scan_cursor_item_id,
+                "scan_cursor_previous_audit_id": scan_cursor_audit_id,
+                "scan_cursor_item_id": next_scan_cursor_item_id,
+                "scan_cursor_wrapped": scan_cursor_wrapped,
             }
         )
         audit_row = _write_work_audit(
@@ -23895,6 +23957,10 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "unchanged_pending_count": unchanged_pending,
                 "unchanged_failed_count": unchanged_failed,
                 "unchanged_cancelled_count": unchanged_cancelled,
+                "scan_cursor_previous_item_id": scan_cursor_item_id,
+                "scan_cursor_previous_audit_id": scan_cursor_audit_id,
+                "scan_cursor_item_id": next_scan_cursor_item_id,
+                "scan_cursor_wrapped": scan_cursor_wrapped,
                 "provider_mode": _work_review_processing_policy()["active_mode"],
             },
         )
@@ -24058,6 +24124,15 @@ def _trigger_work_preprocessing_idle_scan_sync(
         "unchanged_pending_count": unchanged_pending,
         "unchanged_failed_count": unchanged_failed,
         "unchanged_cancelled_count": unchanged_cancelled,
+        "scan_cursor": {
+            "schema": "xarta.kanban.preprocessing.scan_cursor.v1",
+            "scope": "scoped" if scope_ids else "global",
+            "previous_audit_id": scan_cursor_audit_id,
+            "audit_id": audit_id,
+            "previous_item_id": scan_cursor_item_id,
+            "item_id": next_scan_cursor_item_id,
+            "wrapped": scan_cursor_wrapped,
+        },
         "queued_markers": queued_markers,
         "cancelled_markers": cancelled_markers,
         "reconciled_markers": reconciled_markers,
