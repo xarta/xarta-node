@@ -873,6 +873,77 @@ def _proposal_request(
     return routes_personal.WorkProposalInboxCreateRequest(**values)
 
 
+def _create_proposal_reconciliation_fixture(candidate_ids: list[str]) -> str:
+    outcome_id = "proposal-reconciliation-canonical-outcome"
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id=outcome_id,
+                title="Canonical accepted proposal outcome",
+                body="A retained canonical outcome for strict reconciliation tests.",
+                state_id="done",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item_link(
+            outcome_id,
+            routes_personal.WorkItemLinkCreateRequest(
+                target_item_id="work-proposal-semantic-owner",
+                link_type="references",
+                metadata={"role": "semantic_owner"},
+                actor="codex-test",
+                source_surface="pytest",
+            ),
+        )
+    )
+    asyncio.run(
+        routes_personal.record_work_item_review_decision(
+            outcome_id,
+            routes_personal.WorkReviewDecisionCreateRequest(
+                decision_id="proposal-reconciliation-canonical-decision",
+                processor_kind="proposal_response",
+                decision_type="accepted",
+                title="Canonical outcome accepted",
+                summary="The exact owner outcome is accepted.",
+                status="accepted",
+                actor="codex-test",
+                source_surface="pytest",
+            ),
+        )
+    )
+    for candidate_id in candidate_ids:
+        asyncio.run(
+            routes_personal.create_work_proposal_inbox(_proposal_request(entry_id=candidate_id))
+        )
+    return outcome_id
+
+
+def _proposal_reconciliation_preview_request(
+    candidate_ids: list[str],
+    **overrides,
+) -> routes_personal.WorkProposalReconciliationPreviewRequest:
+    values = {
+        "reconciliation_id": "proposal-reconciliation-fixture",
+        "policy_id": routes_personal.KANBAN_PROPOSAL_RECONCILIATION_POLICY_ID,
+        "disposition": "superseded",
+        "candidate_item_refs": [f"xarta-kanban:item:{item_id}" for item_id in candidate_ids],
+        "semantic_owner_item_ref": "xarta-kanban:item:work-proposal-semantic-owner",
+        "canonical_outcome_item_ref": (
+            "xarta-kanban:item:proposal-reconciliation-canonical-outcome"
+        ),
+        "canonical_decision_id": "proposal-reconciliation-canonical-decision",
+        "reason": "The exact accepted owner outcome supersedes these duplicate requests.",
+        "proof_refs": ["pytest:proposal-reconciliation"],
+        "actor": "codex-test",
+        "source_surface": "pytest",
+    }
+    values.update(overrides)
+    return routes_personal.WorkProposalReconciliationPreviewRequest(**values)
+
+
 def _patch_kanban_backup_env(monkeypatch, tmp_path: Path, conn: sqlite3.Connection) -> Path:
     kanban_root = tmp_path / "kanban"
     backup_dir = kanban_root / "backups"
@@ -8763,6 +8834,269 @@ def test_work_proposal_inbox_producer_is_replay_safe_and_uses_discussion_for_sma
     assert status["inbox"]["count"] == 2
     assert status["inbox"]["open_count"] == 2
     assert status["inbox"]["entries"][0]["requested_operator_action"].startswith("Approve")
+
+
+def test_work_proposal_reconciliation_preview_apply_and_replay_preserve_history(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
+    candidate_ids = ["proposal-reconcile-a", "proposal-reconcile-b"]
+    _create_proposal_reconciliation_fixture(candidate_ids)
+    original_bodies = {
+        row["item_id"]: row["body_excerpt"]
+        for row in conn.execute(
+            "SELECT item_id, body_excerpt FROM kanban_items WHERE item_id IN (?, ?)",
+            candidate_ids,
+        ).fetchall()
+    }
+
+    preview_body = _proposal_reconciliation_preview_request(candidate_ids)
+    preview = asyncio.run(routes_personal.preview_work_proposal_reconciliation(preview_body))
+    second_preview = asyncio.run(routes_personal.preview_work_proposal_reconciliation(preview_body))
+
+    assert preview["all_eligible"] is True
+    assert preview["eligible_count"] == 2
+    assert preview["preview_fingerprint"] == second_preview["preview_fingerprint"]
+    assert all(candidate["reasons"] == [] for candidate in preview["candidates"])
+
+    apply_body = routes_personal.WorkProposalReconciliationApplyRequest(
+        **preview_body.model_dump(),
+        preview_fingerprint=preview["preview_fingerprint"],
+    )
+    applied = asyncio.run(routes_personal.apply_work_proposal_reconciliation(apply_body))
+    replay = asyncio.run(routes_personal.apply_work_proposal_reconciliation(apply_body))
+
+    assert applied["idempotent_replay"] is False
+    assert applied["applied_count"] == 2
+    assert replay["idempotent_replay"] is True
+    assert replay["request_hash"] == applied["request_hash"]
+    rows = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id IN (?, ?) ORDER BY item_id",
+        candidate_ids,
+    ).fetchall()
+    assert [row["state_id"] for row in rows] == ["done", "done"]
+    assert {row["item_id"]: row["body_excerpt"] for row in rows} == original_bodies
+    for row in rows:
+        proposal = json.loads(row["provenance_json"])["proposal_surface"]
+        assert proposal["status"] == "superseded"
+        assert proposal["reconciliation"]["canonical_decision_id"] == (
+            "proposal-reconciliation-canonical-decision"
+        )
+        assert proposal["reconciliation"]["request_hash"] == applied["request_hash"]
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_review_decisions "
+            "WHERE processor_kind='proposal_reconciliation'"
+        ).fetchone()["count"]
+        == 2
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_item_links "
+            "WHERE json_extract(metadata_json, '$.role')='reconciled_outcome'"
+        ).fetchone()["count"]
+        == 2
+    )
+    status = applied["proposal_surfaces"]["inbox"]
+    assert status["actionable_count"] == 0
+    assert status["superseded_count"] == 2
+    assert status["obsolete_count"] == 0
+    assert status["resolved_count"] == 2
+    assert status["history_count"] == 2
+    assert status["processed_count"] == 2
+    assert status["canonical_processed_count"] == 0
+
+    conflicting = routes_personal.WorkProposalReconciliationApplyRequest(
+        **{
+            **preview_body.model_dump(),
+            "reason": "A different meaning must not reuse the durable identity.",
+        },
+        preview_fingerprint=preview["preview_fingerprint"],
+    )
+    with pytest.raises(routes_personal.HTTPException) as conflict_info:
+        asyncio.run(routes_personal.apply_work_proposal_reconciliation(conflicting))
+    assert conflict_info.value.status_code == 409
+    assert conflict_info.value.detail["code"] == "proposal_reconciliation_conflicting_reuse"
+
+
+def test_work_proposal_reconciliation_rejects_drift_and_wrong_lineage(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
+    candidate_ids = ["proposal-reconcile-drift"]
+    _create_proposal_reconciliation_fixture(candidate_ids)
+    preview_body = _proposal_reconciliation_preview_request(candidate_ids)
+    preview = asyncio.run(routes_personal.preview_work_proposal_reconciliation(preview_body))
+    conn.execute(
+        "UPDATE kanban_items SET updated_at='2099-01-01T00:00:00Z' WHERE item_id=?",
+        (candidate_ids[0],),
+    )
+    conn.commit()
+    drift_apply = routes_personal.WorkProposalReconciliationApplyRequest(
+        **preview_body.model_dump(),
+        preview_fingerprint=preview["preview_fingerprint"],
+    )
+    with pytest.raises(routes_personal.HTTPException) as drift_info:
+        asyncio.run(routes_personal.apply_work_proposal_reconciliation(drift_apply))
+    assert drift_info.value.status_code == 409
+    assert drift_info.value.detail["code"] == "proposal_reconciliation_preview_drift"
+    assert (
+        conn.execute(
+            "SELECT state_id FROM kanban_items WHERE item_id=?", (candidate_ids[0],)
+        ).fetchone()["state_id"]
+        == "todo"
+    )
+
+    conn.execute(
+        "UPDATE kanban_item_links SET metadata_json=? "
+        "WHERE source_item_id=? AND json_extract(metadata_json, '$.role')='semantic_owner'",
+        (json.dumps({"role": "materially_different_owner"}), candidate_ids[0]),
+    )
+    conn.commit()
+    wrong_lineage = asyncio.run(routes_personal.preview_work_proposal_reconciliation(preview_body))
+    assert wrong_lineage["all_eligible"] is False
+    assert {reason["code"] for reason in wrong_lineage["candidates"][0]["reasons"]} == {
+        "candidate_semantic_owner_mismatch"
+    }
+
+
+def test_work_proposal_reconciliation_apply_is_atomic_and_status_queries_are_bounded(
+    monkeypatch,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    _create_proposal_surface_fixture()
+    candidate_ids = [f"proposal-reconcile-bounded-{index}" for index in range(6)]
+    _create_proposal_reconciliation_fixture(candidate_ids)
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    status = routes_personal._work_proposal_surfaces_status_from_conn(conn, 100)
+    conn.set_trace_callback(None)
+    selects = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("SELECT")
+        or statement.lstrip().upper().startswith("WITH")
+    ]
+    assert len(selects) <= 8
+    assert status["inbox"]["actionable_count"] == 6
+
+    preview_body = _proposal_reconciliation_preview_request(candidate_ids[:2])
+    preview = asyncio.run(routes_personal.preview_work_proposal_reconciliation(preview_body))
+    apply_body = routes_personal.WorkProposalReconciliationApplyRequest(
+        **preview_body.model_dump(),
+        preview_fingerprint=preview["preview_fingerprint"],
+    )
+    original_update = routes_personal.KanbanStore.update_item_row
+    calls = 0
+
+    def fail_second_update(self, item_id, payload, *, now):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected second-candidate failure")
+        return original_update(self, item_id, payload, now=now)
+
+    @contextmanager
+    def rollback_conn():
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    monkeypatch.setattr(routes_personal, "get_conn", rollback_conn)
+    monkeypatch.setattr(routes_personal.KanbanStore, "update_item_row", fail_second_update)
+    with pytest.raises(RuntimeError, match="injected second-candidate failure"):
+        asyncio.run(routes_personal.apply_work_proposal_reconciliation(apply_body))
+    assert [
+        row["state_id"]
+        for row in conn.execute(
+            "SELECT state_id FROM kanban_items WHERE item_id IN (?, ?) ORDER BY item_id",
+            candidate_ids[:2],
+        ).fetchall()
+    ] == ["todo", "todo"]
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS count FROM kanban_review_decisions "
+            "WHERE processor_kind='proposal_reconciliation'"
+        ).fetchone()["count"]
+        == 0
+    )
+
+
+def test_work_proposal_reconciliation_routes_dispatch_off_loop_and_reject_extra_fields(
+    monkeypatch,
+):
+    candidate_ids = ["proposal-reconcile-off-loop"]
+    preview_body = _proposal_reconciliation_preview_request(candidate_ids)
+    calls = []
+
+    async def fake_sync_work(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return {"ok": True, "func": func.__name__}
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", fake_sync_work)
+    preview = asyncio.run(routes_personal.preview_work_proposal_reconciliation(preview_body))
+    apply_body = routes_personal.WorkProposalReconciliationApplyRequest(
+        **preview_body.model_dump(),
+        preview_fingerprint="sha256:" + "1" * 64,
+    )
+    applied = asyncio.run(routes_personal.apply_work_proposal_reconciliation(apply_body))
+
+    assert preview["func"] == "_preview_work_proposal_reconciliation_sync"
+    assert applied["func"] == "_apply_work_proposal_reconciliation_sync"
+    assert [call[0] for call in calls] == [
+        routes_personal._preview_work_proposal_reconciliation_sync,
+        routes_personal._apply_work_proposal_reconciliation_sync,
+    ]
+    with pytest.raises(ValueError):
+        routes_personal.WorkProposalReconciliationPreviewRequest(
+            **preview_body.model_dump(),
+            fuzzy_title_selector="forbidden",
+        )
+
+
+def test_proposal_lifecycle_count_query_translates_for_postgres():
+    class CaptureCursor:
+        def fetchone(self):
+            return {
+                "total_count": 0,
+                "actionable_count": 0,
+                "processed_count": 0,
+                "canonical_processed_count": 0,
+                "superseded_count": 0,
+                "obsolete_count": 0,
+                "history_count": 0,
+                "resolved_count": 0,
+            }
+
+    class TranslatingPostgresConnection:
+        def __init__(self):
+            self.statement = ""
+            self.args = ()
+
+        def execute(self, sql, params=None):
+            self.statement, self.args = kanban_postgres.prepare_sqlite_query_for_postgres(
+                sql,
+                params,
+            )
+            return CaptureCursor()
+
+    conn = TranslatingPostgresConnection()
+    counts = routes_personal._work_proposal_surface_lifecycle_counts(
+        conn,
+        routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,
+    )
+
+    assert counts["total_count"] == 0
+    assert "json_extract" not in conn.statement.lower()
+    assert "((provenance_json)::jsonb #>> '{proposal_surface,status}')" in conn.statement
+    assert (
+        "((provenance_json)::jsonb #>> '{proposal_surface,reconciliation,disposition}')"
+    ) in conn.statement
+    assert conn.args == (routes_personal.KANBAN_OPERATOR_PROPOSAL_INBOX_ITEM_ID,)
 
 
 def test_work_proposal_operator_response_creates_outcome_and_owned_follow_up(
