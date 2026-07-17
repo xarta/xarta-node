@@ -288,6 +288,12 @@ async def test_long_doc_generation_reuses_existing_section_summary(tmp_path, mon
     monkeypatch.setattr(routes_docs, "_complete_doc_speech_local", fake_complete)
     monkeypatch.setattr(routes_docs, "_review_doc_speech_narration", fake_review)
     monkeypatch.setattr(routes_docs, "_clean_doc_speech_markdown", fake_clean)
+    ownership_targets = []
+    monkeypatch.setattr(
+        routes_docs.os,
+        "chown",
+        lambda path, _uid, _gid: ownership_targets.append(Path(path)),
+    )
 
     speech, meta = await routes_docs._generate_long_doc_speech(
         doc={"doc_id": "doc", "path": "docs/doc.md", "label": "Doc"},
@@ -299,6 +305,27 @@ async def test_long_doc_generation_reuses_existing_section_summary(tmp_path, mon
 
     assert speech == "Reviewed cohesive speech."
     assert meta["resumed_summary_count"] == 1
+    assert ownership_targets
+    assert all(target.is_relative_to(tmp_path) for target in ownership_targets)
+
+
+def test_docs_ownership_hand_back_refuses_target_outside_root(tmp_path, monkeypatch):
+    root = tmp_path / "docs-root"
+    target = tmp_path / "outside" / "document.md"
+    root.mkdir()
+    target.parent.mkdir()
+    target.write_text("content\n", encoding="utf-8")
+    calls = []
+
+    monkeypatch.setattr(
+        routes_docs.os,
+        "chown",
+        lambda path, uid, gid: calls.append((Path(path), uid, gid)),
+    )
+
+    routes_docs._normalize_ownership(root, target)
+
+    assert calls == []
 
 
 def test_long_doc_split_respects_headings_and_fenced_code(tmp_path):
@@ -316,7 +343,9 @@ def test_long_doc_split_respects_headings_and_fenced_code(tmp_path):
 
 
 def test_long_doc_split_groups_weak_heading_text_by_paragraph(tmp_path):
-    text = "\n\n".join(f"Paragraph {index} with enough words to count as a chunkable unit." for index in range(80))
+    text = "\n\n".join(
+        f"Paragraph {index} with enough words to count as a chunkable unit." for index in range(80)
+    )
 
     sections = split_sections(
         text,
@@ -330,7 +359,9 @@ def test_long_doc_split_groups_weak_heading_text_by_paragraph(tmp_path):
 
 
 def test_long_doc_split_groups_many_heading_sections(tmp_path):
-    text = "\n\n".join(f"## Heading {index}\n\nBody {index} " + ("word " * 20) for index in range(120))
+    text = "\n\n".join(
+        f"## Heading {index}\n\nBody {index} " + ("word " * 20) for index in range(120)
+    )
 
     sections = split_sections(
         text,

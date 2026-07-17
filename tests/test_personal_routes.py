@@ -6263,6 +6263,78 @@ def test_settings_upsert_sql_is_unambiguous_for_kanban_postgres_support_setting(
     assert "COALESCE(excluded.description, settings.description)" in statement
 
 
+def test_preprocessing_scan_cursor_multiline_json_extract_translates_for_postgres():
+    class EmptyCursor:
+        def fetchone(self):
+            return None
+
+    class TranslatingPostgresConnection:
+        def __init__(self):
+            self.statement = ""
+
+        def execute(self, sql, params=None):
+            self.statement, _args = kanban_postgres.prepare_sqlite_query_for_postgres(
+                sql,
+                params,
+            )
+            return EmptyCursor()
+
+    conn = TranslatingPostgresConnection()
+
+    assert routes_personal._work_preprocessing_scan_cursor(conn) == {
+        "audit_id": "",
+        "item_id": "",
+    }
+    assert "json_extract" not in conn.statement.lower()
+    assert (
+        "((successor.metadata_json)::jsonb #>> '{scan_cursor_previous_audit_id}')" in conn.statement
+    )
+
+
+def test_preprocessing_scan_cursor_uses_translation_in_postgres_connection_adapter(monkeypatch):
+    class FakeAsyncpgConnection:
+        def __init__(self):
+            self.statement = ""
+            self.args = ()
+
+        async def fetch(self, statement, *args):
+            self.statement = statement
+            self.args = args
+            return []
+
+    class FakeRunner:
+        def __init__(self):
+            self.connection = FakeAsyncpgConnection()
+
+        def acquire(self, database_url):
+            assert database_url == "postgresql://cursor-translation-test/db"
+            return object(), self.connection
+
+        def run(self, coroutine):
+            return asyncio.run(coroutine)
+
+        def release(self, pool, connection):
+            assert connection is self.connection
+
+    runner = FakeRunner()
+    monkeypatch.setattr(kanban_postgres, "_runner", lambda: runner)
+    conn = kanban_postgres.PostgresSyncConnection("postgresql://cursor-translation-test/db")
+    try:
+        assert routes_personal._work_preprocessing_scan_cursor(conn) == {
+            "audit_id": "",
+            "item_id": "",
+        }
+    finally:
+        conn.close()
+
+    assert "json_extract" not in runner.connection.statement.lower()
+    assert (
+        "((successor.metadata_json)::jsonb #>> "
+        "'{scan_cursor_previous_audit_id}')" in runner.connection.statement
+    )
+    assert runner.connection.args == ()
+
+
 def test_kanban_postgres_connections_reuse_bounded_owner_loop_pool(monkeypatch):
     created = []
 
