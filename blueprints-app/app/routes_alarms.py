@@ -5,16 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 import uuid
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from .db import get_conn, get_setting, set_setting
+from . import timing
+from .db import get_conn, get_read_conn, get_setting, set_setting
 from .events import AppEvent
 from .routes_events import publish_event
 
@@ -24,6 +26,7 @@ router = APIRouter(prefix="/alarms", tags=["alarms"])
 
 _SERVER_SETTINGS_KEY = "alarm.server.settings.v1"
 _SCHEDULER_POLL_SECONDS = 2.0
+_ALARM_SQLITE_BUSY_TIMEOUT_MS = 100
 _SLOT_COUNT = 5
 _ALARM_LOOP_MAX_SECONDS = 120
 _DAYS = set(range(7))
@@ -210,7 +213,10 @@ def clean_server_alarm_settings(value: Any) -> dict[str, Any]:
 
 
 def load_server_alarm_settings() -> dict[str, Any]:
-    with get_conn() as conn:
+    with get_read_conn(
+        busy_timeout_ms=_ALARM_SQLITE_BUSY_TIMEOUT_MS,
+        operation="alarm_server_settings",
+    ) as conn:
         raw = get_setting(conn, _SERVER_SETTINGS_KEY, "")
     if not raw:
         return default_server_alarm_settings()
@@ -231,6 +237,20 @@ def save_server_alarm_settings(settings: dict[str, Any]) -> dict[str, Any]:
             "Node-local server-side alarm clock settings",
         )
     return clean
+
+
+async def _run_alarm_sync_work(label: str, func, *args):
+    return await timing.to_thread(f"alarms.{label}", func, *args)
+
+
+async def _run_alarm_route_sync_work(label: str, func, *args):
+    try:
+        return await _run_alarm_sync_work(label, func, *args)
+    except sqlite3.OperationalError as exc:
+        message = str(exc).lower()
+        if "database is locked" in message or "database is busy" in message:
+            raise HTTPException(status_code=503, detail="database_locked") from exc
+        raise
 
 
 def _prune_browser_state_responses(now: float | None = None) -> None:
@@ -288,24 +308,41 @@ async def _publish_ring(slot: dict[str, Any], cycle_id: str, settings: dict[str,
     await publish_event(event)
 
 
+async def _run_alarm_scheduler_tick() -> dict[str, Any]:
+    settings = await _run_alarm_sync_work(
+        "scheduler.load_settings",
+        load_server_alarm_settings,
+    )
+    now = _now_for_settings(settings)
+    dirty = False
+    fired_count = 0
+    for slot in settings.get("slots", []):
+        cycle_id = _slot_due(slot, now)
+        if not cycle_id:
+            continue
+        slot["last_fired_cycle"] = cycle_id
+        if not slot.get("recurring"):
+            slot["enabled"] = False
+        dirty = True
+        fired_count += 1
+        await _publish_ring(dict(slot), cycle_id, settings)
+    if dirty:
+        await _run_alarm_sync_work(
+            "scheduler.save_settings",
+            save_server_alarm_settings,
+            settings,
+        )
+    return {
+        "dirty": dirty,
+        "fired_count": fired_count,
+    }
+
+
 async def run_alarm_scheduler() -> None:
     """Poll server alarm settings and publish SSE ring events when due."""
     while True:
         try:
-            settings = load_server_alarm_settings()
-            now = _now_for_settings(settings)
-            dirty = False
-            for slot in settings.get("slots", []):
-                cycle_id = _slot_due(slot, now)
-                if not cycle_id:
-                    continue
-                slot["last_fired_cycle"] = cycle_id
-                if not slot.get("recurring"):
-                    slot["enabled"] = False
-                dirty = True
-                await _publish_ring(dict(slot), cycle_id, settings)
-            if dirty:
-                save_server_alarm_settings(settings)
+            await _run_alarm_scheduler_tick()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -315,12 +352,21 @@ async def run_alarm_scheduler() -> None:
 
 @router.get("/server-settings")
 async def get_server_settings() -> dict[str, Any]:
-    return {"ok": True, "settings": load_server_alarm_settings()}
+    settings = await _run_alarm_route_sync_work(
+        "server_settings.read",
+        load_server_alarm_settings,
+    )
+    return {"ok": True, "settings": settings}
 
 
 @router.put("/server-settings")
 async def put_server_settings(body: AlarmSettingsBody) -> dict[str, Any]:
-    return {"ok": True, "settings": save_server_alarm_settings(body.settings)}
+    settings = await _run_alarm_route_sync_work(
+        "server_settings.write",
+        save_server_alarm_settings,
+        body.settings,
+    )
+    return {"ok": True, "settings": settings}
 
 
 @router.post("/browser-state")

@@ -19,6 +19,7 @@ from typing import Any
 
 import asyncpg
 
+from . import config as cfg
 from .kanban_datastore import KANBAN_DATASTORE_TABLES
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -34,6 +35,10 @@ _PRAGMA_TABLE_INFO_RE = re.compile(
 
 class KanbanPostgresError(RuntimeError):
     """Raised when the Postgres candidate cannot be safely used."""
+
+
+class KanbanPostgresPoolTimeout(KanbanPostgresError):
+    """Raised when the bounded Kanban Postgres pool cannot provide a connection."""
 
 
 class PostgresRow(dict[str, Any]):
@@ -75,12 +80,71 @@ class _AsyncpgRunner:
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._pool_lock = asyncio.Lock()
+        self._pools: dict[str, asyncpg.Pool] = {}
         self._ready.set()
         self._loop.run_forever()
 
     def run(self, coro: Any, *, timeout: float = 60.0) -> Any:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
+
+    async def _pool(self, database_url: str) -> asyncpg.Pool:
+        pool = self._pools.get(database_url)
+        if pool is not None:
+            return pool
+        async with self._pool_lock:
+            pool = self._pools.get(database_url)
+            if pool is None:
+                pool = await asyncpg.create_pool(
+                    database_url,
+                    min_size=cfg.KANBAN_POSTGRES_POOL_MIN_SIZE,
+                    max_size=cfg.KANBAN_POSTGRES_POOL_MAX_SIZE,
+                    timeout=10,
+                    command_timeout=60,
+                    max_inactive_connection_lifetime=300.0,
+                    statement_cache_size=0,
+                    server_settings={
+                        "application_name": f"blueprints-kanban:{cfg.NODE_ID}"[:63],
+                        "jit": "off",
+                    },
+                )
+                self._pools[database_url] = pool
+            return pool
+
+    def acquire(self, database_url: str) -> tuple[asyncpg.Pool, Any]:
+        async def acquire_connection() -> tuple[asyncpg.Pool, Any]:
+            pool = await self._pool(database_url)
+            try:
+                connection = await pool.acquire(timeout=10)
+            except TimeoutError as exc:
+                raise KanbanPostgresPoolTimeout(
+                    "Kanban Postgres connection pool remained saturated for 10 seconds"
+                ) from exc
+            return pool, connection
+
+        return self.run(acquire_connection())
+
+    def release(self, pool: asyncpg.Pool, connection: Any) -> None:
+        self.run(pool.release(connection, timeout=10))
+
+    def close_pools(self) -> None:
+        async def close() -> None:
+            pools = list(self._pools.values())
+            self._pools.clear()
+            for pool in pools:
+                try:
+                    await asyncio.wait_for(pool.close(), timeout=30)
+                except TimeoutError:
+                    pool.terminate()
+
+        self.run(close(), timeout=35)
+
+    def shutdown(self) -> None:
+        with suppress(Exception):
+            self.close_pools()
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5)
 
 
 _RUNNER: _AsyncpgRunner | None = None
@@ -289,9 +353,7 @@ class PostgresSyncConnection:
             raise KanbanPostgresError("Postgres candidate database URL is not configured")
         self.database_url = database_url
         self._runner = _runner()
-        self._conn = self._runner.run(
-            asyncpg.connect(database_url, timeout=10, statement_cache_size=0)
-        )
+        self._pool, self._conn = self._runner.acquire(database_url)
         self._transaction: asyncpg.transaction.Transaction | None = None
 
     def close(self) -> None:
@@ -299,8 +361,9 @@ class PostgresSyncConnection:
             if self._transaction is not None:
                 with suppress(Exception):
                     self.rollback()
-            self._runner.run(self._conn.close())
-            self._conn = None
+            connection, self._conn = self._conn, None
+            pool, self._pool = self._pool, None
+            self._runner.release(pool, connection)
 
     def begin(self) -> None:
         if self._transaction is not None:
@@ -375,6 +438,13 @@ class PostgresSyncConnection:
 
 def postgres_candidate_connection(database_url: str) -> PostgresSyncConnection:
     return PostgresSyncConnection(database_url)
+
+
+def close_postgres_candidate_pools() -> None:
+    with _RUNNER_LOCK:
+        runner = _RUNNER
+    if runner is not None:
+        runner.close_pools()
 
 
 def _postgres_table_info(

@@ -4,7 +4,7 @@
   "version": "2026-07-16",
   "title": "Kanban automation idle worker contract",
   "source_of_truth": true,
-  "summary": "Kanban semantic discovery and processing remain in Blueprints/Hermes while an explicit producer mode fences legacy recurrence from the typed xarta-scheduler provider. Only the nominated singleton owner may run automatic or manual recovery work. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff. Range-type runtime config values must expose raw, default, accepted range, effective value, source, and state in Automation Status.",
+  "summary": "Kanban semantic discovery and processing remain in Blueprints/Hermes while an explicit producer mode fences the legacy 60-second Blueprints loop and hourly Hermes blocker job from two typed xarta-scheduler targets. Only the nominated singleton owner may run automatic or manual recovery work. Automation exclusion flags opt branches out; root scopes are optional narrowing controls, not required inclusion gates. Retryable Review Processor and preprocessing failures are recorded as durable events and retried with capped backoff. Range-type runtime config values must expose raw, default, accepted range, effective value, source, and state in Automation Status.",
   "singleton_guard": {
     "required": true,
     "owner_node_env": "BLUEPRINTS_KANBAN_AUTOMATION_OWNER_NODE_ID",
@@ -21,13 +21,28 @@
     "env": "BLUEPRINTS_KANBAN_AUTOMATION_PRODUCER_MODE",
     "default": "legacy",
     "allowed": {
-      "legacy": "Blueprints lifespan loop is the sole automatic producer; scheduler provider is disabled.",
-      "scheduler_shadow": "Blueprints lifespan loop remains the sole mutating producer; scheduler provider performs read-only discovery/blocker shadow work.",
-      "scheduler": "Blueprints lifespan loop is fenced; the typed scheduler provider is the sole automatic producer.",
-      "fenced": "Both automatic recurrence paths are fenced; owner-node manual recovery remains available."
+      "legacy": "Blueprints lifespan loop runs the 60-second automation tick and the Hermes job runs the hourly blocker tick; scheduler provider is disabled.",
+      "scheduler_shadow": "The legacy Blueprints/Hermes recurrence pair remains mutating; scheduler automation performs read-only discovery and scheduler blocker execution is dry-run only.",
+      "scheduler": "The Blueprints lifespan loop and Hermes hourly recurrence are fenced; the two typed scheduler targets are the sole automatic recurrence owners.",
+      "fenced": "Legacy and scheduler automatic recurrence paths are fenced; owner-node manual recovery remains available."
     },
     "invalid_behavior": "fail_closed_to_fenced",
     "scheduler_target": "blueprints_kanban_automation_tick_v1",
+    "scheduler_blocker_target": "blueprints_kanban_blocker_tick_v1",
+    "scheduler_targets": {
+      "automation": {
+        "target_key": "blueprints_kanban_automation_tick_v1",
+        "interval_seconds": 60,
+        "result_schema": "xarta.blueprints.kanban_automation_tick.result.v1",
+        "tick_id_template": "blueprints-kanban-automation:<scheduler-run-id>"
+      },
+      "blocker": {
+        "target_key": "blueprints_kanban_blocker_tick_v1",
+        "interval_seconds": 3600,
+        "result_schema": "xarta.blueprints.kanban_blocker_tick.result.v1",
+        "tick_id_template": "blueprints-kanban-automation:blocker:<scheduler-run-id>"
+      }
+    },
     "scheduler_provider": "blueprints-kanban-automation",
     "scheduler_worker_template": "blueprints-kanban-automation:<configured-owner-node-id>",
     "status_surface": "GET /api/v1/personal/kanban/scheduler/status",

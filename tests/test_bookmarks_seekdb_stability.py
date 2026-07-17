@@ -247,12 +247,192 @@ def test_async_paths_use_seekdb_isolation_wrappers():
     health_source = inspect.getsource(routes_bookmarks.bookmarks_health)
     search_source = inspect.getsource(routes_bookmarks.search_bookmarks)
     sync_source = inspect.getsource(seekdb_sync._sync_once_body)
+    bookmark_sync_source = inspect.getsource(seekdb_sync._sync_bookmarks_stale)
+    visit_sync_source = inspect.getsource(seekdb_sync._sync_visits_stale)
+    reindex_source = inspect.getsource(seekdb_sync.reindex_all)
+    event_source = inspect.getsource(seekdb_sync._publish_seekdb_status_event)
+    analyze_route_source = inspect.getsource(routes_bookmarks.post_analyze_domains)
 
     assert "await seekdb_counts_async" in health_source
     assert "seekdb_counts()" not in health_source
     assert "keyword_search_bookmarks_async" in search_source
     assert "vector_search_visits_async" in search_source
     assert "await init_seekdb_async" in sync_source
+    assert "await timing.to_thread" in bookmark_sync_source
+    assert "get_conn(" not in bookmark_sync_source
+    assert "await timing.to_thread" in visit_sync_source
+    assert "get_conn(" not in visit_sync_source
+    assert "await timing.to_thread" in reindex_source
+    assert "get_conn(" not in reindex_source
+    assert "await timing.to_thread" in event_source
+    assert "await timing.to_thread" in analyze_route_source
+
+
+def test_seekdb_sync_sqlite_snapshot_runs_off_event_loop(monkeypatch):
+    async def run():
+        def slow_load():
+            time.sleep(0.15)
+            return []
+
+        async def empty_metadata():
+            return [], []
+
+        monkeypatch.setattr(seekdb_sync, "_load_bookmark_rows_sync", slow_load)
+        monkeypatch.setattr(seekdb_sync, "bookmark_index_metadata_async", empty_metadata)
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            deadline = time.perf_counter() + 0.08
+            while time.perf_counter() < deadline:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        sync_task = asyncio.create_task(seekdb_sync._sync_bookmarks_stale())
+        await ticker()
+
+        assert ticks >= 5
+        assert not sync_task.done()
+        assert await sync_task == (0, 0)
+
+    asyncio.run(run())
+
+
+def test_seekdb_reindex_releases_sqlite_before_async_index_writes(monkeypatch):
+    async def run():
+        calls = []
+        row = {
+            "bookmark_id": "bookmark-1",
+            "normalized_url": "https://example.test/",
+            "title": "Example",
+            "description": "",
+            "tags_json": "[]",
+            "notes": "",
+            "url": "https://example.test/",
+        }
+
+        def load_source():
+            calls.append("sqlite-source")
+            return set(), set(), [row]
+
+        async def embed_texts(texts):
+            calls.append("network-embed")
+            assert texts == ["Example"]
+            return [[0.25]]
+
+        def load_stats(normalized_urls):
+            calls.append("sqlite-stats")
+            assert normalized_urls == ["https://example.test/"]
+            return {"https://example.test/": (2, "2026-07-16T00:00:00Z")}
+
+        async def upsert(**kwargs):
+            calls.append("seekdb-upsert")
+            assert kwargs["visit_count"] == 2
+            assert kwargs["last_visited"] == "2026-07-16T00:00:00Z"
+
+        monkeypatch.setattr(seekdb_sync, "_load_reindex_source_sync", load_source)
+        monkeypatch.setattr(seekdb_sync, "_embed_texts", embed_texts)
+        monkeypatch.setattr(seekdb_sync, "_bookmark_visit_stats_sync", load_stats)
+        monkeypatch.setattr(seekdb_sync, "upsert_bookmark_index_async", upsert)
+
+        await seekdb_sync.reindex_all()
+
+        assert calls == [
+            "sqlite-source",
+            "network-embed",
+            "sqlite-stats",
+            "seekdb-upsert",
+        ]
+        assert seekdb_sync.get_reindex_state() == {
+            "running": False,
+            "done": 1,
+            "total": 1,
+            "error": None,
+        }
+
+    asyncio.run(run())
+
+
+def test_seekdb_status_event_persistence_runs_off_event_loop(monkeypatch):
+    async def run():
+        persisted = []
+        published = []
+
+        def slow_persist(event):
+            time.sleep(0.15)
+            persisted.append(event.event_id)
+
+        async def publish(event):
+            published.append(event.event_id)
+
+        monkeypatch.setattr(
+            seekdb_sync,
+            "_persist_seekdb_status_event_sync",
+            slow_persist,
+        )
+        monkeypatch.setattr(seekdb_sync.bus, "publish", publish)
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            deadline = time.perf_counter() + 0.08
+            while time.perf_counter() < deadline:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        event_task = asyncio.create_task(
+            seekdb_sync._publish_seekdb_status_event(
+                event_type="browser_links.seekdb.test",
+                severity="info",
+                title="Test",
+                message="Test event",
+                payload={},
+            )
+        )
+        await ticker()
+
+        assert ticks >= 5
+        assert not event_task.done()
+        await event_task
+        assert persisted == published
+        assert len(persisted) == 1
+
+    asyncio.run(run())
+
+
+def test_analyze_domains_route_runs_sqlite_work_off_event_loop(monkeypatch):
+    async def run():
+        def slow_analyze(threshold):
+            time.sleep(0.15)
+            assert threshold == 4
+            return ["example.test"]
+
+        monkeypatch.setattr(routes_bookmarks, "_do_analyze_domains", slow_analyze)
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            deadline = time.perf_counter() + 0.08
+            while time.perf_counter() < deadline:
+                ticks += 1
+                await asyncio.sleep(0.005)
+
+        route_task = asyncio.create_task(
+            routes_bookmarks.post_analyze_domains({"domain_threshold": 4})
+        )
+        await ticker()
+
+        assert ticks >= 5
+        assert not route_task.done()
+        assert await route_task == {
+            "rare_domains_count": 1,
+            "threshold": 4,
+        }
+
+    asyncio.run(run())
 
 
 def test_create_visit_sqlite_work_runs_off_event_loop(monkeypatch):

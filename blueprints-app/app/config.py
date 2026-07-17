@@ -32,6 +32,17 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _bounded_env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    """Parse one bounded integer setting without making malformed optional env fatal."""
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None else int(raw.strip())
+    except (TypeError, ValueError):
+        log.warning("%s=%r is not an integer; using default %d", name, raw, default)
+        value = default
+    return max(minimum, min(maximum, value))
+
+
 # ── Node identity (stays in .env) ─────────────────────────────────────────────
 NODE_ID: str = os.environ.get("BLUEPRINTS_NODE_ID", "")
 if not NODE_ID:
@@ -197,6 +208,22 @@ KANBAN_POSTGRES_EXPORT_DIR: str = os.environ.get(
 KANBAN_DATASTORE_CONFIG = load_kanban_datastore_config(os.environ)
 KANBAN_DATASTORE_MODE: str = KANBAN_DATASTORE_CONFIG.active_store
 KANBAN_CANDIDATE_STORE_BACKEND: str = KANBAN_DATASTORE_CONFIG.candidate_backend
+KANBAN_POSTGRES_POOL_MIN_SIZE: int = _bounded_env_int(
+    "BLUEPRINTS_KANBAN_POSTGRES_POOL_MIN_SIZE",
+    1,
+    minimum=0,
+    maximum=4,
+)
+KANBAN_POSTGRES_POOL_MAX_SIZE: int = _bounded_env_int(
+    "BLUEPRINTS_KANBAN_POSTGRES_POOL_MAX_SIZE",
+    4,
+    minimum=1,
+    maximum=16,
+)
+KANBAN_POSTGRES_POOL_MIN_SIZE = min(
+    KANBAN_POSTGRES_POOL_MIN_SIZE,
+    KANBAN_POSTGRES_POOL_MAX_SIZE,
+)
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 GUI_DIR: str = os.environ.get("BLUEPRINTS_GUI_DIR", "/data/gui")

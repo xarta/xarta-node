@@ -24,15 +24,20 @@ from . import routes_personal
 log = logging.getLogger(__name__)
 
 PROVIDER_ID = "blueprints-kanban-automation"
-TARGET_KEY = "blueprints_kanban_automation_tick_v1"
+AUTOMATION_TARGET_KEY = "blueprints_kanban_automation_tick_v1"
+BLOCKER_TARGET_KEY = "blueprints_kanban_blocker_tick_v1"
+TARGET_KEYS = frozenset({AUTOMATION_TARGET_KEY, BLOCKER_TARGET_KEY})
+TARGET_KEY = AUTOMATION_TARGET_KEY
 STATUS_SCHEMA = "xarta.blueprints.kanban_automation.scheduler_status.v1"
 RESULT_SCHEMA = "xarta.blueprints.kanban_automation_tick.result.v1"
+BLOCKER_RESULT_SCHEMA = "xarta.blueprints.kanban_blocker_tick.result.v1"
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:18111"
 TOKEN_ENV = "XARTA_SCHEDULER_PROVIDER_BLUEPRINTS_KANBAN_AUTOMATION_TOKEN"
 TOKEN_FILE_ENV = "XARTA_SCHEDULER_PROVIDER_BLUEPRINTS_KANBAN_AUTOMATION_TOKEN_FILE"
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_RESULT_BYTES = 30 * 1024
 REQUEST_TIMEOUT_SECONDS = 3.0
+REPORT_TIMEOUT_SECONDS = 15.0
 TARGET_TIMEOUT_SECONDS = 840.0
 BLOCKER_TIMEOUT_SECONDS = 330.0
 BLOCKER_MAX_OUTPUT_BYTES = 1024 * 1024
@@ -140,12 +145,20 @@ def load_provider_config() -> ProviderConfig:
     )
 
 
+def _scheduler_http_client(config: ProviderConfig) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=config.base_url,
+        timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=1.0),
+        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        trust_env=False,
+    )
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _provider_worker_id() -> str:
-    producer = routes_personal._work_automation_idle_worker_config()
+def _provider_worker_id(producer: dict[str, Any]) -> str:
     owner_node_id = str(producer.get("owner_node_id") or "unconfigured-owner")
     return f"{PROVIDER_ID}:{owner_node_id}"
 
@@ -170,7 +183,12 @@ def _safe_failure(exc: BaseException) -> str:
     return f"{type(exc).__name__}: Kanban automation target failed"
 
 
-def _failure_reasons(tick: dict[str, Any], blocker: dict[str, Any]) -> list[str]:
+def _failure_reasons(
+    tick: dict[str, Any] | None = None,
+    blocker: dict[str, Any] | None = None,
+) -> list[str]:
+    tick = tick or {}
+    blocker = blocker or {}
     reasons: list[str] = []
     for marker in tick.get("processed_markers") or []:
         if isinstance(marker, dict) and marker.get("ok") is False:
@@ -184,7 +202,7 @@ def _failure_reasons(tick: dict[str, Any], blocker: dict[str, Any]) -> list[str]
     return reasons[:20]
 
 
-def _phase_counts(tick: dict[str, Any], blocker: dict[str, Any]) -> dict[str, int]:
+def _automation_phase_counts(tick: dict[str, Any]) -> dict[str, int]:
     timeout = tick.get("timeout_requeue") if isinstance(tick.get("timeout_requeue"), dict) else {}
     review = tick.get("review_scan") if isinstance(tick.get("review_scan"), dict) else {}
     preprocessing = (
@@ -198,13 +216,10 @@ def _phase_counts(tick: dict[str, Any], blocker: dict[str, Any]) -> dict[str, in
         "preprocessing_queued": int(preprocessing.get("queued_count") or 0),
         "eligible_markers": int(tick.get("eligible_marker_count") or 0),
         "processed_markers": int(tick.get("processed_count") or 0),
-        "blocker_candidates": int(blocker.get("candidate_count") or 0),
-        "blockers_examined": int(blocker.get("examined") or 0),
-        "blockers_processed": int(blocker.get("processed") or 0),
     }
 
 
-def _shadow_phase_counts(snapshot: dict[str, Any], blocker: dict[str, Any]) -> dict[str, int]:
+def _automation_shadow_phase_counts(snapshot: dict[str, Any]) -> dict[str, int]:
     return {
         "timeout_candidates": len(snapshot.get("timeout_marker_ids") or []),
         "review_candidates": len(snapshot.get("review_candidate_ids") or []),
@@ -212,8 +227,14 @@ def _shadow_phase_counts(snapshot: dict[str, Any], blocker: dict[str, Any]) -> d
         "preprocessing_candidates": len(snapshot.get("preprocessing_candidate_ids") or []),
         "preprocessing_would_queue": len(snapshot.get("preprocessing_queue_item_ids") or []),
         "claimable_markers": len(snapshot.get("claimable_marker_ids") or []),
+    }
+
+
+def _blocker_phase_counts(blocker: dict[str, Any]) -> dict[str, int]:
+    return {
         "blocker_candidates": int(blocker.get("candidate_count") or 0),
         "blockers_examined": int(blocker.get("examined") or 0),
+        "blockers_processed": int(blocker.get("processed") or 0),
     }
 
 
@@ -300,17 +321,30 @@ class KanbanAutomationScheduler:
         self.config = config
         self.client = client
         self._owns_client = client is None
-        self.worker_id = _provider_worker_id()
+        self.worker_id = ""
         self._loop_tasks: list[asyncio.Task[Any]] = []
         self._active_runs: dict[str, asyncio.Task[Any]] = {}
+        self._status_lock: asyncio.Lock | None = None
+        self._status_inflight_task: asyncio.Task[dict[str, Any]] | None = None
         self._closing = False
         self._last_error = ""
         self.config_error = ""
 
+    def _get_status_lock(self) -> asyncio.Lock:
+        if self._status_lock is None:
+            self._status_lock = asyncio.Lock()
+        return self._status_lock
+
+    async def _producer_config(self) -> dict[str, Any]:
+        producer = await asyncio.to_thread(routes_personal._work_automation_idle_worker_config)
+        if not self.worker_id:
+            self.worker_id = _provider_worker_id(producer)
+        return producer
+
     async def start(self) -> bool:
         if self._loop_tasks:
             return True
-        producer = routes_personal._work_automation_idle_worker_config()
+        producer = await self._producer_config()
         if not producer["scheduler_provider_effective_enabled"]:
             log.info(
                 "Kanban scheduler provider disabled by producer mode %s",
@@ -318,18 +352,13 @@ class KanbanAutomationScheduler:
             )
             return False
         try:
-            self.config = self.config or load_provider_config()
+            self.config = self.config or await asyncio.to_thread(load_provider_config)
         except (OSError, UnicodeError, ValueError) as exc:
             self.config_error = type(exc).__name__
             log.warning("Kanban scheduler provider disabled: invalid configuration")
             return False
         if self.client is None:
-            self.client = httpx.AsyncClient(
-                base_url=self.config.base_url,
-                timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=1.0),
-                limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
-                trust_env=False,
-            )
+            self.client = _scheduler_http_client(self.config)
         if not self.config.token:
             log.info("Kanban scheduler provider disabled: token is not configured")
             return False
@@ -343,6 +372,9 @@ class KanbanAutomationScheduler:
     async def stop(self) -> None:
         self._closing = True
         tasks = [*self._loop_tasks, *self._active_runs.values()]
+        if self._status_inflight_task is not None and not self._status_inflight_task.done():
+            tasks.append(self._status_inflight_task)
+        self._status_inflight_task = None
         self._loop_tasks.clear()
         for task in tasks:
             task.cancel()
@@ -368,13 +400,9 @@ class KanbanAutomationScheduler:
         authenticated: bool = False,
     ) -> dict[str, Any]:
         if self.client is None:
-            config = self.config or load_provider_config()
+            config = self.config or await asyncio.to_thread(load_provider_config)
             self.config = config
-            self.client = httpx.AsyncClient(
-                base_url=config.base_url,
-                timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=1.0),
-                trust_env=False,
-            )
+            self.client = _scheduler_http_client(config)
         response = await self.client.request(
             method,
             path,
@@ -402,6 +430,7 @@ class KanbanAutomationScheduler:
             run_ids = list(self._active_runs)[:32]
             state = "running" if run_ids else ("degraded" if self._last_error else "idle")
             try:
+                producer = await self._producer_config()
                 await self._request_json(
                     "POST",
                     f"/providers/{PROVIDER_ID}/heartbeat",
@@ -411,7 +440,7 @@ class KanbanAutomationScheduler:
                         "current_run_ids": run_ids,
                         "metadata": {
                             "protocol": "blueprints-kanban-automation-provider-v1",
-                            "producer_mode": routes_personal._work_automation_producer_mode(),
+                            "producer_mode": producer["producer_mode"],
                         },
                         "last_error": self._last_error,
                     },
@@ -541,33 +570,50 @@ class KanbanAutomationScheduler:
     async def _execute_target(self, claim: dict[str, Any]) -> dict[str, Any]:
         run = claim.get("run") if isinstance(claim.get("run"), dict) else {}
         scheduler_run_id = str(run.get("run_id") or "")
-        if run.get("target_key") != TARGET_KEY or not scheduler_run_id:
+        target_key = str(run.get("target_key") or "")
+        if target_key not in TARGET_KEYS or not scheduler_run_id:
             raise TargetRejected("claim target is outside the Kanban automation allowlist")
         target_config = claim.get("target_config")
         if not isinstance(target_config, dict) or target_config:
             raise TargetRejected("Kanban automation target config must be exactly empty")
-        tick_id = f"{PROVIDER_ID}:{scheduler_run_id}"
-        producer = routes_personal._work_automation_idle_worker_config()
+        tick_id = (
+            f"{PROVIDER_ID}:{scheduler_run_id}"
+            if target_key == AUTOMATION_TARGET_KEY
+            else f"{PROVIDER_ID}:blocker:{scheduler_run_id}"
+        )
+        producer = await self._producer_config()
         if not producer["scheduler_provider_effective_enabled"]:
             raise TargetRejected("Kanban scheduler provider is fenced on this node")
 
         if producer["producer_mode"] == "scheduler_shadow":
-            snapshot, blocker = await asyncio.gather(
-                routes_personal.work_kanban_automation_shadow_snapshot(),
-                _run_blocker_resolver(
-                    tick_id=tick_id,
-                    worker_id=self.worker_id,
-                    apply=False,
-                ),
+            if target_key == AUTOMATION_TARGET_KEY:
+                snapshot = await routes_personal.work_kanban_automation_shadow_snapshot()
+                result = {
+                    "schema": RESULT_SCHEMA,
+                    "scheduler_run_id": scheduler_run_id,
+                    "tick_id": tick_id,
+                    "producer_node_id": str(producer.get("owner_node_id") or ""),
+                    "outcome": "skipped",
+                    "coverage_complete": True,
+                    "truncated": False,
+                    "error_count": 0,
+                    "phase_counts": _automation_shadow_phase_counts(snapshot),
+                    "failure_reasons": [],
+                }
+                return _bounded_result(result)
+            blocker = await _run_blocker_resolver(
+                tick_id=tick_id,
+                worker_id=self.worker_id,
+                apply=False,
             )
-            reasons = _failure_reasons({}, blocker)
+            reasons = _failure_reasons(blocker=blocker)
             blocker_candidates = int(blocker.get("candidate_count") or 0)
             blocker_examined = int(blocker.get("examined") or 0)
             truncated = bool(
                 blocker.get("run_timeout_reached") or blocker_candidates > blocker_examined
             )
             result = {
-                "schema": RESULT_SCHEMA,
+                "schema": BLOCKER_RESULT_SCHEMA,
                 "scheduler_run_id": scheduler_run_id,
                 "tick_id": tick_id,
                 "producer_node_id": str(producer.get("owner_node_id") or ""),
@@ -579,7 +625,7 @@ class KanbanAutomationScheduler:
                 "coverage_complete": not truncated,
                 "truncated": truncated,
                 "error_count": len(reasons),
-                "phase_counts": _shadow_phase_counts(snapshot, blocker),
+                "phase_counts": _blocker_phase_counts(blocker),
                 "failure_reasons": reasons,
             }
             return _bounded_result(result)
@@ -590,47 +636,67 @@ class KanbanAutomationScheduler:
         if replay is not None:
             return _bounded_result(replay)
 
-        tick = await routes_personal.run_work_kanban_automation_idle_tick(
-            holder_id=self.worker_id,
-            run_id=tick_id,
-            actor=self.worker_id,
-            source_surface="xarta-scheduler-provider",
-            request_id=tick_id,
-            producer_source="scheduler",
-        )
-        blocker = await _run_blocker_resolver(
-            tick_id=tick_id,
-            worker_id=self.worker_id,
-            apply=True,
-        )
-        reasons = _failure_reasons(tick, blocker)
-        eligible = int(tick.get("eligible_marker_count") or 0)
-        processed = int(tick.get("processed_count") or 0)
-        blocker_candidates = int(blocker.get("candidate_count") or 0)
-        blocker_examined = int(blocker.get("examined") or 0)
-        truncated = bool(
-            eligible > processed
-            or blocker.get("run_timeout_reached")
-            or blocker_candidates > blocker_examined
-        )
-        skipped = tick.get("lease_acquired") is False and not reasons and not truncated
-        outcome = (
-            "truncated"
-            if truncated
-            else ("completed_with_errors" if reasons else ("skipped" if skipped else "completed"))
-        )
-        result = {
-            "schema": RESULT_SCHEMA,
-            "scheduler_run_id": scheduler_run_id,
-            "tick_id": tick_id,
-            "producer_node_id": str(producer.get("owner_node_id") or ""),
-            "outcome": outcome,
-            "coverage_complete": not truncated,
-            "truncated": truncated,
-            "error_count": len(reasons),
-            "phase_counts": _phase_counts(tick, blocker),
-            "failure_reasons": reasons,
-        }
+        if target_key == AUTOMATION_TARGET_KEY:
+            tick = await routes_personal.run_work_kanban_automation_idle_tick(
+                holder_id=self.worker_id,
+                run_id=tick_id,
+                actor=self.worker_id,
+                source_surface="xarta-scheduler-provider",
+                request_id=tick_id,
+                producer_source="scheduler",
+            )
+            reasons = _failure_reasons(tick=tick)
+            eligible = int(tick.get("eligible_marker_count") or 0)
+            processed = int(tick.get("processed_count") or 0)
+            truncated = eligible > processed
+            skipped = tick.get("lease_acquired") is False and not reasons and not truncated
+            outcome = (
+                "truncated"
+                if truncated
+                else (
+                    "completed_with_errors" if reasons else ("skipped" if skipped else "completed")
+                )
+            )
+            result = {
+                "schema": RESULT_SCHEMA,
+                "scheduler_run_id": scheduler_run_id,
+                "tick_id": tick_id,
+                "producer_node_id": str(producer.get("owner_node_id") or ""),
+                "outcome": outcome,
+                "coverage_complete": not truncated,
+                "truncated": truncated,
+                "error_count": len(reasons),
+                "phase_counts": _automation_phase_counts(tick),
+                "failure_reasons": reasons,
+            }
+        else:
+            blocker = await _run_blocker_resolver(
+                tick_id=tick_id,
+                worker_id=self.worker_id,
+                apply=True,
+            )
+            reasons = _failure_reasons(blocker=blocker)
+            blocker_candidates = int(blocker.get("candidate_count") or 0)
+            blocker_examined = int(blocker.get("examined") or 0)
+            truncated = bool(
+                blocker.get("run_timeout_reached") or blocker_candidates > blocker_examined
+            )
+            result = {
+                "schema": BLOCKER_RESULT_SCHEMA,
+                "scheduler_run_id": scheduler_run_id,
+                "tick_id": tick_id,
+                "producer_node_id": str(producer.get("owner_node_id") or ""),
+                "outcome": (
+                    "truncated"
+                    if truncated
+                    else ("completed_with_errors" if reasons else "completed")
+                ),
+                "coverage_complete": not truncated,
+                "truncated": truncated,
+                "error_count": len(reasons),
+                "phase_counts": _blocker_phase_counts(blocker),
+                "failure_reasons": reasons,
+            }
         result = _bounded_result(result)
         return await routes_personal.record_work_kanban_automation_tick_receipt(
             tick_id=tick_id,
@@ -646,6 +712,7 @@ class KanbanAutomationScheduler:
         lost: asyncio.Event,
     ) -> bool:
         run_id = claim["run"]["run_id"]
+        deadline = asyncio.get_running_loop().time() + REPORT_TIMEOUT_SECONDS
         body = {
             "worker_id": self.worker_id,
             "claim_token": claim["claim_token"],
@@ -653,6 +720,10 @@ class KanbanAutomationScheduler:
             **value,
         }
         while not lost.is_set() and not self._closing:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                self._last_error = f"claim:{action}_report_timeout"
+                return False
             try:
                 response = await self._request_json(
                     "POST",
@@ -673,7 +744,7 @@ class KanbanAutomationScheduler:
             except Exception:
                 pass
             try:
-                await asyncio.wait_for(lost.wait(), timeout=1.0)
+                await asyncio.wait_for(lost.wait(), timeout=min(1.0, remaining))
             except TimeoutError:
                 pass
         return False
@@ -706,7 +777,8 @@ class KanbanAutomationScheduler:
                     raise ClaimLost("claim lease was lost before completion")
                 accepted = await self._report_claim(claim, "complete", {"result": result}, lost)
                 if not accepted:
-                    self._last_error = "claim:ClaimLost"
+                    if not self._last_error.startswith("claim:complete_report_timeout"):
+                        self._last_error = "claim:ClaimLost"
                     raise ClaimLost("claim completion was not accepted")
                 self._last_error = ""
         finally:
@@ -715,7 +787,24 @@ class KanbanAutomationScheduler:
             await asyncio.gather(maintainer, return_exceptions=True)
 
     async def status_payload(self) -> dict[str, Any]:
-        producer = routes_personal._work_automation_idle_worker_config()
+        lock = self._get_status_lock()
+        async with lock:
+            if self._status_inflight_task is None or self._status_inflight_task.done():
+                self._status_inflight_task = asyncio.create_task(
+                    self._build_status_payload(),
+                    name="kanban-scheduler-status",
+                )
+            task = self._status_inflight_task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                async with lock:
+                    if self._status_inflight_task is task:
+                        self._status_inflight_task = None
+
+    async def _build_status_payload(self) -> dict[str, Any]:
+        producer = await self._producer_config()
         try:
             automation = await routes_personal.get_work_automation_status(
                 item_id=None,
@@ -757,6 +846,8 @@ class KanbanAutomationScheduler:
             "scheduler": {"available": False},
             "provider": None,
             "schedule": None,
+            "blocker_schedule": None,
+            "schedules": {},
             "history": {"runs": []},
         }
         try:
@@ -770,20 +861,27 @@ class KanbanAutomationScheduler:
             history_rows = history.get("runs")
             if not isinstance(schedule_rows, list) or not isinstance(history_rows, list):
                 raise SchedulerProtocolError("scheduler list response is malformed")
-            matches = [
-                item
-                for item in schedule_rows
-                if isinstance(item, dict)
-                and item.get("target_key") == TARGET_KEY
-                and item.get("provider_id") == PROVIDER_ID
-                and not item.get("archived_at")
-            ]
+            matches_by_target = {
+                target_key: [
+                    item
+                    for item in schedule_rows
+                    if isinstance(item, dict)
+                    and item.get("target_key") == target_key
+                    and item.get("provider_id") == PROVIDER_ID
+                    and not item.get("archived_at")
+                ]
+                for target_key in TARGET_KEYS
+            }
             health = status.get("health") if isinstance(status.get("health"), dict) else {}
-            if len(matches) > 1:
+            ambiguous_targets = [
+                target_key for target_key, matches in matches_by_target.items() if len(matches) > 1
+            ]
+            if ambiguous_targets:
                 health = {
                     **health,
                     "ok": False,
                     "classification": "ambiguous_kanban_automation_schedule",
+                    "ambiguous_target_keys": sorted(ambiguous_targets),
                 }
             payload["scheduler"] = {
                 "available": True,
@@ -791,7 +889,12 @@ class KanbanAutomationScheduler:
                 "health": health,
             }
             payload["provider"] = provider
-            payload["schedule"] = matches[0] if len(matches) == 1 else None
+            payload["schedules"] = {
+                target_key: matches[0] if len(matches) == 1 else None
+                for target_key, matches in matches_by_target.items()
+            }
+            payload["schedule"] = payload["schedules"][AUTOMATION_TARGET_KEY]
+            payload["blocker_schedule"] = payload["schedules"][BLOCKER_TARGET_KEY]
             payload["history"] = {"runs": history_rows}
         except Exception as exc:
             payload["scheduler"] = {

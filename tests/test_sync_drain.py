@@ -228,3 +228,64 @@ def test_self_target_cleanup_defers_busy_sqlite_without_raising(monkeypatch, tmp
         assert conn.execute("SELECT sent FROM sync_queue WHERE queue_id=1").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_drain_integrity_read_is_read_only_and_does_not_change_journal_mode(monkeypatch, tmp_path):
+    db_path = tmp_path / "drain-integrity.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        conn.execute("CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sync_meta (key, value) VALUES ('integrity_ok', 'true')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(drain.cfg, "DB_PATH", str(db_path))
+
+    assert drain._drain_integrity_ok_sync() is True
+    with drain.get_read_conn(
+        busy_timeout_ms=drain._DRAIN_SQLITE_BUSY_TIMEOUT_MS,
+        operation="test_sync_drain_integrity",
+    ) as read_conn:
+        assert read_conn.in_transaction is False
+        try:
+            read_conn.execute("UPDATE sync_meta SET value='false' WHERE key='integrity_ok'")
+        except sqlite3.OperationalError as exc:
+            assert "readonly" in str(exc).lower()
+        else:
+            raise AssertionError("expected the sync integrity connection to reject writes")
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    finally:
+        conn.close()
+
+
+def test_drain_integrity_read_fails_within_busy_bound(monkeypatch, tmp_path):
+    db_path = tmp_path / "drain-integrity-locked.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("CREATE TABLE sync_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sync_meta (key, value) VALUES ('integrity_ok', 'true')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(drain.cfg, "DB_PATH", str(db_path))
+    locker = sqlite3.connect(db_path, timeout=0, isolation_level=None)
+    try:
+        locker.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        try:
+            drain._drain_integrity_ok_sync()
+        except sqlite3.OperationalError as exc:
+            assert "locked" in str(exc).lower()
+        else:
+            raise AssertionError("expected the bounded read to fail while SQLite is locked")
+        assert time.monotonic() - started < 0.5
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()

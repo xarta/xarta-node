@@ -32,7 +32,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from . import config as cfg
 from . import timing
 from .auth import compute_token
-from .db import get_conn, get_gen, get_meta, increment_gen
+from .db import get_conn, get_gen, get_meta, get_read_conn, increment_gen
 from .events import bus as events_bus
 from .models import GitPullRequest, SyncActionsPayload, SyncStatus
 from .sync.queue import (
@@ -58,6 +58,7 @@ _sync_status_cache_lock = asyncio.Lock()
 _sync_status_cache_payload: SyncStatus | None = None
 _sync_status_cache_expires_monotonic = 0.0
 _sync_status_inflight_task: asyncio.Task[SyncStatus] | None = None
+_SYNC_STATUS_SQLITE_BUSY_TIMEOUT_MS = 100
 
 # Tables that actions are permitted to touch (safeguard against bad payloads)
 # NOTE: "nodes" is intentionally excluded — the nodes table is local-only,
@@ -678,8 +679,11 @@ def _invalidate_sync_status_cache() -> None:
 
 
 def _sync_status_sync() -> SyncStatus:
-    """Build sync status in one SQLite read transaction."""
-    with get_conn() as conn:
+    """Build sync status through one bounded read-only SQLite connection."""
+    with get_read_conn(
+        busy_timeout_ms=_SYNC_STATUS_SQLITE_BUSY_TIMEOUT_MS,
+        operation="sync_status",
+    ) as conn:
         with timing.span("sync.status.read_meta"):
             gen = get_gen(conn)
             integrity_ok = get_meta(conn, "integrity_ok") == "true"
@@ -1300,7 +1304,13 @@ async def runtime_readiness(
 async def sync_status() -> SyncStatus:
     """Return current sync state: gen, integrity, queue depths per peer."""
     with timing.span("handler", route="sync_status"):
-        return await _sync_status_coalesced()
+        try:
+            return await _sync_status_coalesced()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "database is locked" in message or "database is busy" in message:
+                raise HTTPException(status_code=503, detail="database_locked") from exc
+            raise
 
 
 def _validated_backup_confirmation(filename: str) -> dict:

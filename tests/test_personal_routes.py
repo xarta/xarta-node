@@ -47,6 +47,7 @@ os.environ.setdefault("SEEKDB_DB", "blueprints_test")
 os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
+from app import config as app_config  # noqa: E402
 from app import db as app_db  # noqa: E402
 from app import (  # noqa: E402
     kanban_parity,
@@ -800,6 +801,12 @@ def _conn_context(conn: sqlite3.Connection):
 
 def _patch_conn(monkeypatch, conn: sqlite3.Connection) -> None:
     monkeypatch.setattr(routes_personal, "get_conn", lambda: _conn_context(conn))
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(conn))
+    monkeypatch.setattr(
+        routes_personal,
+        "_sqlite_get_read_conn",
+        lambda **_kwargs: _conn_context(conn),
+    )
     monkeypatch.setenv(
         routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
         routes_personal._work_automation_current_node_id(),
@@ -881,9 +888,15 @@ def _patch_kanban_backup_env(monkeypatch, tmp_path: Path, conn: sqlite3.Connecti
 def _disable_import_status_sync(monkeypatch) -> None:
     monkeypatch.setattr(
         routes_personal,
-        "_sync_personal_import_status_batches",
-        lambda conn, now: {"inserted": 0, "updated": 0, "unchanged": 0},
+        "_prepare_personal_import_status_batches",
+        lambda now: [],
     )
+    monkeypatch.setattr(
+        routes_personal,
+        "_sync_personal_import_status_batches",
+        lambda conn, now, *, rows: {"inserted": 0, "updated": 0, "unchanged": 0},
+    )
+    monkeypatch.setattr(routes_personal, "_kanban_active_store_is_postgres", lambda: False)
 
 
 def _load_personal_automation_module():
@@ -1183,6 +1196,23 @@ def test_projection_maintenance_trims_hot_cache_and_rehydrates(monkeypatch, tmp_
     assert rehydrated["rehydrated"] is True
     assert rehydrated["event"]["projection_state"] == "hot"
     assert "Restored projection body" in rehydrated["event"]["content_projection"]
+
+
+def test_imports_dashboard_runs_whole_build_through_measured_thread_boundary(
+    monkeypatch,
+):
+    calls = []
+
+    async def run_sync_work(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return {"status": "proof"}
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", run_sync_work)
+
+    result = asyncio.run(routes_personal.get_imports_dashboard())
+
+    assert result == {"status": "proof"}
+    assert calls == [(routes_personal._get_imports_dashboard_sync, (), {})]
 
 
 def test_imports_dashboard_parses_interests_and_git(monkeypatch, tmp_path):
@@ -2577,6 +2607,7 @@ def test_personal_search_sync_exact_fts_and_filters(monkeypatch):
 def test_personal_search_sync_projects_import_status_rows(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "_kanban_active_store_is_postgres", lambda: False)
 
     monkeypatch.setattr(
         routes_personal,
@@ -2671,9 +2702,443 @@ def test_personal_search_sync_projects_import_status_rows(monkeypatch):
     }
 
 
+def test_personal_search_isolated_sync_releases_postgres_before_sqlite_reconcile(
+    monkeypatch,
+):
+    lifecycle = []
+    sqlite_writes = iter(["sqlite-import", "sqlite-reconcile"])
+    active_store = ""
+
+    @contextmanager
+    def sqlite_write():
+        nonlocal active_store
+        name = next(sqlite_writes)
+        assert not active_store
+        active_store = name
+        lifecycle.append(f"{name}-open")
+        try:
+            yield name
+        finally:
+            lifecycle.append(f"{name}-close")
+            active_store = ""
+
+    @contextmanager
+    def sqlite_read(**kwargs):
+        nonlocal active_store
+        assert kwargs == {
+            "busy_timeout_ms": 100,
+            "operation": "personal_search_source_snapshot",
+        }
+        assert not active_store
+        active_store = "sqlite-read"
+        lifecycle.append("sqlite-read-open")
+        try:
+            yield "sqlite-read"
+        finally:
+            lifecycle.append("sqlite-read-close")
+            active_store = ""
+
+    @contextmanager
+    def postgres_read(**kwargs):
+        nonlocal active_store
+        assert kwargs == {
+            "operation": "personal_search_source_snapshot",
+            "transactional": False,
+        }
+        assert not active_store
+        active_store = "postgres"
+        lifecycle.append("postgres-open")
+        try:
+            yield "postgres-read"
+        finally:
+            lifecycle.append("postgres-close")
+            active_store = ""
+
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", sqlite_write)
+    monkeypatch.setattr(routes_personal, "_sqlite_get_read_conn", sqlite_read)
+    monkeypatch.setattr(routes_personal, "_kanban_postgres_get_conn", postgres_read)
+    monkeypatch.setattr(routes_personal, "_kanban_active_store_is_postgres", lambda: True)
+    monkeypatch.setattr(
+        routes_personal,
+        "_prepare_personal_import_status_batches",
+        lambda _now: lifecycle.append("prepare") or [{"import_batch_id": "proof"}],
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_sync_personal_import_status_batches",
+        lambda conn, _now, *, rows: (
+            lifecycle.append(f"import:{conn}:{rows[0]['import_batch_id']}")
+            or {"inserted": 0, "updated": 0, "unchanged": 2}
+        ),
+    )
+
+    def collect(
+        conn,
+        *,
+        kanban_conn=None,
+        include_personal=True,
+        include_kanban=True,
+    ):
+        assert kanban_conn is None
+        if conn == "sqlite-read":
+            assert active_store == "sqlite-read"
+            assert include_personal is True
+            assert include_kanban is False
+            lifecycle.append("collect-personal")
+            return [{"document_id": "personal-proof"}]
+        assert conn == "postgres-read"
+        assert active_store == "postgres"
+        assert include_personal is False
+        assert include_kanban is True
+        lifecycle.append("collect-kanban")
+        return [{"document_id": "kanban-proof"}]
+
+    def reconcile(conn, _now, *, docs, import_status):
+        assert conn == "sqlite-reconcile"
+        assert active_store == "sqlite-reconcile"
+        assert docs == [
+            {"document_id": "personal-proof"},
+            {"document_id": "kanban-proof"},
+        ]
+        assert import_status == {"inserted": 0, "updated": 0, "unchanged": 2}
+        lifecycle.append("reconcile")
+        return {"document_count": 2}
+
+    monkeypatch.setattr(routes_personal, "_collect_personal_search_documents", collect)
+    monkeypatch.setattr(routes_personal, "_reconcile_personal_search_documents", reconcile)
+
+    result = routes_personal._sync_personal_search_documents_isolated("2026-07-16T15:00:00Z")
+
+    assert result == {"document_count": 2}
+    assert lifecycle == [
+        "prepare",
+        "sqlite-import-open",
+        "import:sqlite-import:proof",
+        "sqlite-import-close",
+        "sqlite-read-open",
+        "collect-personal",
+        "sqlite-read-close",
+        "postgres-open",
+        "collect-kanban",
+        "postgres-close",
+        "sqlite-reconcile-open",
+        "reconcile",
+        "sqlite-reconcile-close",
+    ]
+
+
+def test_personal_search_isolated_sync_closes_both_read_stores_on_collection_failure(
+    monkeypatch,
+):
+    lifecycle = []
+
+    @contextmanager
+    def sqlite_write():
+        lifecycle.append("sqlite-write-open")
+        try:
+            yield "sqlite-write"
+        finally:
+            lifecycle.append("sqlite-write-close")
+
+    @contextmanager
+    def sqlite_read(**_kwargs):
+        lifecycle.append("sqlite-read-open")
+        try:
+            yield "sqlite-read"
+        finally:
+            lifecycle.append("sqlite-read-close")
+
+    @contextmanager
+    def postgres_read(**kwargs):
+        assert kwargs["transactional"] is False
+        lifecycle.append("postgres-open")
+        try:
+            yield "postgres-read"
+        finally:
+            lifecycle.append("postgres-close")
+
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", sqlite_write)
+    monkeypatch.setattr(routes_personal, "_sqlite_get_read_conn", sqlite_read)
+    monkeypatch.setattr(routes_personal, "_kanban_postgres_get_conn", postgres_read)
+    monkeypatch.setattr(routes_personal, "_kanban_active_store_is_postgres", lambda: True)
+    monkeypatch.setattr(
+        routes_personal,
+        "_prepare_personal_import_status_batches",
+        lambda _now: [],
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_sync_personal_import_status_batches",
+        lambda _conn, _now, *, rows: {"inserted": 0, "updated": 0, "unchanged": 2},
+    )
+
+    def fail_collection(
+        conn,
+        *,
+        kanban_conn=None,
+        include_personal=True,
+        include_kanban=True,
+    ):
+        assert kanban_conn is None
+        if conn == "sqlite-read":
+            assert include_personal is True
+            assert include_kanban is False
+            return []
+        assert conn == "postgres-read"
+        assert include_personal is False
+        assert include_kanban is True
+        raise RuntimeError("collection failed")
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_collect_personal_search_documents",
+        fail_collection,
+    )
+
+    with pytest.raises(RuntimeError, match="collection failed"):
+        routes_personal._sync_personal_search_documents_isolated("2026-07-16T15:00:00Z")
+
+    assert lifecycle == [
+        "sqlite-write-open",
+        "sqlite-write-close",
+        "sqlite-read-open",
+        "sqlite-read-close",
+        "postgres-open",
+        "postgres-close",
+    ]
+
+
+def test_personal_search_import_status_discovery_runs_without_database_handle(
+    monkeypatch,
+):
+    active_database = False
+    lifecycle = []
+    counts = {
+        "events": {"git": 3},
+        "import_batches": {"git": {"ok": 1}},
+    }
+
+    @contextmanager
+    def sqlite_read(**kwargs):
+        nonlocal active_database
+        assert kwargs == {
+            "busy_timeout_ms": 100,
+            "operation": "personal_search_import_status_counts",
+        }
+        assert active_database is False
+        active_database = True
+        lifecycle.append("sqlite-open")
+        try:
+            yield "sqlite-read"
+        finally:
+            lifecycle.append("sqlite-close")
+            active_database = False
+
+    def source_counts(conn):
+        assert conn == "sqlite-read"
+        assert active_database is True
+        lifecycle.append("counts")
+        return counts
+
+    def interests():
+        assert active_database is False
+        lifecycle.append("interests")
+        return {"status": "ok", "proof_links": [], "blockers": []}
+
+    def git_activity(actual_counts):
+        assert active_database is False
+        assert actual_counts == counts
+        lifecycle.append("git")
+        return {
+            "status": "ok",
+            "watched_repos": [],
+            "latest_commits": [],
+            "errors": [],
+            "actionable_repos": [],
+        }
+
+    monkeypatch.setattr(routes_personal, "_sqlite_get_read_conn", sqlite_read)
+    monkeypatch.setattr(routes_personal, "_personal_source_counts_from_conn", source_counts)
+    monkeypatch.setattr(routes_personal, "_parse_interests_dashboard", interests)
+    monkeypatch.setattr(routes_personal, "_git_activity_dashboard", git_activity)
+
+    rows = routes_personal._prepare_personal_import_status_batches("2026-07-16T15:00:00Z")
+
+    assert [row["import_batch_id"] for row in rows] == [
+        "status-interests-ingestion",
+        "status-git-activity",
+    ]
+    assert lifecycle == ["sqlite-open", "counts", "sqlite-close", "interests", "git"]
+
+
+def test_personal_search_import_status_unchanged_reconcile_does_zero_writes():
+    conn = _make_conn()
+    now = "2026-07-16T15:00:00Z"
+    rows = routes_personal._build_personal_import_status_rows(
+        counts={"events": {}, "import_batches": {}},
+        interests={"status": "ok", "proof_links": [], "blockers": []},
+        git_activity={
+            "status": "ok",
+            "watched_repos": [],
+            "latest_commits": [],
+            "errors": [],
+            "actionable_repos": [],
+        },
+        now=now,
+    )
+
+    first = routes_personal._sync_personal_import_status_batches(
+        conn,
+        now,
+        rows=rows,
+    )
+    changes_before = conn.total_changes
+    second = routes_personal._sync_personal_import_status_batches(
+        conn,
+        now,
+        rows=rows,
+    )
+
+    assert first == {"inserted": 2, "updated": 0, "unchanged": 0}
+    assert second == {"inserted": 0, "updated": 0, "unchanged": 2}
+    assert conn.total_changes == changes_before
+
+
+def test_personal_search_reconcile_skips_exact_unchanged_rows_and_preserves_repairs():
+    conn = _make_conn()
+    now = "2026-07-16T15:00:00Z"
+    import_status = {"inserted": 0, "updated": 0, "unchanged": 2}
+    doc = routes_personal._search_payload(
+        record_type="calendar",
+        record_table="personal_events",
+        record_id="evt-reconcile",
+        source_type="manual-calendar",
+        source_ref="calendar:evt-reconcile",
+        source_hash="sha256:first",
+        title="Dentist",
+        body="Initial appointment",
+        local_date="2026-07-17",
+        status="open",
+        mode="calendar",
+        privacy_level="normal",
+        tags=["health"],
+        related_refs=[],
+        page_ref={"group": "dave", "tab": "calendar", "date": "2026-07-17"},
+        source_refs=["personal_events:evt-reconcile"],
+        provenance={"source": "pytest"},
+        updated_at=now,
+    )
+
+    first = routes_personal._reconcile_personal_search_documents(
+        conn,
+        now,
+        docs=[doc],
+        import_status=import_status,
+    )
+    assert first == {
+        "document_count": 1,
+        "updated": 1,
+        "unchanged": 0,
+        "deleted": 0,
+        "import_status": import_status,
+    }
+    conn.execute(
+        """
+        UPDATE personal_search_documents
+        SET embedding_ref='embedding:first',
+            embedding_model='test-embedding',
+            vector_index_status='indexed'
+        WHERE document_id=?
+        """,
+        (doc["document_id"],),
+    )
+    changes_before = conn.total_changes
+
+    second = routes_personal._reconcile_personal_search_documents(
+        conn,
+        now,
+        docs=[doc],
+        import_status=import_status,
+    )
+
+    assert second["updated"] == 0
+    assert second["unchanged"] == 1
+    assert second["deleted"] == 0
+    assert conn.total_changes == changes_before
+
+    changed = routes_personal._search_payload(
+        record_type="calendar",
+        record_table="personal_events",
+        record_id="evt-reconcile",
+        source_type="manual-calendar",
+        source_ref="calendar:evt-reconcile",
+        source_hash="sha256:second",
+        title="Dentist moved",
+        body="Updated appointment",
+        local_date="2026-07-18",
+        status="open",
+        mode="calendar",
+        privacy_level="normal",
+        tags=["health"],
+        related_refs=[],
+        page_ref={"group": "dave", "tab": "calendar", "date": "2026-07-18"},
+        source_refs=["personal_events:evt-reconcile"],
+        provenance={"source": "pytest"},
+        updated_at="2026-07-16T15:01:00Z",
+    )
+    third = routes_personal._reconcile_personal_search_documents(
+        conn,
+        "2026-07-16T15:01:00Z",
+        docs=[changed],
+        import_status=import_status,
+    )
+    row = conn.execute(
+        """
+        SELECT title, embedding_ref, embedding_model, vector_index_status
+        FROM personal_search_documents
+        WHERE document_id=?
+        """,
+        (doc["document_id"],),
+    ).fetchone()
+    fts = conn.execute(
+        "SELECT title, body FROM personal_search_fts WHERE document_id=?",
+        (doc["document_id"],),
+    ).fetchone()
+    assert third["updated"] == 1
+    assert third["unchanged"] == 0
+    assert row["title"] == "Dentist moved"
+    assert row["embedding_ref"] == ""
+    assert row["embedding_model"] == ""
+    assert row["vector_index_status"] == "pending"
+    assert tuple(fts) == ("Dentist moved", "Updated appointment")
+
+    stale = routes_personal._reconcile_personal_search_documents(
+        conn,
+        "2026-07-16T15:02:00Z",
+        docs=[],
+        import_status=import_status,
+    )
+    assert stale["deleted"] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM personal_search_documents WHERE document_id=?",
+            (doc["document_id"],),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM personal_search_fts WHERE document_id=?",
+            (doc["document_id"],),
+        ).fetchone()[0]
+        == 0
+    )
+
+
 def test_personal_search_vector_sync_does_not_hold_sqlite_across_await(monkeypatch):
     conn = _make_conn()
     active_contexts = 0
+    monkeypatch.setattr(routes_personal, "_kanban_active_store_is_postgres", lambda: False)
 
     @contextmanager
     def tracked_conn():
@@ -2686,6 +3151,12 @@ def test_personal_search_vector_sync_does_not_hold_sqlite_across_await(monkeypat
             active_contexts -= 1
 
     monkeypatch.setattr(routes_personal, "get_conn", lambda: tracked_conn())
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: tracked_conn())
+    monkeypatch.setattr(
+        routes_personal,
+        "_sqlite_get_read_conn",
+        lambda **_kwargs: tracked_conn(),
+    )
     _disable_import_status_sync(monkeypatch)
     conn.execute(
         """
@@ -3381,7 +3852,14 @@ def test_kanban_idle_worker_no_root_scans_automatic_todo_leaves(monkeypatch, tmp
         )
     )
 
-    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
+    async def fake_local_ai_json_completion(
+        *,
+        messages,
+        run_id,
+        processor_kind="",
+        source_hash="",
+        state_identity=None,
+    ):
         assert "work-auto-todo-leaf" in messages[1]["content"]
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
@@ -5084,9 +5562,12 @@ def test_work_kanban_detail_review_documents_delegate_to_kanban_store_boundary(
     assert "Document boundary feedback" in feedback["review_document"]["body"]
     assert feedback["review_processor"]["queued"] is True
 
+    # Item-detail GET stages database rows through KanbanStore, releases the
+    # datastore, then reads markdown. Update/feedback writes remain owned by
+    # KanbanStore and may read their just-written document through that boundary.
     assert calls == {
-        "item_detail_document": 1,
-        "item_review_document": 2,
+        "item_detail_document": 0,
+        "item_review_document": 1,
         "write_item_detail_document": 1,
         "write_item_review_document": 2,
     }
@@ -5780,6 +6261,292 @@ def test_settings_upsert_sql_is_unambiguous_for_kanban_postgres_support_setting(
     )
 
     assert "COALESCE(excluded.description, settings.description)" in statement
+
+
+def test_kanban_postgres_connections_reuse_bounded_owner_loop_pool(monkeypatch):
+    created = []
+
+    class FakeTransaction:
+        def __init__(self):
+            self.started = False
+            self.committed = False
+            self.rolled_back = False
+
+        async def start(self):
+            self.started = True
+
+        async def commit(self):
+            self.committed = True
+
+        async def rollback(self):
+            self.rolled_back = True
+
+    class FakeConnection:
+        def __init__(self):
+            self.transactions = []
+
+        def transaction(self):
+            transaction = FakeTransaction()
+            self.transactions.append(transaction)
+            return transaction
+
+    class FakePool:
+        def __init__(self):
+            self.connections = []
+            self.released = []
+            self.closed = False
+            self.terminated = False
+
+        async def acquire(self, *, timeout):
+            assert timeout == 10
+            connection = FakeConnection()
+            self.connections.append(connection)
+            return connection
+
+        async def release(self, connection, *, timeout):
+            assert timeout == 10
+            self.released.append(connection)
+
+        async def close(self):
+            self.closed = True
+
+        def terminate(self):
+            self.terminated = True
+
+    async def fake_create_pool(database_url, **kwargs):
+        pool = FakePool()
+        created.append((database_url, kwargs, pool))
+        return pool
+
+    runner = kanban_postgres._AsyncpgRunner()
+    monkeypatch.setattr(kanban_postgres.asyncpg, "create_pool", fake_create_pool)
+    monkeypatch.setattr(kanban_postgres, "_runner", lambda: runner)
+    try:
+        first = kanban_postgres.postgres_candidate_connection("postgresql://pool-test/db")
+        second = kanban_postgres.postgres_candidate_connection("postgresql://pool-test/db")
+
+        first.begin()
+        first_transaction = first._transaction
+        first.commit()
+        second.begin()
+        second_transaction = second._transaction
+        second.close()
+        first.close()
+        runner.close_pools()
+    finally:
+        runner.shutdown()
+
+    assert len(created) == 1
+    database_url, kwargs, pool = created[0]
+    assert database_url == "postgresql://pool-test/db"
+    assert kwargs["min_size"] == routes_personal.cfg.KANBAN_POSTGRES_POOL_MIN_SIZE
+    assert kwargs["max_size"] == routes_personal.cfg.KANBAN_POSTGRES_POOL_MAX_SIZE
+    assert kwargs["max_size"] <= 16
+    assert kwargs["max_inactive_connection_lifetime"] == 300.0
+    assert kwargs["statement_cache_size"] == 0
+    assert kwargs["server_settings"] == {
+        "application_name": "blueprints-kanban:test-node",
+        "jit": "off",
+    }
+    assert len(pool.connections) == 2
+    assert len(pool.released) == 2
+    assert pool.closed is True
+    assert pool.terminated is False
+    assert first_transaction.started is True
+    assert first_transaction.committed is True
+    assert second_transaction.started is True
+    assert second_transaction.rolled_back is True
+
+
+def test_kanban_postgres_pool_acquire_timeout_is_typed(monkeypatch):
+    created = []
+
+    class FakePool:
+        async def acquire(self, *, timeout):
+            assert timeout == 10
+            raise TimeoutError
+
+        async def close(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    async def fake_create_pool(database_url, **kwargs):
+        pool = FakePool()
+        created.append((database_url, kwargs, pool))
+        return pool
+
+    runner = kanban_postgres._AsyncpgRunner()
+    monkeypatch.setattr(kanban_postgres.asyncpg, "create_pool", fake_create_pool)
+    monkeypatch.setattr(kanban_postgres, "_runner", lambda: runner)
+    try:
+        with pytest.raises(
+            kanban_postgres.KanbanPostgresPoolTimeout,
+            match="remained saturated for 10 seconds",
+        ):
+            kanban_postgres.postgres_candidate_connection("postgresql://pool-timeout/db")
+    finally:
+        runner.shutdown()
+
+    assert len(created) == 1
+
+
+def test_kanban_postgres_read_context_can_skip_transaction(monkeypatch):
+    calls = []
+
+    class FakeConnection:
+        def begin(self):
+            calls.append("begin")
+
+        def commit(self):
+            calls.append("commit")
+
+        def rollback(self):
+            calls.append("rollback")
+
+        def close(self):
+            calls.append("close")
+
+    monkeypatch.setattr(
+        routes_personal,
+        "postgres_candidate_connection",
+        lambda _database_url: FakeConnection(),
+    )
+
+    with routes_personal._kanban_postgres_get_conn(
+        operation="status-read",
+        transactional=False,
+    ):
+        calls.append("body")
+
+    assert calls == ["body", "close"]
+
+
+def test_work_decision_commit_health_batches_ids_and_preserves_metadata_failure(
+    monkeypatch,
+):
+    looked_up = []
+
+    def fake_rows_by_id(_conn, commit_ids):
+        looked_up.append(list(commit_ids))
+        return {"commit-present": {"commit_link_id": "commit-present"}}
+
+    monkeypatch.setattr(routes_personal, "_work_commit_rows_by_id", fake_rows_by_id)
+    rows = [
+        {
+            "status": "processed",
+            "commit_link_ids_json": json.dumps(["commit-present", "commit-missing"]),
+            "metadata_json": json.dumps({"hook_status": "passed"}),
+        },
+        {
+            "status": "processed",
+            "commit_link_ids_json": "[]",
+            "metadata_json": json.dumps({"hook_status": "failed"}),
+        },
+    ]
+
+    health = routes_personal._work_decision_commit_health(
+        rows,
+        object(),
+        decision_count=9,
+    )
+
+    assert looked_up == [["commit-present", "commit-missing"]]
+    assert health == {
+        "decision_count": 9,
+        "decisions_with_commits": 1,
+        "missing_commit_link_count": 1,
+        "missing_commit_link_ids": ["commit-missing"],
+        "hook_failure_count": 1,
+        "ok": False,
+    }
+
+
+def test_work_automation_status_preserves_metadata_hook_failure_compatibility(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-status-hook-failure",
+                title="Status hook failure compatibility",
+                body="Keep legacy metadata hook failures visible without loading every decision.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="status-hook-failure-item",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.record_work_item_review_decision(
+            "work-status-hook-failure",
+            routes_personal.WorkReviewDecisionCreateRequest(
+                decision_id="decision-status-hook-failure",
+                summary="A legacy-compatible hook failure remains visible.",
+                status="recorded",
+                metadata={"hook_status": "failed"},
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="status-hook-failure-decision",
+            ),
+        )
+    )
+
+    status = routes_personal._get_work_automation_status_sync(
+        "work-status-hook-failure",
+        10,
+        include_contracts=False,
+    )
+
+    assert status["decisions"]["count"] == 1
+    assert status["commit_link_health"]["hook_failure_count"] == 1
+    assert status["commit_link_health"]["ok"] is False
+
+
+def test_kanban_postgres_pool_timeout_response_is_retryable_503():
+    from app import main as app_main
+
+    exc = kanban_postgres.KanbanPostgresPoolTimeout("pool busy")
+    response = asyncio.run(app_main._handle_kanban_postgres_pool_timeout(None, exc))
+    payload = json.loads(response.body)
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert payload["error"] == {
+        "code": "kanban_postgres_pool_saturated",
+        "retryable": True,
+    }
+    assert (
+        app_main.app.exception_handlers[kanban_postgres.KanbanPostgresPoolTimeout]
+        is app_main._handle_kanban_postgres_pool_timeout
+    )
+
+
+def test_kanban_postgres_pool_config_is_bounded_and_malformed_optional_env_is_safe(
+    monkeypatch,
+):
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_POSTGRES_POOL_MIN_SIZE", "not-an-int")
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_POSTGRES_POOL_MAX_SIZE", "999")
+
+    assert (
+        app_config._bounded_env_int(
+            "BLUEPRINTS_KANBAN_POSTGRES_POOL_MIN_SIZE",
+            1,
+            minimum=0,
+            maximum=4,
+        )
+        == 1
+    )
+    assert (
+        app_config._bounded_env_int(
+            "BLUEPRINTS_KANBAN_POSTGRES_POOL_MAX_SIZE",
+            4,
+            minimum=1,
+            maximum=16,
+        )
+        == 16
+    )
 
 
 def test_work_kanban_postgres_read_replica_rejects_local_writes(monkeypatch, tmp_path):
@@ -7301,6 +8068,137 @@ def test_work_automation_status_delegates_sync_payload_off_event_loop(monkeypatc
     assert status["kwargs"]["include_contracts"] is False
     assert status["server_metrics"]["schema"] == "xarta.kanban.automation_status.metrics.v1"
     assert status["server_metrics"]["status_thread_seconds"] >= 0
+
+
+def test_work_automation_status_reuses_outer_connection_for_proposal_surfaces(monkeypatch):
+    conn = _make_conn()
+    active = 0
+    max_active = 0
+    opened = 0
+
+    @contextmanager
+    def tracked_conn():
+        nonlocal active, max_active, opened
+        active += 1
+        opened += 1
+        max_active = max(max_active, active)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(routes_personal, "get_conn", tracked_conn)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        routes_personal._work_automation_current_node_id(),
+    )
+
+    status = asyncio.run(
+        routes_personal.get_work_automation_status(
+            include_contracts=False,
+            limit=3,
+        )
+    )
+
+    assert status["ok"] is True
+    assert opened == 1
+    assert max_active == 1
+
+
+def test_work_automation_status_query_count_does_not_scale_with_decision_volume(
+    monkeypatch,
+):
+    conn = _make_conn()
+    query_count = 0
+
+    class CountingConnection:
+        def execute(self, sql, params=None):
+            nonlocal query_count
+            query_count += 1
+            return conn.execute(sql, params or ())
+
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+    @contextmanager
+    def tracked_conn():
+        yield CountingConnection()
+
+    monkeypatch.setattr(routes_personal, "get_conn", tracked_conn)
+    monkeypatch.setattr(
+        routes_personal.cfg,
+        "KANBAN_DATASTORE_CONFIG",
+        type("Config", (), {"active_store": "sqlite"})(),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO kanban_review_decisions (
+            decision_id,
+            item_id,
+            decision_type,
+            status,
+            provider_mode,
+            commit_link_ids_json,
+            metadata_json,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, 'review', 'accepted', 'manual', '[]', '{}', ?, ?)
+        """,
+        (
+            "decision-status-bounded-000",
+            "work-status-bounded",
+            "2026-07-16T00:00:00Z",
+            "2026-07-16T00:00:00Z",
+        ),
+    )
+    query_count = 0
+    one_decision = routes_personal._get_work_automation_status_sync(
+        "",
+        10,
+        include_contracts=False,
+    )
+    one_decision_query_count = query_count
+
+    conn.executemany(
+        """
+        INSERT INTO kanban_review_decisions (
+            decision_id,
+            item_id,
+            decision_type,
+            status,
+            provider_mode,
+            commit_link_ids_json,
+            metadata_json,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, 'review', 'accepted', 'manual', '[]', '{}', ?, ?)
+        """,
+        [
+            (
+                f"decision-status-bounded-{index:03d}",
+                "work-status-bounded",
+                f"2026-07-16T00:{index // 60:02d}:{index % 60:02d}Z",
+                f"2026-07-16T00:{index // 60:02d}:{index % 60:02d}Z",
+            )
+            for index in range(1, 101)
+        ],
+    )
+    query_count = 0
+    many_decisions = routes_personal._get_work_automation_status_sync(
+        "",
+        10,
+        include_contracts=False,
+    )
+    many_decisions_query_count = query_count
+
+    assert one_decision["decisions"]["count"] == 1
+    assert many_decisions["decisions"]["count"] == 101
+    assert one_decision_query_count > 0
+    assert many_decisions_query_count == one_decision_query_count
 
 
 def test_work_kanban_review_decision_ledger_links_commits_and_status(monkeypatch):
@@ -8989,7 +9887,14 @@ def test_work_automation_idle_tick_processes_review_with_profile_llm(monkeypatch
         )
     )
 
-    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
+    async def fake_local_ai_json_completion(
+        *,
+        messages,
+        run_id,
+        processor_kind="",
+        source_hash="",
+        state_identity=None,
+    ):
         assert "missing required provider wiring" in messages[1]["content"]
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
@@ -9154,7 +10059,14 @@ def test_work_automation_preprocessing_distinguishes_marker_staleness_from_block
     )
     conn.commit()
 
-    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
+    async def fake_local_ai_json_completion(
+        *,
+        messages,
+        run_id,
+        processor_kind="",
+        source_hash="",
+        state_identity=None,
+    ):
         context = json.loads(messages[1]["content"])
         assert context["queue_source"]["reason"] == "missing_readiness_marker"
         assert "parent_body" in {ref["name"] for ref in context["queue_source"]["source_refs"]}
@@ -9792,7 +10704,14 @@ def test_work_automation_preprocessing_malformed_decomposition_fails_without_chi
         )
     )
 
-    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
+    async def fake_local_ai_json_completion(
+        *,
+        messages,
+        run_id,
+        processor_kind="",
+        source_hash="",
+        state_identity=None,
+    ):
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
             "run_id": run_id,
@@ -9919,7 +10838,14 @@ def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
         )
     )
 
-    async def fake_local_ai_json_completion(*, messages, run_id, processor_kind=""):
+    async def fake_local_ai_json_completion(
+        *,
+        messages,
+        run_id,
+        processor_kind="",
+        source_hash="",
+        state_identity=None,
+    ):
         return {
             "model_alias": "TEST-KANBAN-LOCAL-AI",
             "run_id": run_id,
@@ -10006,6 +10932,170 @@ def test_work_preprocessing_actionable_leaf_without_decomposition_marks_ready(
     assert metadata["llm_payload"]["ready"] is True
 
 
+def test_work_preprocessing_retargets_claimed_marker_to_fresh_context_before_model_wait(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_LOCAL_AI_MODEL_ENV,
+        "TEST-KANBAN-LOCAL-AI",
+    )
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-refresh-root",
+                title="Refresh root",
+                body="Root item.",
+                state_id="doing",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-preprocess-refresh-child",
+                parent_item_id="work-preprocess-refresh-root",
+                title="Refresh claimed preprocessing source",
+                body="Process the latest bounded context without stale claim identity.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+
+    async def fake_local_ai_json_completion(
+        *,
+        messages,
+        run_id,
+        processor_kind="",
+        source_hash="",
+        state_identity=None,
+    ):
+        assert source_hash == refreshed_source["document_source_hash"]
+        assert state_identity == {
+            "item_id": "work-preprocess-refresh-child",
+            "marker_id": queued_marker["marker_id"],
+        }
+        return {
+            "model_alias": "TEST-KANBAN-LOCAL-AI",
+            "run_id": run_id,
+            "content_excerpt": "{}",
+            "payload": {
+                **_preprocessing_contract_fields(unit_title="Process the refreshed context"),
+                "ready": True,
+                "title": "Refreshed preprocessing context",
+                "summary": "The refreshed context is actionable.",
+                "rationale": "The source was refreshed before the bounded model wait.",
+                "confidence": "high",
+                "uncertainty": "",
+                "decomposition_items": [],
+                "recommended_next_actions": ["Continue with the refreshed context."],
+                "proof_refs": ["kanban_items:work-preprocess-refresh-child"],
+            },
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_completion",
+        fake_local_ai_json_completion,
+    )
+
+    scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-preprocess-refresh-child",
+                max_items=1,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-refresh-scan",
+            )
+        )
+    )
+    queued_marker = scan["queued_markers"][0]
+    queued_source_hash = queued_marker["document_source_hash"]
+
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-refresh",
+                item_id="work-preprocess-refresh-child",
+                ttl_seconds=600,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-refresh-lease",
+            )
+        )
+    )
+    lease_token = acquired["lease"]["lease_token"]
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-refresh",
+                lease_token=lease_token,
+                item_id="work-preprocess-refresh-child",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-refresh-claim",
+            )
+        )
+    )
+    assert claimed["claimed"] is True
+    assert claimed["marker"]["document_source_hash"] == queued_source_hash
+
+    asyncio.run(
+        routes_personal.create_work_discussion(
+            "work-preprocess-refresh-child",
+            routes_personal.WorkDiscussionCreateRequest(
+                discussion_id="discussion-preprocess-refresh",
+                body="This source change happened after claim but before preprocessing.",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="preprocess-refresh-discussion",
+            ),
+        )
+    )
+    current_item = conn.execute(
+        "SELECT * FROM kanban_items WHERE item_id='work-preprocess-refresh-child'"
+    ).fetchone()
+    refreshed_source = routes_personal._work_preprocessing_context_source(conn, current_item)
+    assert refreshed_source["document_source_hash"] != queued_source_hash
+
+    processed = asyncio.run(
+        routes_personal._process_work_preprocessing_idle_marker(
+            claimed["marker"],
+            holder_id="codex-refresh",
+            lease_token=lease_token,
+            run_id="pytest-preprocess-refresh",
+        )
+    )
+    assert processed["ok"] is True
+    assert processed["status"] == "processed"
+
+    marker = conn.execute(
+        """
+        SELECT * FROM kanban_review_processor_markers
+        WHERE item_id='work-preprocess-refresh-child'
+        """
+    ).fetchone()
+    assert marker["document_source_hash"] == refreshed_source["document_source_hash"]
+    assert marker["processed_source_hash"] == refreshed_source["document_source_hash"]
+    marker_metadata = json.loads(marker["metadata_json"])
+    assert marker_metadata["source_retarget"]["reason"] == ("context_refreshed_before_model_wait")
+    hints = asyncio.run(routes_personal.get_work_item_agent_hints("work-preprocess-refresh-child"))
+    readiness = hints["agent_hints"]["metadata"]["context_readiness_marker"]
+    assert readiness["context_hash"] == refreshed_source["document_source_hash"]
+
+
 def test_work_preprocessing_duplicate_outcome_needs_no_invented_children(
     monkeypatch,
     tmp_path,
@@ -10034,7 +11124,14 @@ def test_work_preprocessing_duplicate_outcome_needs_no_invented_children(
             )
         )
 
-    async def duplicate_completion(*, messages, run_id, processor_kind=""):
+    async def duplicate_completion(
+        *,
+        messages,
+        run_id,
+        processor_kind="",
+        source_hash="",
+        state_identity=None,
+    ):
         return {
             "model_alias": "TEST-KANBAN-DUPLICATE",
             "run_id": run_id,
@@ -11196,6 +12293,41 @@ def test_work_kanban_shadow_snapshot_matches_real_scan_candidates(monkeypatch, t
     )
 
 
+def test_work_kanban_shadow_snapshot_uses_nontransactional_direct_read(monkeypatch):
+    calls = []
+
+    class Cursor:
+        def fetchall(self):
+            return []
+
+    class Conn:
+        def execute(self, _sql, _params=None):
+            return Cursor()
+
+    @contextmanager
+    def scan_conn(*, operation, transactional=True):
+        calls.append((operation, transactional))
+        yield Conn()
+
+    monkeypatch.setattr(routes_personal, "_kanban_automation_scan_conn", scan_conn)
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_idle_worker_config",
+        lambda: {
+            "root_item_id": "",
+            "max_scan_items": 20,
+        },
+    )
+
+    snapshot = routes_personal._work_kanban_automation_shadow_snapshot_sync()
+
+    assert snapshot["timeout_marker_ids"] == []
+    assert snapshot["review_candidate_ids"] == []
+    assert snapshot["preprocessing_candidate_ids"] == []
+    assert snapshot["claimable_marker_ids"] == []
+    assert calls == [("kanban_automation_shadow_snapshot", False)]
+
+
 def test_work_kanban_scheduler_tick_receipt_is_durable_and_replay_safe(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -11240,6 +12372,75 @@ def test_work_kanban_scheduler_tick_receipt_is_durable_and_replay_safe(monkeypat
         (tick_id,),
     ).fetchone()
     assert row["count"] == 1
+
+
+def test_work_kanban_scheduler_tick_receipts_use_direct_postgres_lifetimes(monkeypatch):
+    from contextlib import contextmanager
+
+    result = {
+        "schema": "xarta.blueprints.kanban_automation_tick.result.v1",
+        "scheduler_run_id": "run-direct-receipt",
+        "tick_id": "blueprints-kanban-automation:run-direct-receipt",
+        "producer_node_id": "test-owner",
+        "outcome": "completed",
+    }
+    calls = []
+
+    class Cursor:
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Conn:
+        def execute(self, sql, params=None):
+            calls.append(("execute", sql, params))
+            return Cursor(
+                {
+                    "metadata_json": json.dumps({"result": result}),
+                }
+                if "complete_kanban_automation_scheduler_tick" in sql
+                else None
+            )
+
+    @contextmanager
+    def direct_conn(*, operation, transactional=True):
+        calls.append(("connection", operation, transactional))
+        yield Conn()
+
+    active_config = load_kanban_datastore_config(
+        {
+            "BLUEPRINTS_KANBAN_DATASTORE_MODE": "postgres",
+            "BLUEPRINTS_KANBAN_CANDIDATE_DATABASE_URL": "postgresql://example.invalid/db",
+        }
+    )
+    monkeypatch.setattr(routes_personal.cfg, "KANBAN_DATASTORE_CONFIG", active_config)
+    monkeypatch.setattr(routes_personal, "_kanban_postgres_get_conn", direct_conn)
+    monkeypatch.setattr(
+        routes_personal,
+        "get_conn",
+        lambda: pytest.fail("active-Postgres receipt path must not open hybrid SQLite"),
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_write_work_audit",
+        lambda _conn, **kwargs: {"audit_id": kwargs["audit_id"]},
+    )
+    monkeypatch.setattr(routes_personal, "_kanban_table_sync_gen", lambda *_args: 1)
+    monkeypatch.setattr(routes_personal, "enqueue_for_all_peers", lambda *_args: None)
+
+    replay = routes_personal._work_kanban_automation_tick_receipt_sync(result["tick_id"])
+    recorded = routes_personal._record_work_kanban_automation_tick_receipt_sync(
+        tick_id=result["tick_id"],
+        scheduler_run_id=result["scheduler_run_id"],
+        result=result,
+    )
+
+    assert replay == result
+    assert recorded == result
+    assert ("connection", "kanban_automation_tick_receipt", False) in calls
+    assert ("connection", "record_kanban_automation_tick_receipt", True) in calls
 
 
 def test_work_queued_processor_markers_prioritize_item_urgency_before_queue_age(
@@ -12997,6 +14198,194 @@ def test_work_kanban_agent_leaf_doing_requires_active_session(monkeypatch, tmp_p
     assert agent_move["state_id"] == "doing"
 
 
+def test_work_blocker_discovery_is_one_bounded_snapshot_with_inherited_guards(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+
+    for item_id, parent_item_id, state_id, excluded, tags in (
+        ("discovery-root", None, "doing", False, ["kanban"]),
+        ("discovery-blocked", "discovery-root", "blocked", False, ["kanban"]),
+        ("discovery-lane", "discovery-root", "blocked", False, ["kanban"]),
+        ("discovery-lane-child", "discovery-lane", "todo", False, ["kanban"]),
+        ("discovery-lane-archived", "discovery-lane", "todo", False, ["kanban"]),
+        ("discovery-excluded", None, "doing", True, ["kanban"]),
+        ("discovery-excluded-child", "discovery-excluded", "blocked", False, ["kanban"]),
+        (
+            "discovery-test",
+            "discovery-root",
+            "blocked",
+            False,
+            ["kanban", "agent-working-out"],
+        ),
+    ):
+        asyncio.run(
+            routes_personal.create_work_item(
+                routes_personal.WorkItemCreateRequest(
+                    item_id=item_id,
+                    parent_item_id=parent_item_id,
+                    title=item_id,
+                    body=f"Body for {item_id}",
+                    state_id=state_id,
+                    automation_excluded=excluded,
+                    tags=tags,
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"{item_id}-create",
+                )
+            )
+        )
+    for blocker_id, item_id in (
+        ("discovery-open-blocker", "discovery-blocked"),
+        ("discovery-resolved-sibling", "discovery-blocked"),
+        ("discovery-excluded-blocker", "discovery-excluded-child"),
+        ("discovery-test-blocker", "discovery-test"),
+    ):
+        asyncio.run(
+            routes_personal.create_work_blocker(
+                routes_personal.WorkBlockerUpsertRequest(
+                    blocker_id=blocker_id,
+                    item_id=item_id,
+                    title=blocker_id,
+                    body=f"Body for {blocker_id}",
+                    blocked_by_ref=f"kanban_items:{item_id}",
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id=f"{blocker_id}-create",
+                )
+            )
+        )
+    conn.execute(
+        """
+        UPDATE kanban_blockers
+        SET status='resolved'
+        WHERE blocker_id='discovery-resolved-sibling'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE kanban_items
+        SET archived_at='2026-07-16T00:00:00Z'
+        WHERE item_id='discovery-lane-archived'
+        """
+    )
+
+    query_count = 0
+
+    class CountingConn:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def execute(self, *args, **kwargs):
+            nonlocal query_count
+            query_count += 1
+            return self.wrapped.execute(*args, **kwargs)
+
+    @contextmanager
+    def scan_conn(**_kwargs):
+        yield CountingConn(conn)
+
+    monkeypatch.setattr(routes_personal, "_kanban_automation_scan_conn", scan_conn)
+    hidden = routes_personal._work_blocker_processor_discovery_sync(None, False, 250)
+
+    candidate_keys = {
+        (
+            f"blocker:{candidate['blocker_id']}"
+            if candidate["blocker_id"]
+            else f"item:{candidate['item_id']}:blocked-lane"
+        )
+        for candidate in hidden["candidates"]
+    }
+    skipped_reasons = {
+        candidate["blocker_id"]: candidate["skip_reason"]
+        for candidate in hidden["skipped"]
+        if candidate["blocker_id"]
+    }
+    assert query_count == 5
+    assert candidate_keys == {
+        "blocker:discovery-open-blocker",
+        "item:discovery-lane:blocked-lane",
+    }
+    assert skipped_reasons["discovery-excluded-blocker"] == "automation_excluded"
+    assert "discovery-test-blocker" not in skipped_reasons
+    assert hidden["tree_status_by_item_id"]["discovery-lane"] == {
+        "descendant_count": 1,
+        "blocked_descendant_count": 0,
+        "active_descendant_count": 1,
+        "done_descendant_count": 0,
+        "direct_child_state_counts": {"todo": 1},
+        "open_blocker_count": 0,
+        "resolved_blocker_count": 0,
+    }
+    focused = routes_personal._work_blocker_processor_discovery_sync(
+        "discovery-open-blocker",
+        False,
+        1,
+    )
+    assert [candidate["blocker_id"] for candidate in focused["candidates"]] == [
+        "discovery-open-blocker"
+    ]
+    assert focused["tree_status_by_item_id"]["discovery-blocked"]["open_blocker_count"] == 1
+    assert focused["tree_status_by_item_id"]["discovery-blocked"]["resolved_blocker_count"] == 1
+
+    visible = routes_personal._work_blocker_processor_discovery_sync(None, True, 250)
+    visible_keys = {
+        candidate["blocker_id"] for candidate in visible["candidates"] if candidate["blocker_id"]
+    }
+    assert "discovery-test-blocker" in visible_keys
+
+
+def test_work_kanban_item_detail_releases_database_before_markdown_reads(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="detail-pool-release",
+                title="Detail pool release",
+                body="Database rows are staged before filesystem reads.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="detail-pool-release-create",
+            )
+        )
+    )
+    active = False
+
+    @contextmanager
+    def scan_conn(**_kwargs):
+        nonlocal active
+        active = True
+        try:
+            yield conn
+        finally:
+            active = False
+
+    original_reader = routes_personal._read_kanban_markdown_document
+
+    def checked_reader(path):
+        assert active is False
+        return original_reader(path)
+
+    monkeypatch.setattr(routes_personal, "_kanban_automation_scan_conn", scan_conn)
+    monkeypatch.setattr(routes_personal, "_read_kanban_markdown_document", checked_reader)
+
+    detail = routes_personal._get_work_item_detail_sync("detail-pool-release")
+
+    assert detail["item"]["item_id"] == "detail-pool-release"
+    assert detail["detail_document"]["exists"] is False
+
+
 def test_work_kanban_test_entry_visibility_preference_filters_board(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -13990,7 +15379,19 @@ def test_work_processor_model_failover_is_bounded_and_records_attempts(monkeypat
         "_work_automation_idle_worker_config",
         lambda: {"local_ai_max_tokens": 1200},
     )
-    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", lambda: _conn_context(_make_conn()))
+    sqlite_state = {"active": False}
+    sqlite_conn = _make_conn()
+
+    @contextmanager
+    def tracked_sqlite_conn():
+        assert sqlite_state["active"] is False
+        sqlite_state["active"] = True
+        try:
+            yield sqlite_conn
+        finally:
+            sqlite_state["active"] = False
+
+    monkeypatch.setattr(routes_personal, "_sqlite_get_conn", tracked_sqlite_conn)
     monkeypatch.setattr(
         routes_personal,
         "_work_processor_model_definitions",
@@ -14014,18 +15415,27 @@ def test_work_processor_model_failover_is_bounded_and_records_attempts(monkeypat
                 "request_sha256": f"sha256:{route_id}",
                 "selection": "model_variant",
                 "route_id": route_id,
+                "request_bytes": 128,
+                "message_count": len(messages),
             },
         ),
     )
     calls = []
 
     def complete(**kwargs):
+        assert sqlite_state["active"] is False
         calls.append(kwargs)
         if kwargs["route_id"] == "chatgpt-5-6-sol":
             raise ConnectionError("subscription route temporarily unavailable")
         return {
             "model": "gateway-profile",
-            "choices": [{"message": {"content": '{"ready": true}'}}],
+            "choices": [
+                {
+                    "message": {"content": '{"ready": true}'},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"total_tokens": 27},
         }
 
     monkeypatch.setattr(routes_personal, "_work_automation_profile_completion_sync", complete)
@@ -14055,6 +15465,92 @@ def test_work_processor_model_failover_is_bounded_and_records_attempts(monkeypat
         and attempt["state_identity"]["state_key"] == "blocker:test"
         for attempt in result["model_attempts"]
     )
+    assert result["finish_reason"] == "stop"
+    assert result["usage"] == {"total_tokens": 27}
+    assert result["max_tokens"] == 1200
+    assert result["content_length"] == len('{"ready": true}')
+    assert result["content_excerpt_truncated"] is False
+
+
+def test_work_processor_required_route_is_allowlisted_and_prevents_failover(monkeypatch):
+    route_ids = ["chatgpt-5-6-sol", "chatgpt-5-6-terra"]
+    definitions = _processor_model_definitions_for_test("preprocessing")
+
+    async def run_sync(func, *args, **kwargs):
+        assert func is routes_personal._work_automation_processor_request_plan_sync
+        messages = kwargs["messages"]
+        return {
+            "config": {"local_ai_max_tokens": 900},
+            "processor_kind": "preprocessing",
+            "route": {
+                "profile": "hermes-kanban-preprocessor",
+                "api_base": "http://127.0.0.1:8649",
+                "fallback_provider": "",
+                "fallback_model": "",
+            },
+            "routing": {
+                "revision": "sha256:required-route",
+                "routes": [
+                    {
+                        "route_id": route_id,
+                        "available": True,
+                        "availability_state": "available",
+                        "availability_classification": "available_subscription_model",
+                    }
+                    for route_id in route_ids
+                ],
+            },
+            "route_definitions": {route_id: definitions[route_id] for route_id in route_ids},
+            "prompt_variants": {
+                route_id: (
+                    messages,
+                    {
+                        "request_sha256": f"sha256:{route_id}",
+                        "route_id": route_id,
+                        "request_bytes": 100,
+                        "message_count": len(messages),
+                    },
+                )
+                for route_id in route_ids
+            },
+        }
+
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", run_sync)
+    calls = []
+
+    def complete(**kwargs):
+        calls.append(kwargs)
+        return {
+            "model": "gateway-profile",
+            "choices": [{"message": {"content": '{"ready": true}'}}],
+        }
+
+    monkeypatch.setattr(routes_personal, "_work_automation_profile_completion_sync", complete)
+
+    result = asyncio.run(
+        routes_personal._work_automation_processor_profile_json_completion(
+            messages=[{"role": "user", "content": "same-route validation repair"}],
+            run_id="pytest-required-route",
+            processor_kind="preprocessing",
+            source_hash="sha256:required-route-source",
+            required_route_id="chatgpt-5-6-terra",
+        )
+    )
+
+    assert [call["route_id"] for call in calls] == ["chatgpt-5-6-terra"]
+    assert result["chosen_route_id"] == "chatgpt-5-6-terra"
+    assert result["required_route_id"] == "chatgpt-5-6-terra"
+    assert result["model_attempts"][0]["required_route_id"] == "chatgpt-5-6-terra"
+
+    with pytest.raises(ValueError, match="not allowlisted"):
+        asyncio.run(
+            routes_personal._work_automation_processor_profile_json_completion(
+                messages=[{"role": "user", "content": "reject arbitrary route"}],
+                run_id="pytest-required-route-invalid",
+                processor_kind="preprocessing",
+                required_route_id="arbitrary-import-or-url",
+            )
+        )
 
 
 def test_work_processor_all_unavailable_retains_retryable_attempt_evidence(monkeypatch):
@@ -14117,6 +15613,415 @@ def test_work_processor_all_unavailable_retains_retryable_attempt_evidence(monke
     assert len(exhausted.value.attempts) == 3
     assert {attempt["outcome"] for attempt in exhausted.value.attempts} == {"unavailable"}
     assert all(attempt["latency_ms"] == 0 for attempt in exhausted.value.attempts)
+
+
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        (
+            _preprocessing_contract_fields(recommended_mode="shared-worktree-parallel"),
+            "execution_directive recommended_mode is invalid",
+        ),
+        (
+            {
+                **_preprocessing_contract_fields(),
+                "execution_directive": {
+                    **_preprocessing_contract_fields()["execution_directive"],
+                    "work_units": [
+                        {
+                            "depends_on": [],
+                            "repo_paths": [],
+                            "write_scopes": [],
+                            "required_skills": [],
+                            "proof_expected": [],
+                        }
+                    ],
+                },
+            },
+            "execution_directive work_units\\[0\\] requires unit_id, title, and scope",
+        ),
+    ],
+)
+def test_work_preprocessing_execution_directive_rejects_observed_failure_fixtures(
+    payload,
+    error,
+):
+    with pytest.raises(ValueError, match=error):
+        routes_personal._work_preprocessing_execution_directive(payload)
+
+
+def test_work_preprocessing_execution_directive_reports_all_top_level_omissions():
+    payload = _preprocessing_contract_fields()
+    directive = payload["execution_directive"]
+    directive.pop("merge_reconciliation_owner")
+    directive.pop("timeout_checkin_failure_behavior")
+    directive.pop("cleanup_criteria")
+
+    with pytest.raises(ValueError) as invalid:
+        routes_personal._work_preprocessing_execution_directive(payload)
+
+    error = str(invalid.value)
+    assert error.startswith("execution_directive validation errors:")
+    assert "execution_directive cleanup_criteria must be a list" in error
+    assert "execution_directive merge_reconciliation_owner is required" in error
+    assert "execution_directive timeout_checkin_failure_behavior is required" in error
+
+
+def test_work_preprocessing_valid_contract_does_not_attempt_validation_repair(monkeypatch):
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda item: {"item_id": item["item_id"], "tags": []},
+    )
+
+    async def unexpected_repair(**_kwargs):
+        raise AssertionError("a valid first response must not trigger validation repair")
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_repair",
+        unexpected_repair,
+    )
+    initial_ai = {
+        "payload": _preprocessing_contract_fields(),
+        "chosen_route_id": "chatgpt-5-6-sol",
+        "model_attempts": [{"route_id": "chatgpt-5-6-sol", "outcome": "chosen"}],
+    }
+
+    returned_ai, contract = asyncio.run(
+        routes_personal._work_preprocessing_validate_with_one_repair(
+            ai=initial_ai,
+            messages=[{"role": "user", "content": "bounded initial request"}],
+            item={"item_id": "work-valid-first-response", "body_excerpt": ""},
+            discussions=[],
+            source_hash="sha256:valid-source",
+            marker_id="marker-valid-first-response",
+            run_id="run-valid-first-response",
+        )
+    )
+
+    assert returned_ai is initial_ai
+    assert contract["execution_directive"]["recommended_mode"] == "serial"
+    assert "validation_repair" not in returned_ai
+
+
+def test_work_preprocessing_repairs_once_on_same_route_and_preserves_identity(monkeypatch):
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda item: {"item_id": item["item_id"], "tags": []},
+    )
+    calls = []
+
+    async def repair(**kwargs):
+        calls.append(kwargs)
+        repair_request = json.loads(kwargs["messages"][-1]["content"])
+        assert repair_request["validation_error"] == (
+            "execution_directive work_units[0] requires unit_id, title, and scope"
+        )
+        assert repair_request["document_source_hash"] == "sha256:repair-source"
+        assert repair_request["marker_id"] == "marker-repair"
+        return {
+            "payload": _preprocessing_contract_fields(),
+            "chosen_route_id": "chatgpt-5-6-sol",
+            "required_route_id": "chatgpt-5-6-sol",
+            "prompt_sha256": "sha256:repair-prompt",
+            "response_id": "repair-response",
+            "finish_reason": "stop",
+            "usage": {"total_tokens": 321},
+            "max_tokens": 1800,
+            "content_excerpt": '{"execution_directive":{"recommended_mode":"serial"}}',
+            "content_length": 512,
+            "model_attempts": [
+                {
+                    "route_id": "chatgpt-5-6-sol",
+                    "outcome": "chosen",
+                    "source_hash": "sha256:repair-source",
+                    "run_id": "run-repair",
+                }
+            ],
+            "latency_ms": 14.0,
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_repair",
+        repair,
+    )
+    invalid_payload = _preprocessing_contract_fields()
+    invalid_payload["execution_directive"]["work_units"] = [
+        {
+            "depends_on": [],
+            "repo_paths": [],
+            "write_scopes": [],
+            "required_skills": [],
+            "proof_expected": [],
+        }
+    ]
+    initial_ai = {
+        "payload": invalid_payload,
+        "chosen_route_id": "chatgpt-5-6-sol",
+        "prompt_sha256": "sha256:initial-prompt",
+        "response_id": "initial-response",
+        "finish_reason": "length",
+        "usage": {"total_tokens": 1800},
+        "max_tokens": 1800,
+        "content_excerpt": '{"execution_directive":{"work_units":[{}]}}',
+        "content_length": 4100,
+        "content_excerpt_truncated": True,
+        "model_attempts": [
+            {
+                "route_id": "chatgpt-5-6-sol",
+                "outcome": "chosen",
+                "source_hash": "sha256:repair-source",
+                "run_id": "run-repair",
+            }
+        ],
+        "latency_ms": 20.0,
+    }
+
+    repaired_ai, contract = asyncio.run(
+        routes_personal._work_preprocessing_validate_with_one_repair(
+            ai=initial_ai,
+            messages=[{"role": "user", "content": "bounded original request"}],
+            item={"item_id": "work-repair", "body_excerpt": ""},
+            discussions=[],
+            source_hash="sha256:repair-source",
+            marker_id="marker-repair",
+            run_id="run-repair",
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["required_route_id"] == "chatgpt-5-6-sol"
+    assert calls[0]["run_id"] == "run-repair"
+    assert calls[0]["source_hash"] == "sha256:repair-source"
+    assert calls[0]["state_identity"] == {
+        "item_id": "work-repair",
+        "marker_id": "marker-repair",
+        "validation_repair_attempt": "1",
+    }
+    assert contract["execution_directive"]["recommended_mode"] == "serial"
+    assert repaired_ai["validation_repair"]["outcome"] == "repaired"
+    assert repaired_ai["validation_repair"]["same_route"] is True
+    assert repaired_ai["validation_repair"]["initial_finish_reason"] == "length"
+    assert repaired_ai["validation_repair"]["initial_content_excerpt_truncated"] is True
+    assert [attempt["validation_phase"] for attempt in repaired_ai["model_attempts"]] == [
+        "initial",
+        "validation_repair",
+    ]
+
+
+def test_work_preprocessing_exhausted_repair_stays_visible_and_is_not_repeated(monkeypatch):
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda item: {"item_id": item["item_id"], "tags": []},
+    )
+    calls = []
+
+    async def repair(**kwargs):
+        calls.append(kwargs)
+        return {
+            "payload": _preprocessing_contract_fields(recommended_mode="shared-worktree-parallel"),
+            "chosen_route_id": "chatgpt-5-6-sol",
+            "required_route_id": "chatgpt-5-6-sol",
+            "content_excerpt": '{"recommended_mode":"shared-worktree-parallel"}',
+            "content_length": 48,
+            "model_attempts": [
+                {
+                    "route_id": "chatgpt-5-6-sol",
+                    "outcome": "chosen",
+                    "source_hash": "sha256:exhausted-source",
+                    "run_id": "run-exhausted",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_local_ai_json_repair",
+        repair,
+    )
+    initial_ai = {
+        "payload": _preprocessing_contract_fields(recommended_mode="parallel"),
+        "chosen_route_id": "chatgpt-5-6-sol",
+        "content_excerpt": '{"recommended_mode":"parallel"}',
+        "content_length": 31,
+        "model_attempts": [
+            {
+                "route_id": "chatgpt-5-6-sol",
+                "outcome": "chosen",
+                "source_hash": "sha256:exhausted-source",
+                "run_id": "run-exhausted",
+            }
+        ],
+    }
+
+    with pytest.raises(routes_personal.WorkPreprocessingValidationRepairExhausted) as exhausted:
+        asyncio.run(
+            routes_personal._work_preprocessing_validate_with_one_repair(
+                ai=initial_ai,
+                messages=[{"role": "user", "content": "bounded original request"}],
+                item={"item_id": "work-exhausted", "body_excerpt": ""},
+                discussions=[],
+                source_hash="sha256:exhausted-source",
+                marker_id="marker-exhausted",
+                run_id="run-exhausted",
+            )
+        )
+
+    assert len(calls) == 1
+    assert exhausted.value.error_class == "llm_response_validation"
+    assert exhausted.value.validation_repair["outcome"] == "exhausted"
+    assert exhausted.value.validation_repair["attempt_count"] == 1
+    assert exhausted.value.validation_repair["same_route"] is True
+    assert [attempt["validation_phase"] for attempt in exhausted.value.attempts] == [
+        "initial",
+        "validation_repair",
+    ]
+
+
+def test_preprocessing_validation_exhaustion_uses_one_existing_marker_retry(
+    monkeypatch,
+    tmp_path,
+):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    monkeypatch.setattr(routes_personal, "KANBAN_ROOT", tmp_path / "kanban")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('test-node')")
+    conn.execute("INSERT INTO nodes (node_id) VALUES ('peer-node')")
+    asyncio.run(
+        routes_personal.create_work_item(
+            routes_personal.WorkItemCreateRequest(
+                item_id="work-validation-marker-retry",
+                title="Validation marker retry",
+                body="Keep one exhausted semantic repair visible for the existing marker retry.",
+                state_id="todo",
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    scan = asyncio.run(
+        routes_personal.trigger_work_preprocessing_idle_scan(
+            routes_personal.WorkPreprocessingIdleScanRequest(
+                item_id="work-validation-marker-retry",
+                max_items=1,
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    marker = scan["queued_markers"][0]
+    acquired = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="codex-validation-retry",
+                item_id="work-validation-marker-retry",
+                ttl_seconds=600,
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    lease_token = acquired["lease"]["lease_token"]
+    claimed = asyncio.run(
+        routes_personal.claim_next_work_review_processor_marker(
+            routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                holder_id="codex-validation-retry",
+                lease_token=lease_token,
+                item_id="work-validation-marker-retry",
+                timeout_seconds=120,
+                actor="codex-test",
+                source_surface="pytest",
+            )
+        )
+    )
+    validation_repair = {
+        "schema": routes_personal.KANBAN_PREPROCESSING_VALIDATION_REPAIR_SCHEMA,
+        "outcome": "exhausted",
+        "attempt_count": 1,
+        "max_attempts": 1,
+        "required_route_id": "chatgpt-5-6-sol",
+        "document_source_hash": marker["document_source_hash"],
+    }
+    failure = routes_personal.WorkPreprocessingValidationRepairExhausted(
+        initial_error="execution_directive recommended_mode is invalid",
+        repair_error="execution_directive recommended_mode is invalid",
+        attempts=[
+            {
+                "route_id": "chatgpt-5-6-sol",
+                "outcome": "chosen",
+                "validation_phase": "initial",
+                "latency_ms": 10,
+            },
+            {
+                "route_id": "chatgpt-5-6-sol",
+                "outcome": "chosen",
+                "validation_phase": "validation_repair",
+                "latency_ms": 12,
+            },
+        ],
+        validation_repair=validation_repair,
+    )
+
+    async def fail_preprocessing(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(
+        routes_personal,
+        "_process_work_preprocessing_idle_marker",
+        fail_preprocessing,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_processor_profile_route",
+        lambda _kind: {
+            "provider_mode": "profile",
+            "processor_engine": "hermes",
+            "profile": "hermes-kanban-preprocessor",
+            "primary_provider": "openai-codex",
+            "primary_model": "gpt-5.6-sol",
+            "model_alias": "hermes-kanban-preprocessor",
+        },
+    )
+
+    result = asyncio.run(
+        routes_personal._process_work_automation_claimed_marker(
+            claimed["marker"],
+            holder_id="codex-validation-retry",
+            lease_token=lease_token,
+            run_id="run-validation-retry",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["final_outcome"] == "validation_repair_exhausted"
+    assert result["model_attempt_count"] == 2
+    failed_marker = conn.execute(
+        """
+        SELECT * FROM kanban_review_processor_markers
+        WHERE marker_id=?
+        """,
+        (marker["marker_id"],),
+    ).fetchone()
+    assert failed_marker["status"] == "failed"
+    assert failed_marker["retry_attempt_count"] == 1
+    assert failed_marker["retry_after_seconds"] == 5 * 60
+    assert failed_marker["next_retry_at"]
+    failure_events = conn.execute(
+        """
+        SELECT * FROM kanban_review_processor_failure_events
+        WHERE marker_id=?
+        """,
+        (marker["marker_id"],),
+    ).fetchall()
+    assert len(failure_events) == 1
+    marker_metadata = json.loads(failed_marker["metadata_json"])
+    assert marker_metadata["error_class"] == "llm_response_validation"
+    assert marker_metadata["validation_repair"]["outcome"] == "exhausted"
+    assert marker_metadata["model_routing"]["final_outcome"] == ("validation_repair_exhausted")
 
 
 def test_blocker_processor_completion_uses_structured_bounded_blueprints_routing(monkeypatch):
@@ -14276,6 +16181,8 @@ def test_work_processor_prompt_variant_selects_model_files_and_generic_fallback(
     assert evidence["selection"] == "model_variant"
     assert evidence["soul_prompt_id"] == "kanban-preprocessing-chatgpt-5-6-sol-soul"
     assert evidence["request_sha256"].startswith("sha256:")
+    assert evidence["request_bytes"] > 0
+    assert evidence["message_count"] == len(selected)
 
     fallback, fallback_evidence = routes_personal._work_processor_prompt_variant(
         "preprocessing",
@@ -14459,6 +16366,15 @@ def test_work_preprocessing_prompt_supplies_bounded_engineering_guidance(monkeyp
         "long-lived-http-clients",
         "permission-and-ownership-guards",
     }
+    database_guidance = next(
+        entry
+        for entry in catalog["entries"]
+        if entry["guidance_id"] == "database-connection-lifecycle"
+    )
+    assert "measured mode=ro helper" in database_guidance["card_guidance"]
+    assert "bounded thread- or lifecycle-owned reuse" in database_guidance["card_guidance"]
+    assert "repeated open/setup work is the measured owner" in database_guidance["card_guidance"]
+    assert "SQLite open/setup/use/close stages" in database_guidance["proof_guidance"]
     assert "selected_guidance_ids" in payload["required_output"]
     assert any("must not browse arbitrary skills" in rule for rule in payload["hard_rules"])
 
@@ -15311,6 +17227,7 @@ def test_preprocessing_rejects_unjustified_operator_request_deviation():
                     "record_refs_in_order": ["kanban_items:verbatim-fixture:body"],
                     "alignment": "deviation_requires_approval",
                     "comparison_summary": "A different implementation is proposed.",
+                    "intent_summary": "Preserve the original request unless approval is recorded.",
                     "deviations": [
                         {
                             "affected_request_ref": "kanban_items:verbatim-fixture:body",

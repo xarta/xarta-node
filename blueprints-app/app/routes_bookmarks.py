@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 
 from . import timing
 from .ai_client import complete, embed, rerank
-from .db import get_conn, get_setting, increment_gen, set_setting
+from .db import get_conn, get_read_conn, get_setting, increment_gen, set_setting
 from .models import (
     BookmarkCreate,
     BookmarkImportRequest,
@@ -294,13 +294,29 @@ async def post_analyze_domains(body: dict | None = None) -> dict:
     threshold: int | None = None
     if body and "domain_threshold" in body:
         threshold = max(0, int(body["domain_threshold"]))
-    rare = _do_analyze_domains(threshold)
-    with get_conn() as conn:
-        used_threshold = int(
+    rare = await timing.to_thread(
+        "bookmarks.analyze_domains",
+        _do_analyze_domains,
+        threshold,
+    )
+    used_threshold = threshold
+    if used_threshold is None:
+        used_threshold = await timing.to_thread(
+            "bookmarks.analyze_domains_threshold",
+            _embedding_domain_threshold_sync,
+        )
+    return {"rare_domains_count": len(rare), "threshold": used_threshold}
+
+
+def _embedding_domain_threshold_sync() -> int:
+    with get_read_conn(
+        busy_timeout_ms=100,
+        operation="bookmarks_embedding_domain_threshold",
+    ) as conn:
+        return int(
             get_setting(conn, SETTING_DOMAIN_THRESHOLD, DEFAULT_DOMAIN_THRESHOLD)
             or DEFAULT_DOMAIN_THRESHOLD
         )
-    return {"rare_domains_count": len(rare), "threshold": used_threshold}
 
 
 @router.post("/reindex", response_model=dict)

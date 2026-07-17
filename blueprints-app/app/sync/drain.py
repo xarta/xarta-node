@@ -25,7 +25,7 @@ import httpx
 from .. import config as cfg
 from .. import timing
 from ..auth import compute_token
-from ..db import get_conn, get_meta
+from ..db import get_meta, get_read_conn
 from ..sync.queue import (
     get_peer_urls,
     get_peers_with_pending,
@@ -164,7 +164,10 @@ def _discard_self_target_actions() -> None:
 
 
 def _drain_integrity_ok_sync() -> bool:
-    with get_conn() as conn:
+    with get_read_conn(
+        busy_timeout_ms=_DRAIN_SQLITE_BUSY_TIMEOUT_MS,
+        operation="sync_drain_integrity",
+    ) as conn:
         return get_meta(conn, "integrity_ok") == "true"
 
 

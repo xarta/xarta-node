@@ -17,11 +17,11 @@ NODES_JSON.write_text(
         {
             "nodes": [
                 {
-                    "node_id": "test-owner",
+                    "node_id": "test-node",
                     "display_name": "Thunderbird 1",
                     "host_machine": "test-host",
-                    "primary_hostname": "test-owner.local",
-                    "tailnet_hostname": "test-owner.tailnet",
+                    "primary_hostname": "test-node.local",
+                    "tailnet_hostname": "test-node.tailnet",
                     "primary_ip": "127.0.0.1",
                     "sync_port": 8080,
                     "tailnet": "test",
@@ -33,7 +33,7 @@ NODES_JSON.write_text(
     ),
     encoding="utf-8",
 )
-os.environ.setdefault("BLUEPRINTS_NODE_ID", "test-owner")
+os.environ.setdefault("BLUEPRINTS_NODE_ID", "test-node")
 os.environ.setdefault("NODES_JSON_PATH", str(NODES_JSON))
 os.environ.setdefault("BLUEPRINTS_DB_DIR", tempfile.mkdtemp(prefix="blueprints-kanban-db-"))
 os.environ.setdefault("SEEKDB_HOST", "127.0.0.1")
@@ -80,16 +80,16 @@ def client(handler):
 def producer_config(mode):
     return {
         "producer_mode": mode,
-        "owner_node_id": "test-owner",
+        "owner_node_id": "test-node",
         "scheduler_provider_effective_enabled": mode in {"scheduler_shadow", "scheduler"},
         "scheduler_mutations_enabled": mode == "scheduler",
     }
 
 
-def claim(run_id="run-1"):
+def claim(run_id="run-1", target_key=scheduler.AUTOMATION_TARGET_KEY):
     return {
         "actionable": True,
-        "run": {"run_id": run_id, "target_key": scheduler.TARGET_KEY},
+        "run": {"run_id": run_id, "target_key": target_key},
         "target_config": {},
         "claim_token": "c" * 40,
         "fence_token": 7,
@@ -99,7 +99,7 @@ def claim(run_id="run-1"):
 
 
 def test_producer_modes_default_legacy_and_invalid_fail_closed(monkeypatch):
-    monkeypatch.setenv(routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV, "test-owner")
+    monkeypatch.setenv(routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV, "test-node")
     monkeypatch.delenv(routes_personal.KANBAN_AUTOMATION_PRODUCER_MODE_ENV, raising=False)
     legacy = routes_personal._work_automation_idle_worker_config()
     assert legacy["producer_mode"] == "legacy"
@@ -175,6 +175,61 @@ async def test_provider_lifecycle_can_restart_after_clean_stop(monkeypatch):
 
 
 @async_test
+async def test_lazy_provider_config_and_client_creation_stay_bounded_off_event_loop(
+    monkeypatch,
+):
+    loaded = config()
+    calls = []
+
+    async def to_thread(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    created = client(lambda _request: httpx.Response(200, json={"ok": True}))
+    monkeypatch.setattr(asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(scheduler, "load_provider_config", lambda: loaded)
+    monkeypatch.setattr(
+        scheduler,
+        "_scheduler_http_client",
+        lambda received: calls.append(("client", received)) or created,
+    )
+
+    instance = scheduler.KanbanAutomationScheduler()
+    response = await instance._request_json("GET", "/status")
+
+    assert response == {"ok": True}
+    assert calls[0][0] is scheduler.load_provider_config
+    assert calls[1] == ("client", loaded)
+    assert instance.config == loaded
+    assert instance.client is created
+    await instance.stop()
+
+
+@async_test
+async def test_producer_config_and_singleton_file_check_stay_off_event_loop(monkeypatch):
+    loaded = producer_config("legacy")
+    calls = []
+
+    async def to_thread(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", to_thread)
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_idle_worker_config",
+        lambda: loaded,
+    )
+    instance = scheduler.KanbanAutomationScheduler(config=config())
+
+    assert await instance._producer_config() is loaded
+    assert calls == [
+        (routes_personal._work_automation_idle_worker_config, (), {}),
+    ]
+    assert instance.worker_id == "blueprints-kanban-automation:test-node"
+
+
+@async_test
 @pytest.mark.parametrize(
     "bad_claim",
     [
@@ -218,16 +273,11 @@ async def test_shadow_mode_is_read_only_and_reports_candidate_parity(monkeypatch
             "claimable_marker_ids": ["marker-1"],
         }
 
-    async def blocker(*, tick_id, worker_id, apply):
-        called.append(("blocker", tick_id, worker_id, apply))
-        return {"ok": True, "candidate_count": 3, "examined": 3, "processed": 0}
-
     async def forbidden_tick(**_kwargs):
         raise AssertionError("shadow provider must never call the mutating tick")
 
     monkeypatch.setattr(routes_personal, "work_kanban_automation_shadow_snapshot", snapshot)
     monkeypatch.setattr(routes_personal, "run_work_kanban_automation_idle_tick", forbidden_tick)
-    monkeypatch.setattr(scheduler, "_run_blocker_resolver", blocker)
     result = await instance._execute_target(claim("run-shadow"))
     assert result["outcome"] == "skipped"
     assert result["coverage_complete"] is True
@@ -238,18 +288,8 @@ async def test_shadow_mode_is_read_only_and_reports_candidate_parity(monkeypatch
         "preprocessing_candidates": 1,
         "preprocessing_would_queue": 1,
         "claimable_markers": 1,
-        "blocker_candidates": 3,
-        "blockers_examined": 3,
     }
-    assert called == [
-        "snapshot",
-        (
-            "blocker",
-            "blueprints-kanban-automation:run-shadow",
-            instance.worker_id,
-            False,
-        ),
-    ]
+    assert called == ["snapshot"]
     await async_client.aclose()
 
 
@@ -263,18 +303,8 @@ async def test_shadow_mode_keeps_blocker_failures_visible(monkeypatch):
         lambda: producer_config("scheduler_shadow"),
     )
 
-    async def snapshot(**_kwargs):
-        return {
-            "timeout_marker_ids": [],
-            "review_candidate_ids": [],
-            "review_queue_item_ids": [],
-            "preprocessing_candidate_ids": [],
-            "preprocessing_queue_item_ids": [],
-            "claimable_marker_ids": [],
-        }
-
     async def blocker(*, tick_id, worker_id, apply):
-        assert tick_id == "blueprints-kanban-automation:run-shadow-failure"
+        assert tick_id == "blueprints-kanban-automation:blocker:run-shadow-failure"
         assert worker_id == instance.worker_id
         assert apply is False
         return {
@@ -286,9 +316,11 @@ async def test_shadow_mode_keeps_blocker_failures_visible(monkeypatch):
             "run_timeout_reached": True,
         }
 
-    monkeypatch.setattr(routes_personal, "work_kanban_automation_shadow_snapshot", snapshot)
     monkeypatch.setattr(scheduler, "_run_blocker_resolver", blocker)
-    result = await instance._execute_target(claim("run-shadow-failure"))
+    result = await instance._execute_target(
+        claim("run-shadow-failure", scheduler.BLOCKER_TARGET_KEY)
+    )
+    assert result["schema"] == scheduler.BLOCKER_RESULT_SCHEMA
     assert result["outcome"] == "truncated"
     assert result["coverage_complete"] is False
     assert result["truncated"] is True
@@ -325,6 +357,51 @@ async def test_scheduler_tick_uses_stable_identity_and_durable_replay(monkeypatc
             "preprocessing_scan": {"scanned_count": 3, "queued_count": 1},
         }
 
+    async def record(**kwargs):
+        seen["record"] = kwargs
+        receipt["value"] = kwargs["result"]
+        return kwargs["result"]
+
+    monkeypatch.setattr(routes_personal, "work_kanban_automation_tick_receipt", get_receipt)
+    monkeypatch.setattr(routes_personal, "run_work_kanban_automation_idle_tick", tick)
+    monkeypatch.setattr(routes_personal, "record_work_kanban_automation_tick_receipt", record)
+
+    first = await instance._execute_target(claim("run-stable"))
+    assert first["scheduler_run_id"] == "run-stable"
+    assert first["tick_id"] == "blueprints-kanban-automation:run-stable"
+    assert first["producer_node_id"] == "test-node"
+    assert first["outcome"] == "completed"
+    assert seen["tick"] == {
+        "holder_id": instance.worker_id,
+        "run_id": "blueprints-kanban-automation:run-stable",
+        "actor": instance.worker_id,
+        "source_surface": "xarta-scheduler-provider",
+        "request_id": "blueprints-kanban-automation:run-stable",
+        "producer_source": "scheduler",
+    }
+    seen.pop("tick")
+    second = await instance._execute_target(claim("run-stable"))
+    assert second == first
+    assert "tick" not in seen
+    await async_client.aclose()
+
+
+@async_test
+async def test_blocker_tick_has_separate_identity_and_durable_replay(monkeypatch):
+    async_client = client(lambda _request: None)
+    instance = scheduler.KanbanAutomationScheduler(config=config(), client=async_client)
+    monkeypatch.setattr(
+        routes_personal,
+        "_work_automation_idle_worker_config",
+        lambda: producer_config("scheduler"),
+    )
+    seen = {}
+    receipt = {"value": None}
+
+    async def get_receipt(tick_id):
+        seen.setdefault("receipt_lookups", []).append(tick_id)
+        return receipt["value"]
+
     async def blocker(*, tick_id, worker_id, apply):
         seen["blocker"] = (tick_id, worker_id, apply)
         return {
@@ -340,34 +417,23 @@ async def test_scheduler_tick_uses_stable_identity_and_durable_replay(monkeypatc
         return kwargs["result"]
 
     monkeypatch.setattr(routes_personal, "work_kanban_automation_tick_receipt", get_receipt)
-    monkeypatch.setattr(routes_personal, "run_work_kanban_automation_idle_tick", tick)
     monkeypatch.setattr(routes_personal, "record_work_kanban_automation_tick_receipt", record)
     monkeypatch.setattr(scheduler, "_run_blocker_resolver", blocker)
 
-    first = await instance._execute_target(claim("run-stable"))
-    assert first["scheduler_run_id"] == "run-stable"
-    assert first["tick_id"] == "blueprints-kanban-automation:run-stable"
-    assert first["producer_node_id"] == "test-owner"
-    assert first["outcome"] == "completed"
-    assert seen["tick"] == {
-        "holder_id": instance.worker_id,
-        "run_id": "blueprints-kanban-automation:run-stable",
-        "actor": instance.worker_id,
-        "source_surface": "xarta-scheduler-provider",
-        "request_id": "blueprints-kanban-automation:run-stable",
-        "producer_source": "scheduler",
-    }
+    target_claim = claim("run-blocker", scheduler.BLOCKER_TARGET_KEY)
+    first = await instance._execute_target(target_claim)
+    assert first["schema"] == scheduler.BLOCKER_RESULT_SCHEMA
+    assert first["tick_id"] == "blueprints-kanban-automation:blocker:run-blocker"
+    assert first["phase_counts"]["blockers_processed"] == 1
     assert seen["blocker"] == (
-        "blueprints-kanban-automation:run-stable",
+        "blueprints-kanban-automation:blocker:run-blocker",
         instance.worker_id,
         True,
     )
 
-    seen.pop("tick")
     seen.pop("blocker")
-    second = await instance._execute_target(claim("run-stable"))
+    second = await instance._execute_target(target_claim)
     assert second == first
-    assert "tick" not in seen
     assert "blocker" not in seen
     await async_client.aclose()
 
@@ -423,6 +489,38 @@ async def test_provider_timeout_cancels_target_and_reports_bounded_failure(monke
     await instance._run_claim(claim("run-timeout"))
     assert cancelled.is_set()
     assert reports[0]["error"] == "TimeoutError: Kanban automation target failed"
+    await async_client.aclose()
+
+
+@async_test
+async def test_claim_report_retry_is_bounded_and_does_not_create_hidden_retry_owner(
+    monkeypatch,
+):
+    attempts = 0
+
+    def handler(_request):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, json={"detail": "scheduler report unavailable"})
+
+    async_client = client(handler)
+    instance = scheduler.KanbanAutomationScheduler(config=config(), client=async_client)
+    monkeypatch.setattr(scheduler, "REPORT_TIMEOUT_SECONDS", 0.03)
+    lost = asyncio.Event()
+    started = time.monotonic()
+
+    accepted = await instance._report_claim(
+        claim("run-report-bound"),
+        "complete",
+        {"result": {"schema": "bounded-test"}},
+        lost,
+    )
+
+    assert accepted is False
+    assert attempts >= 1
+    assert time.monotonic() - started < 0.5
+    assert lost.is_set() is False
+    assert instance._last_error == "claim:complete_report_timeout"
     await async_client.aclose()
 
 
@@ -485,7 +583,7 @@ async def test_blocker_resolver_command_is_fixed_and_bounded(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     report = await scheduler._run_blocker_resolver(
         tick_id="tick-1",
-        worker_id="blueprints-kanban-automation:test-owner",
+        worker_id="blueprints-kanban-automation:test-node",
         apply=True,
     )
     assert report["ok"] is True
@@ -566,6 +664,70 @@ async def test_shadow_snapshot_blocking_database_boundary_stays_off_event_loop(m
     )
     assert snapshot["schema"] == "xarta.kanban.automation.shadow_snapshot.v1"
     assert ticks >= 5
+
+
+@async_test
+async def test_scheduler_status_coalesces_only_concurrent_fresh_builds(monkeypatch):
+    instance = scheduler.KanbanAutomationScheduler(
+        config=config(),
+    )
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def build_status():
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"ok": True, "build": calls}
+
+    monkeypatch.setattr(instance, "_build_status_payload", build_status)
+
+    tasks = [asyncio.create_task(instance.status_payload()) for _ in range(4)]
+    await started.wait()
+    await asyncio.sleep(0)
+    assert calls == 1
+
+    release.set()
+    results = await asyncio.gather(*tasks)
+    assert results == [{"ok": True, "build": 1}] * 4
+
+    release.clear()
+    started.clear()
+    next_task = asyncio.create_task(instance.status_payload())
+    await started.wait()
+    assert calls == 2
+    release.set()
+    assert await next_task == {"ok": True, "build": 2}
+
+
+@async_test
+async def test_scheduler_status_waiter_cancellation_does_not_cancel_shared_build(monkeypatch):
+    instance = scheduler.KanbanAutomationScheduler(
+        config=config(),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def build_status():
+        started.set()
+        await release.wait()
+        return {"ok": True}
+
+    monkeypatch.setattr(instance, "_build_status_payload", build_status)
+
+    first = asyncio.create_task(instance.status_payload())
+    second = asyncio.create_task(instance.status_payload())
+    await started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    assert instance._status_inflight_task is not None
+    assert not instance._status_inflight_task.cancelled()
+    release.set()
+    assert await second == {"ok": True}
 
 
 def test_main_wires_fenced_provider_lifecycle_and_status_route():

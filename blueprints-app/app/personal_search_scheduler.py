@@ -33,14 +33,17 @@ RESULT_SCHEMA = "xarta.personal.search.scheduler-result.v1"
 DEFAULT_SCHEDULER_URL = "http://127.0.0.1:18111"
 TOKEN_ENV = "XARTA_SCHEDULER_PROVIDER_BLUEPRINTS_PERSONAL_SEARCH_TOKEN"
 TOKEN_FILE_ENV = "XARTA_SCHEDULER_PROVIDER_BLUEPRINTS_PERSONAL_SEARCH_TOKEN_FILE"
-SOURCE_TABLES = (
+PERSONAL_SOURCE_TABLES = (
     "personal_events",
     "personal_time_tasks",
     "personal_import_batches",
+)
+KANBAN_SOURCE_TABLES = (
     "kanban_items",
     "kanban_blockers",
     "kanban_discussions",
 )
+SOURCE_TABLES = (*PERSONAL_SOURCE_TABLES, *KANBAN_SOURCE_TABLES)
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_RESULT_BYTES = 30 * 1024
 REQUEST_TIMEOUT_SECONDS = 3.0
@@ -151,8 +154,10 @@ def _utc_now() -> str:
 
 def _source_signature_sync() -> dict[str, Any]:
     tables: list[dict[str, Any]] = []
-    with routes_personal.get_conn() as conn:
-        for table in SOURCE_TABLES:
+    postgres_active = routes_personal._kanban_active_store_is_postgres()
+
+    def append_table_signatures(conn: Any, source_tables: tuple[str, ...]) -> None:
+        for table in source_tables:
             row = conn.execute(
                 f"SELECT COUNT(*) AS row_count, COALESCE(MAX(updated_at), '') AS max_updated_at "
                 f"FROM {table}"
@@ -164,6 +169,20 @@ def _source_signature_sync() -> dict[str, Any]:
                     "max_updated_at": str(row["max_updated_at"] or ""),
                 }
             )
+
+    with routes_personal._sqlite_get_read_conn(
+        busy_timeout_ms=100,
+        operation="personal_search_source_signature",
+    ) as sqlite_conn:
+        append_table_signatures(sqlite_conn, PERSONAL_SOURCE_TABLES)
+        if not postgres_active:
+            append_table_signatures(sqlite_conn, KANBAN_SOURCE_TABLES)
+    if postgres_active:
+        with routes_personal._kanban_postgres_get_conn(
+            operation="personal_search_source_signature",
+            transactional=False,
+        ) as kanban_conn:
+            append_table_signatures(kanban_conn, KANBAN_SOURCE_TABLES)
     encoded = json.dumps(tables, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return {
         "source_signature": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
@@ -174,8 +193,7 @@ def _source_signature_sync() -> dict[str, Any]:
 
 def _full_document_sync_sync() -> dict[str, Any]:
     generated_at = _utc_now()
-    with routes_personal.get_conn() as conn:
-        documents = routes_personal._sync_personal_search_documents(conn, generated_at)
+    documents = routes_personal._sync_personal_search_documents_isolated(generated_at)
     return {"generated_at": generated_at, "documents": documents}
 
 
