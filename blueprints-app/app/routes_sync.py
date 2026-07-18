@@ -541,7 +541,9 @@ def _strict_nonnegative_int(value: Any, field: str) -> int:
     return value
 
 
-def _strict_scheduler_restart_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+def _strict_scheduler_restart_snapshot(
+    payload: dict[str, Any], *, queued_provider_ids: set[str] | None = None
+) -> dict[str, Any]:
     if payload.get("schema") != _SCHEDULER_RESTART_SNAPSHOT_SCHEMA:
         raise SchedulerRestartRefused(
             "scheduler_snapshot_malformed", {"field": "schema", "reason": "unsupported"}
@@ -671,11 +673,19 @@ def _strict_scheduler_restart_snapshot(payload: dict[str, Any]) -> dict[str, Any
         raise SchedulerRestartRefused(
             "scheduler_active_owner_mismatch", {"active_work": ownership_mismatches}
         )
+    queued_provider_ids = (
+        set(_BLUEPRINTS_SCHEDULER_PROVIDER_IDS)
+        if queued_provider_ids is None
+        else queued_provider_ids
+    )
     unsafe_blueprints = [
         row
         for row in active_work
         if row["provider_id"] in _BLUEPRINTS_SCHEDULER_PROVIDER_IDS
-        and (row["queued_runs"] or row["running_runs"])
+        and (
+            row["running_runs"]
+            or (row["provider_id"] in queued_provider_ids and row["queued_runs"])
+        )
     ]
     if unsafe_blueprints:
         raise SchedulerRestartRefused(
@@ -707,10 +717,20 @@ def _strict_scheduler_restart_snapshot(payload: dict[str, Any]) -> dict[str, Any
     }
 
 
-async def _scheduler_quiescence_snapshot() -> dict[str, Any]:
+async def _scheduler_quiescence_snapshot(
+    providers: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    queued_provider_ids = None
+    if providers is not None:
+        queued_provider_ids = {
+            str(provider["provider_id"])
+            for provider in providers
+            if provider.get("provider_effective_enabled") is True
+        }
     try:
         return _strict_scheduler_restart_snapshot(
-            await scheduler_local_get_json("/restart-snapshot")
+            await scheduler_local_get_json("/restart-snapshot"),
+            queued_provider_ids=queued_provider_ids,
         )
     except SchedulerRestartRefused:
         raise
@@ -757,6 +777,7 @@ async def _pause_blueprints_provider_claims() -> list[dict[str, Any]]:
     }
     malformed_provider = any(
         provider.get("claim_loop_paused") is not True
+        or not isinstance(provider.get("provider_effective_enabled"), bool)
         or not isinstance(provider.get("active_run_ids"), list)
         for provider in providers
     )
@@ -790,7 +811,7 @@ async def _pause_blueprints_provider_claims() -> list[dict[str, Any]]:
 async def _pause_and_snapshot_scheduler() -> dict[str, Any]:
     providers = await _pause_blueprints_provider_claims()
     try:
-        scheduler = await _scheduler_quiescence_snapshot()
+        scheduler = await _scheduler_quiescence_snapshot(providers)
     except Exception:
         await _resume_blueprints_provider_claims()
         raise
@@ -987,7 +1008,7 @@ async def _restart_service(
     )
     dispatched_successfully = False
     try:
-        scheduler_immediately_before = await _scheduler_quiescence_snapshot()
+        scheduler_immediately_before = await _scheduler_quiescence_snapshot(providers)
         parts = _restart_command_parts()
         if not parts:
             return False
@@ -1654,7 +1675,11 @@ async def _reconcile_git_pull_operation(
                 },
             )
         return receipt
-    scheduler_immediately_after = await _scheduler_quiescence_snapshot()
+    # The pre-restart receipt already proved that every locally effective
+    # provider had no queued work and that no Blueprints provider was running.
+    # A new scheduled occurrence may be queued while the app is down; it must
+    # not deadlock startup before the new provider loops can consume it.
+    scheduler_immediately_after = await _scheduler_quiescence_snapshot([])
     completed = {
         **result,
         "completed_node_id": cfg.NODE_ID,
@@ -1875,7 +1900,7 @@ async def git_pull_capabilities() -> dict[str, Any]:
         "broadcast": False,
         "operation_receipt_schema": "xarta.blueprints.git_pull_operation.v1",
         "supported_scopes": ["outer"],
-        "restart_guard": "atomic-provider-scoped-snapshot-v4",
+        "restart_guard": "atomic-provider-scoped-snapshot-v5",
         "exact_expected_head": True,
     }
 

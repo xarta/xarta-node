@@ -188,6 +188,7 @@ async def test_restart_pause_waits_for_inflight_claim_materialization():
     release_response.set()
     paused = await asyncio.wait_for(pause_task, timeout=0.2)
 
+    assert paused["provider_effective_enabled"] is True
     assert paused["active_run_ids"] == ["run-race"]
     assert request_count == 1
     await asyncio.sleep(0.03)

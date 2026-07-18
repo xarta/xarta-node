@@ -391,6 +391,7 @@ class KanbanAutomationScheduler:
 
     async def pause_new_claims_for_restart(self) -> dict[str, Any]:
         """Fence new claims without cancelling an in-flight or retained claim."""
+        provider_effective_enabled = any(not task.done() for task in self._loop_tasks)
         self._claims_paused_for_restart = True
         async with self._get_claim_attempt_lock():
             pass
@@ -398,6 +399,7 @@ class KanbanAutomationScheduler:
         producer = await self._producer_config()
         return {
             "provider_id": PROVIDER_ID,
+            "provider_effective_enabled": provider_effective_enabled,
             "claim_loop_paused": True,
             "legacy_loop_effective_enabled": bool(producer.get("legacy_loop_effective_enabled")),
             "active_run_ids": sorted(
