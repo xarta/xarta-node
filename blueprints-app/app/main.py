@@ -38,6 +38,7 @@ from .kanban_automation_scheduler import (
     stop_kanban_automation_scheduler,
 )
 from .kanban_postgres import (
+    KanbanPostgresOperationTimeout,
     KanbanPostgresPoolTimeout,
     close_postgres_candidate_pools,
 )
@@ -165,6 +166,24 @@ async def _handle_kanban_postgres_pool_timeout(
             "detail": "Kanban Postgres is busy; retry shortly.",
             "error": {
                 "code": "kanban_postgres_pool_saturated",
+                "retryable": True,
+            },
+        },
+    )
+
+
+async def _handle_kanban_postgres_operation_timeout(
+    _request: Request,
+    exc: KanbanPostgresOperationTimeout,
+) -> JSONResponse:
+    log.warning("kanban_postgres_operation_timeout: %s", exc)
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": "1"},
+        content={
+            "detail": "Kanban Postgres operation timed out; retry shortly.",
+            "error": {
+                "code": "kanban_postgres_operation_timeout",
                 "retryable": True,
             },
         },
@@ -549,6 +568,10 @@ def create_app() -> FastAPI:
     application.add_exception_handler(
         KanbanPostgresPoolTimeout,
         _handle_kanban_postgres_pool_timeout,
+    )
+    application.add_exception_handler(
+        KanbanPostgresOperationTimeout,
+        _handle_kanban_postgres_operation_timeout,
     )
 
     # App-side timing header used by local contention probes to distinguish

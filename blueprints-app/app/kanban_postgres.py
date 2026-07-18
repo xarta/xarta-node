@@ -41,6 +41,10 @@ class KanbanPostgresPoolTimeout(KanbanPostgresError):
     """Raised when the bounded Kanban Postgres pool cannot provide a connection."""
 
 
+class KanbanPostgresOperationTimeout(KanbanPostgresError):
+    """Raised when a bounded Kanban Postgres operation exceeds its wall time."""
+
+
 class PostgresRow(dict[str, Any]):
     """Small row object compatible with sqlite3.Row's mapping/index access."""
 
@@ -87,7 +91,16 @@ class _AsyncpgRunner:
 
     def run(self, coro: Any, *, timeout: float = 60.0) -> Any:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except TimeoutError as exc:
+            pending = not future.done()
+            if pending:
+                future.cancel()
+            timeout_kind = "runner wall time" if pending else "database command time"
+            raise KanbanPostgresOperationTimeout(
+                f"Kanban Postgres operation exceeded {timeout_kind} ({timeout:g} seconds)"
+            ) from exc
 
     async def _pool(self, database_url: str) -> asyncpg.Pool:
         pool = self._pools.get(database_url)
