@@ -23,6 +23,11 @@ from .local_llm_events import (
     publish_local_llm_offline_event,
     publish_local_llm_recovered_event,
 )
+from .node_local_ownership import (
+    read_node_local_text,
+    unlink_node_local_file,
+    write_node_local_text_atomic,
+)
 from .tts_sanitizer_client import (
     TtsSanitizerUnavailable,
     clean_tts_markdown_via_service,
@@ -1034,29 +1039,12 @@ def _cache_path(cache_key: str) -> Path:
     return _SPEECH_CACHE_ROOT / f"{cache_key}.json"
 
 
-def _normalize_node_local_ownership(target: Path) -> None:
-    try:
-        owner = _NODE_LOCAL_ROOT.stat()
-    except OSError:
-        return
-    current = target
-    while True:
-        try:
-            if current.exists():
-                os.chown(current, owner.st_uid, owner.st_gid)
-        except OSError:
-            return
-        if current == _NODE_LOCAL_ROOT or current.parent == current:
-            break
-        current = current.parent
-
-
 def _read_speech_cache(cache_key: str) -> dict[str, Any] | None:
     path = _cache_path(cache_key)
-    if not path.is_file():
-        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_node_local_text(path, root=_NODE_LOCAL_ROOT))
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError) as exc:
         raise HTTPException(500, f"Could not read web research speech cache: {exc}") from exc
     if not isinstance(data, dict) or not isinstance(data.get("markdown"), str):
@@ -1077,13 +1065,24 @@ def _write_speech_cache(cache_key: str, markdown: str, meta: dict[str, Any]) -> 
         "meta": {**meta, "speech_version": _WEB_RESEARCH_SPEECH_VERSION},
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        _normalize_node_local_ownership(path.parent)
-        _normalize_node_local_ownership(path)
-    except OSError as exc:
+        write_node_local_text_atomic(
+            path,
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            root=_NODE_LOCAL_ROOT,
+        )
+    except (OSError, ValueError) as exc:
         raise HTTPException(500, f"Could not write web research speech cache: {exc}") from exc
     return path
+
+
+def _invalidate_speech_cache(cache_key: str) -> None:
+    path = _cache_path(cache_key)
+    try:
+        unlink_node_local_file(path, root=_NODE_LOCAL_ROOT)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        raise HTTPException(500, f"Could not invalidate web research speech cache: {exc}") from exc
 
 
 async def _display_envelope(
@@ -1642,7 +1641,7 @@ async def web_research_query_prompt(body: WebResearchPromptBody) -> dict[str, An
 async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
     cache_key = (body.cache_key or "").strip()
     if cache_key and not body.force_refresh and not body.private_mode:
-        cached = _read_speech_cache(cache_key)
+        cached = await asyncio.to_thread(_read_speech_cache, cache_key)
         if cached:
             return {
                 "ok": True,
@@ -1682,14 +1681,9 @@ async def web_research_speech(body: WebResearchSpeechBody) -> dict[str, Any]:
             markdown=markdown,
         )
     if body.force_refresh:
-        path = _cache_path(cache_key)
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise HTTPException(
-                500, f"Could not invalidate web research speech cache: {exc}"
-            ) from exc
-    _write_speech_cache(
+        await asyncio.to_thread(_invalidate_speech_cache, cache_key)
+    await asyncio.to_thread(
+        _write_speech_cache,
         cache_key,
         audio,
         {
