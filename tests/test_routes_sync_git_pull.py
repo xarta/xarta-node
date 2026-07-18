@@ -356,6 +356,112 @@ def test_git_pull_batch_restarts_when_runtime_process_is_stale(monkeypatch):
     assert restarts[0]["operation_id"] == created_operations[0]
 
 
+def test_manual_restart_snapshots_current_runtime_heads_before_dispatch(monkeypatch):
+    created_operations = []
+    restarts = []
+
+    async def runtime_heads():
+        raise AssertionError("route must not capture heads before the guarded restart")
+
+    async def fake_to_thread(label, func, *args, **_kwargs):
+        assert label == "sync.restart_operation_create"
+        assert func is routes_sync._restart_operation_create_sync
+        created_operations.append(args[0])
+        return {"operation_id": args[0], "status": "queued"}
+
+    async def guarded_restart(**kwargs):
+        restarts.append(kwargs)
+
+    async def exercise():
+        response = await routes_sync.trigger_restart()
+        await asyncio.sleep(0)
+        return response
+
+    monkeypatch.setattr(routes_sync.cfg, "SERVICE_RESTART_CMD", "restart-blueprints")
+    monkeypatch.setattr(
+        routes_sync,
+        "_RUNNING_RUNTIME_REPO_HEADS",
+        {"outer": "a" * 40, "inner": "b" * 40},
+    )
+    monkeypatch.setattr(routes_sync, "_runtime_heads", runtime_heads)
+    monkeypatch.setattr(routes_sync.timing, "to_thread", fake_to_thread)
+    monkeypatch.setattr(routes_sync, "_run_guarded_restart", guarded_restart)
+
+    response = asyncio.run(exercise())
+
+    assert response.status_code == 204
+    assert len(created_operations) == 1
+    assert restarts == [
+        {
+            "operation_id": created_operations[0],
+            "capture_runtime_heads": True,
+        }
+    ]
+
+
+def test_direct_restart_captures_runtime_heads_after_quiescence(monkeypatch):
+    order = []
+    receipt_updates = []
+
+    async def no_sleep(_seconds):
+        order.append("sleep")
+
+    async def pause():
+        order.append("pause")
+        return []
+
+    async def snapshot(_providers=None):
+        order.append("snapshot")
+        return {"queued_runs": 0, "running_runs": 0, "stale_running_runs": 0}
+
+    async def runtime_heads():
+        order.append("runtime_heads")
+        return {"outer": "c" * 40, "inner": "d" * 40}
+
+    async def update(operation_id, status, result, error_code=""):
+        order.append("receipt")
+        receipt_updates.append((operation_id, status, result, error_code))
+        return {}
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"dispatched", b""
+
+    async def create_subprocess(*_args, **_kwargs):
+        order.append("subprocess")
+        return Proc()
+
+    monkeypatch.setattr(routes_sync.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(routes_sync, "_pause_blueprints_provider_claims", pause)
+    monkeypatch.setattr(routes_sync, "_scheduler_quiescence_snapshot", snapshot)
+    monkeypatch.setattr(routes_sync, "_runtime_heads", runtime_heads)
+    monkeypatch.setattr(routes_sync, "_update_git_pull_operation", update)
+    monkeypatch.setattr(routes_sync.asyncio, "create_subprocess_exec", create_subprocess)
+    monkeypatch.setattr(routes_sync.cfg, "SERVICE_RESTART_CMD", "restart-blueprints")
+    monkeypatch.setattr(
+        routes_sync,
+        "_RUNNING_RUNTIME_REPO_HEADS",
+        {"outer": "a" * 40, "inner": "b" * 40},
+    )
+
+    restarted = asyncio.run(
+        routes_sync._restart_service(
+            operation_id="git-pull-" + "a" * 32,
+            capture_runtime_heads=True,
+        )
+    )
+
+    assert restarted is True
+    assert order == ["sleep", "pause", "snapshot", "runtime_heads", "receipt", "subprocess"]
+    assert receipt_updates[0][1] == "restart_requested"
+    assert receipt_updates[0][2]["expected_runtime_heads"] == {
+        "outer": "c" * 40,
+        "inner": "d" * 40,
+    }
+
+
 def test_receive_actions_offloads_db_apply(monkeypatch):
     to_thread_calls = []
     applied = []

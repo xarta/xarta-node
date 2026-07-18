@@ -988,6 +988,7 @@ async def _restart_service(
     *,
     operation_id: str | None = None,
     expected_runtime_heads: dict[str, str] | None = None,
+    capture_runtime_heads: bool = False,
     guard_before: dict[str, Any] | None = None,
     claims_already_paused: bool = False,
 ) -> bool:
@@ -1012,6 +1013,8 @@ async def _restart_service(
         parts = _restart_command_parts()
         if not parts:
             return False
+        if capture_runtime_heads:
+            expected_runtime_heads = await _runtime_heads()
         await _update_git_pull_operation(
             operation_id,
             "restart_requested",
@@ -1768,7 +1771,10 @@ async def _run_tracked_git_pull_operation(
 
 
 async def _run_guarded_restart(
-    *, operation_id: str | None = None, expected_runtime_heads: dict[str, str] | None = None
+    *,
+    operation_id: str | None = None,
+    expected_runtime_heads: dict[str, str] | None = None,
+    capture_runtime_heads: bool = False,
 ) -> None:
     global _RESTART_PENDING
     try:
@@ -1786,6 +1792,7 @@ async def _run_guarded_restart(
             restarted = await _restart_service(
                 operation_id=operation_id,
                 expected_runtime_heads=expected_runtime_heads,
+                capture_runtime_heads=capture_runtime_heads,
             )
             if not restarted:
                 _RESTART_PENDING = False
@@ -1919,7 +1926,7 @@ async def trigger_restart() -> Response:
     asyncio.create_task(
         _run_guarded_restart(
             operation_id=operation_id,
-            expected_runtime_heads=dict(_RUNNING_RUNTIME_REPO_HEADS),
+            capture_runtime_heads=True,
         )
     )
     log.info("service restart triggered via API operation_id=%s", operation_id)
