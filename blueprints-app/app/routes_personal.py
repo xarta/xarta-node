@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import importlib
 import json
@@ -20605,6 +20606,8 @@ def _work_preprocessing_validation_repair_messages(
     source_hash: str,
     marker_id: str,
     item_id: str,
+    expected_operator_request_refs: list[str],
+    preservable_planned_ownership_refs: list[str],
 ) -> list[dict[str, str]]:
     payload = ai.get("payload") if isinstance(ai.get("payload"), dict) else {}
     serialized_payload = json.dumps(
@@ -20640,6 +20643,65 @@ def _work_preprocessing_validation_repair_messages(
             "request, not a patch or explanation. Correct the stated validation failure and any "
             "directly dependent schema defect while preserving the original bounded semantics."
         ),
+        "operator_request_contract": {
+            "required": bool(expected_operator_request_refs),
+            "expected_record_refs_in_order": list(expected_operator_request_refs),
+            "preservable_planned_ownership_refs": list(preservable_planned_ownership_refs),
+            "planned_ownership_fallback": (
+                [preservable_planned_ownership_refs[0]]
+                if preservable_planned_ownership_refs
+                else []
+            ),
+            "derive_from_repaired_response_when_fallback_empty": {
+                "work_unit_reference": "work_unit:<exact repaired execution_directive.work_units[*].unit_id>",
+                "decomposition_reference": "decomposition:<exact repaired decomposition_items[*].title>",
+                "require_at_least_one_valid_reference": True,
+            },
+            "copy_refs_byte_for_byte": True,
+            "alignment_allowed_values": [
+                "aligned",
+                "deviation_requires_approval",
+                "contradiction_requires_approval",
+                "impossibility_requires_approval",
+                "necessary_constraint_requires_approval",
+            ],
+            "aligned_requires_empty_deviations": True,
+            "non_aligned_requires_specific_approved_or_awaiting_operator_deviation": True,
+            "required_assessment_fields": [
+                "record_refs_in_order",
+                "alignment",
+                "comparison_summary",
+                "intent_summary",
+                "intent_components",
+                "deviations",
+            ],
+            "intent_component_contract": {
+                "required_fields": [
+                    "component_id",
+                    "request_refs",
+                    "specification",
+                    "importance",
+                    "why_it_matters",
+                    "implementation_consequences",
+                    "acceptance_implications",
+                    "planned_ownership",
+                    "confidence",
+                    "inference_kind",
+                ],
+                "component_id_pattern": "[a-z0-9][a-z0-9._-]{0,99}",
+                "importance_allowed_values": ["low", "medium", "high", "critical"],
+                "confidence_allowed_values": ["low", "medium", "medium-high", "high"],
+                "inference_kind_allowed_values": [
+                    "explicit",
+                    "necessary_consequence",
+                    "material_ambiguity",
+                ],
+                "implementation_consequences_nonempty": True,
+                "acceptance_implications_nonempty": True,
+                "planned_ownership_must_resolve_against_final_repaired_response": True,
+                "cover_every_expected_request_ref": True,
+            },
+        },
         "execution_directive_contract": {
             "recommended_mode_allowed_values": [
                 "serial",
@@ -20683,6 +20745,10 @@ def _work_preprocessing_validation_repair_messages(
             "Use the whole original bounded context; exact words and lexical matches never choose semantic mode or scope.",
             "Do not invent broader authority, scope, nodes, paths, skills, or proof.",
             "Preserve every source identity and original Operator request assessment requirement.",
+            "When operator_request_contract.required=true, copy expected_record_refs_in_order byte-for-byte into operator_request_assessment.record_refs_in_order and use only those exact values in intent_components.request_refs.",
+            "When operator_request_contract.planned_ownership_fallback is nonempty, copy it exactly for any intent component whose ownership is uncertain and preserve the corresponding initially valid work-unit ID or decomposition title. When that fallback is empty because the original directive was malformed, first repair execution_directive/decomposition_items, then construct planned_ownership only from the exact repaired values using derive_from_repaired_response_when_fallback_empty. Never emit a repository name, path, label, unprefixed unit ID, unprefixed decomposition title, or unrelated invented reference.",
+            "Use exactly one operator_request_contract.alignment_allowed_values token for operator_request_assessment.alignment; do not invent synonyms.",
+            "Use the exact operator_request_contract.intent_component_contract field names, especially component_id rather than intent_component_id or id.",
             "This is the only validation-guided repair attempt. A second invalid response remains a visible processor failure.",
         ],
     }
@@ -20727,6 +20793,64 @@ def _work_preprocessing_attempts_with_phase(
         for attempt in ai.get("model_attempts") or []
         if isinstance(attempt, dict)
     ]
+
+
+def _work_preprocessing_repair_planned_ownership_refs(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Repair only response-local referential integrity, never semantic scope."""
+    repaired = copy.deepcopy(payload)
+    allowed_refs: list[str] = []
+    execution_directive = repaired.get("execution_directive")
+    if isinstance(execution_directive, dict):
+        for unit in execution_directive.get("work_units") or []:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = _clean_short_text(str(unit.get("unit_id") or ""), "", limit=100)
+            if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", unit_id):
+                allowed_refs.append(f"work_unit:{unit_id}")
+    for value in repaired.get("decomposition_items") or []:
+        if not isinstance(value, dict):
+            continue
+        title = _clean_short_text(str(value.get("title") or ""), "", limit=180)
+        if title:
+            allowed_refs.append(f"decomposition:{title}")
+    allowed_refs = list(dict.fromkeys(allowed_refs))
+    if not allowed_refs:
+        return repaired, []
+
+    assessment = repaired.get("operator_request_assessment")
+    if not isinstance(assessment, dict):
+        return repaired, []
+    components = assessment.get("intent_components")
+    if not isinstance(components, list):
+        return repaired, []
+
+    normalizations: list[dict[str, Any]] = []
+    for index, component in enumerate(components):
+        if not isinstance(component, dict):
+            continue
+        original = [
+            _clean_short_text(str(value or ""), "", limit=260)
+            for value in component.get("planned_ownership") or []
+        ]
+        valid = list(dict.fromkeys(value for value in original if value in allowed_refs))
+        selected = valid or list(allowed_refs)
+        if original == selected:
+            continue
+        component["planned_ownership"] = selected
+        normalizations.append(
+            {
+                "component_index": index,
+                "reason": "invalid_or_missing_response_local_reference",
+                "original": original,
+                "selected": selected,
+                "selection_policy": (
+                    "preserve_valid_subset" if valid else "conservative_all_final_owners"
+                ),
+            }
+        )
+    return repaired, normalizations
 
 
 def _work_preprocessing_validation_repair_evidence(
@@ -20778,8 +20902,11 @@ def _work_preprocessing_validation_repair_evidence(
         "repair_content_excerpt": _body_excerpt(
             str(repair_ai.get("content_excerpt") or ""), limit=2500
         ),
+        "deterministic_referential_repairs": list(
+            repair_ai.get("deterministic_referential_repairs") or []
+        ),
         "retry_ownership": {
-            "validation_repair": "one in-attempt same-route semantic repair",
+            "validation_repair": "one in-attempt same-route semantic repair plus response-local referential integrity normalization",
             "marker_retry": "existing capped Kanban marker backoff after exhausted repair",
             "scheduler_retry": "transport/invocation failure only; never semantic reclassification",
         },
@@ -20817,7 +20944,31 @@ async def _work_preprocessing_validate_with_one_repair(
     marker_id: str,
     run_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    original_operator_requests = _work_preprocessing_original_operator_requests(
+        item,
+        discussions,
+    )
+    expected_operator_request_refs = [
+        str(record.get("source_ref") or "")
+        for record in original_operator_requests.get("records") or []
+    ]
     payload = ai.get("payload") if isinstance(ai.get("payload"), dict) else {}
+    preservable_planned_ownership_refs: list[str] = []
+    execution_directive = payload.get("execution_directive")
+    if isinstance(execution_directive, dict):
+        for unit in execution_directive.get("work_units") or []:
+            if not isinstance(unit, dict):
+                continue
+            unit_id = _clean_short_text(str(unit.get("unit_id") or ""), "", limit=100)
+            if re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", unit_id):
+                preservable_planned_ownership_refs.append(f"work_unit:{unit_id}")
+    for value in payload.get("decomposition_items") or []:
+        if not isinstance(value, dict):
+            continue
+        title = _clean_short_text(str(value.get("title") or ""), "", limit=180)
+        if title:
+            preservable_planned_ownership_refs.append(f"decomposition:{title}")
+    preservable_planned_ownership_refs = list(dict.fromkeys(preservable_planned_ownership_refs))
     try:
         return ai, _work_preprocessing_validate_response_contract(
             payload=payload,
@@ -20841,6 +20992,8 @@ async def _work_preprocessing_validate_with_one_repair(
             source_hash=source_hash,
             marker_id=marker_id,
             item_id=str(item["item_id"]),
+            expected_operator_request_refs=expected_operator_request_refs,
+            preservable_planned_ownership_refs=preservable_planned_ownership_refs,
         )
         try:
             repair_ai = await _work_automation_local_ai_json_repair(
@@ -20859,10 +21012,15 @@ async def _work_preprocessing_validate_with_one_repair(
             repair_ai = _work_automation_processor_ai_defaults(repair_ai, "preprocessing")
             if repair_ai.get("chosen_route_id") != chosen_route_id:
                 raise ValueError("validation repair changed the selected semantic route")
+            repaired_payload, referential_repairs = (
+                _work_preprocessing_repair_planned_ownership_refs(
+                    repair_ai.get("payload") if isinstance(repair_ai.get("payload"), dict) else {}
+                )
+            )
+            repair_ai["payload"] = repaired_payload
+            repair_ai["deterministic_referential_repairs"] = referential_repairs
             repaired_contract = _work_preprocessing_validate_response_contract(
-                payload=repair_ai.get("payload")
-                if isinstance(repair_ai.get("payload"), dict)
-                else {},
+                payload=repaired_payload,
                 item=item,
                 discussions=discussions,
             )
