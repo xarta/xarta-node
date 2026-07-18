@@ -780,6 +780,54 @@ def test_scheduler_restart_snapshot_refuses_queued_blueprints_work(monkeypatch):
     assert exc.value.code == "blueprints_scheduler_not_quiescent"
 
 
+def test_scheduler_restart_snapshot_allows_queued_owner_disabled_provider(monkeypatch):
+    async def get_json(_path):
+        return _restart_snapshot_payload(kanban_queued=1, pim_queued=0)
+
+    monkeypatch.setattr(routes_sync, "scheduler_local_get_json", get_json)
+    providers = [
+        {
+            "provider_id": routes_sync.PERSONAL_SEARCH_PROVIDER_ID,
+            "provider_effective_enabled": True,
+        },
+        {
+            "provider_id": routes_sync.KANBAN_PROVIDER_ID,
+            "provider_effective_enabled": False,
+        },
+    ]
+
+    snapshot = asyncio.run(routes_sync._scheduler_quiescence_snapshot(providers))
+
+    assert snapshot["global_work"]["queued_runs"] == 1
+    assert snapshot["non_blueprints_active_work"] == []
+
+
+def test_scheduler_restart_snapshot_refuses_running_owner_disabled_provider(monkeypatch):
+    payload = _restart_snapshot_payload(kanban_queued=0, pim_queued=0)
+    payload["schedules"][0]["running_runs"] = 1
+    payload["global_work"]["running_runs"] = 1
+
+    async def get_json(_path):
+        return payload
+
+    monkeypatch.setattr(routes_sync, "scheduler_local_get_json", get_json)
+    providers = [
+        {
+            "provider_id": routes_sync.PERSONAL_SEARCH_PROVIDER_ID,
+            "provider_effective_enabled": True,
+        },
+        {
+            "provider_id": routes_sync.KANBAN_PROVIDER_ID,
+            "provider_effective_enabled": False,
+        },
+    ]
+
+    with pytest.raises(routes_sync.SchedulerRestartRefused) as exc:
+        asyncio.run(routes_sync._scheduler_quiescence_snapshot(providers))
+
+    assert exc.value.code == "blueprints_scheduler_not_quiescent"
+
+
 @pytest.mark.parametrize(
     ("mutate", "code"),
     [
@@ -815,6 +863,7 @@ def test_provider_claim_gate_requires_both_typed_provider_results(monkeypatch):
     async def malformed_personal():
         return {
             "provider_id": routes_sync.PERSONAL_SEARCH_PROVIDER_ID,
+            "provider_effective_enabled": True,
             "claim_loop_paused": True,
             "active_run_ids": "not-a-list",
         }
@@ -822,6 +871,7 @@ def test_provider_claim_gate_requires_both_typed_provider_results(monkeypatch):
     async def valid_kanban():
         return {
             "provider_id": routes_sync.KANBAN_PROVIDER_ID,
+            "provider_effective_enabled": False,
             "claim_loop_paused": True,
             "active_run_ids": [],
             "legacy_loop_effective_enabled": False,
@@ -831,6 +881,41 @@ def test_provider_claim_gate_requires_both_typed_provider_results(monkeypatch):
         resumes.append(True)
 
     monkeypatch.setattr(routes_sync, "pause_personal_search_claims_for_restart", malformed_personal)
+    monkeypatch.setattr(routes_sync, "pause_kanban_claims_for_restart", valid_kanban)
+    monkeypatch.setattr(routes_sync, "_resume_blueprints_provider_claims", resume)
+
+    with pytest.raises(routes_sync.SchedulerRestartRefused) as exc:
+        asyncio.run(routes_sync._pause_blueprints_provider_claims())
+
+    assert exc.value.code == "provider_claim_gate_malformed"
+    assert resumes == [True]
+
+
+def test_provider_claim_gate_requires_typed_effective_policy_and_resumes(monkeypatch):
+    resumes = []
+
+    async def personal_missing_policy():
+        return {
+            "provider_id": routes_sync.PERSONAL_SEARCH_PROVIDER_ID,
+            "claim_loop_paused": True,
+            "active_run_ids": [],
+        }
+
+    async def valid_kanban():
+        return {
+            "provider_id": routes_sync.KANBAN_PROVIDER_ID,
+            "provider_effective_enabled": False,
+            "claim_loop_paused": True,
+            "active_run_ids": [],
+            "legacy_loop_effective_enabled": False,
+        }
+
+    async def resume():
+        resumes.append(True)
+
+    monkeypatch.setattr(
+        routes_sync, "pause_personal_search_claims_for_restart", personal_missing_policy
+    )
     monkeypatch.setattr(routes_sync, "pause_kanban_claims_for_restart", valid_kanban)
     monkeypatch.setattr(routes_sync, "_resume_blueprints_provider_claims", resume)
 
@@ -970,7 +1055,7 @@ def test_git_pull_capability_is_typed_non_broadcast_and_node_bound(monkeypatch):
         "broadcast": False,
         "operation_receipt_schema": "xarta.blueprints.git_pull_operation.v1",
         "supported_scopes": ["outer"],
-        "restart_guard": "atomic-provider-scoped-snapshot-v4",
+        "restart_guard": "atomic-provider-scoped-snapshot-v5",
         "exact_expected_head": True,
     }
 
@@ -994,7 +1079,7 @@ def test_second_scheduler_snapshot_blocks_restart_and_resumes_claims(monkeypatch
     async def no_sleep(_seconds):
         return None
 
-    async def second_snapshot():
+    async def second_snapshot(_providers=None):
         raise routes_sync.SchedulerRestartRefused(
             "scheduler_not_quiescent", {"queued_runs": 1, "running_runs": 0}
         )
@@ -1035,18 +1120,20 @@ def test_direct_restart_subprocess_error_resumes_claim_gates(monkeypatch):
         return [
             {
                 "provider_id": routes_sync.PERSONAL_SEARCH_PROVIDER_ID,
+                "provider_effective_enabled": True,
                 "claim_loop_paused": True,
                 "active_run_ids": [],
             },
             {
                 "provider_id": routes_sync.KANBAN_PROVIDER_ID,
+                "provider_effective_enabled": True,
                 "claim_loop_paused": True,
                 "active_run_ids": [],
                 "legacy_loop_effective_enabled": False,
             },
         ]
 
-    async def snapshot():
+    async def snapshot(_providers=None):
         return {"queued_runs": 0, "running_runs": 0, "stale_running_runs": 0}
 
     async def resume():
@@ -1085,7 +1172,7 @@ def test_restart_receipt_completes_only_in_new_process_with_exact_runtime_heads(
         updates.append((operation_id, status, result, error_code))
         return {**receipt, "status": status, "result": result}
 
-    async def after_snapshot():
+    async def after_snapshot(_providers=None):
         return {
             "schema": "xarta.scheduler.restart_active_work_snapshot.v2",
             "captured_at": "2026-07-18T13:01:00+00:00",

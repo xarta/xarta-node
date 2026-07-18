@@ -285,6 +285,7 @@ class PersonalSearchScheduler:
         non-empty; it must never cancel retained scheduler work to make a
         deployment appear quiescent.
         """
+        provider_effective_enabled = any(not task.done() for task in self._loop_tasks)
         self._claims_paused_for_restart = True
         async with self._get_claim_attempt_lock():
             # Acquiring the barrier proves any /claims/next response has already
@@ -293,6 +294,7 @@ class PersonalSearchScheduler:
         await asyncio.sleep(0)
         return {
             "provider_id": PROVIDER_ID,
+            "provider_effective_enabled": provider_effective_enabled,
             "claim_loop_paused": True,
             "active_run_ids": sorted(
                 run_id for run_id, task in self._active_runs.items() if not task.done()
