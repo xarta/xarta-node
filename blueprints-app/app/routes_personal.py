@@ -4808,7 +4808,7 @@ def _review_lease_is_active(row: Any | None, now_dt: datetime | None = None) -> 
 def _review_lease_owner_matches(row: Any, holder_id: str, lease_token: str = "") -> bool:
     if row["holder_id"] != holder_id:
         return False
-    return not lease_token or not row["lease_token"] or row["lease_token"] == lease_token
+    return not lease_token or row["lease_token"] == lease_token
 
 
 def _row_to_work_review_processor_lease(
@@ -24276,66 +24276,15 @@ async def run_work_kanban_automation_idle_tick(
     if isinstance(source_metadata_extra, dict) and source_metadata_extra:
         source_metadata.update(source_metadata_extra)
 
-    timeout_requeue: dict[str, Any]
-    if clean_processor_kind == "preprocessing":
-        # The dedicated recovery path must not mutate a Review marker merely
-        # because it shares the leaf scope with the requested preprocessing.
-        timeout_requeue = {
-            "ok": True,
-            "skipped": True,
-            "reason": "preprocessing_only_recovery",
-        }
-    else:
-        timeout_requeue = await requeue_timed_out_work_review_processor_markers(
-            WorkReviewProcessorTimeoutRequeueRequest(
-                item_id=clean_item_id or None,
-                actor=clean_actor,
-                source_surface=clean_source_surface,
-                request_id=f"{clean_request_id}-requeue-timeouts",
-                run_id=clean_run_id,
-                metadata=source_metadata,
-            )
-        )
-    review_scan: dict[str, Any]
-    if clean_processor_kind == "preprocessing":
-        review_scan = {
-            "ok": True,
-            "skipped": True,
-            "reason": "preprocessing_only_recovery",
-        }
-    else:
-        review_scan = await trigger_work_review_processor_idle_scan(
-            WorkReviewProcessorIdleScanRequest(
-                item_id=clean_item_id or None,
-                max_items=scan_limit,
-                include_empty=False,
-                actor=clean_actor,
-                source_surface=clean_source_surface,
-                request_id=f"{clean_request_id}-review-scan",
-                run_id=clean_run_id,
-                metadata=source_metadata,
-            )
-        )
-    preprocessing_scan = await trigger_work_preprocessing_idle_scan(
-        WorkPreprocessingIdleScanRequest(
-            item_id=clean_item_id or None,
-            max_items=scan_limit,
-            actor=clean_actor,
-            source_surface=clean_source_surface,
-            request_id=f"{clean_request_id}-preprocessing-scan",
-            run_id=clean_run_id,
-            metadata=source_metadata,
-        )
-    )
-    eligible_marker_ids = await _run_personal_sync_work(
-        _work_queued_processor_marker_ids_for_item_sync,
-        clean_item_id,
-        processor_kind=clean_processor_kind or None,
-    )
+    # Fence the complete tick, including scans. A unique token prevents two
+    # invocations using the same configured holder id from refreshing and
+    # sharing one lease.
+    tick_lease_token = f"tick-{uuid.uuid4().hex}"
     lease = await acquire_work_review_processor_lease(
         WorkReviewProcessorLeaseRequest(
             holder_id=clean_holder_id,
             item_id=clean_item_id or None,
+            lease_token=tick_lease_token,
             ttl_seconds=ttl_seconds,
             actor=clean_actor,
             source_surface=clean_source_surface,
@@ -24348,6 +24297,11 @@ async def run_work_kanban_automation_idle_tick(
     claim_results: list[dict[str, Any]] = []
     release: dict[str, Any] | None = None
     if not lease.get("acquired"):
+        skipped_scan = {
+            "ok": True,
+            "skipped": True,
+            "reason": "tick_lease_not_acquired",
+        }
         return {
             "ok": True,
             "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
@@ -24364,16 +24318,89 @@ async def run_work_kanban_automation_idle_tick(
             "processor_kind_filter": clean_processor_kind,
             "reason": lease.get("reason") or "lease_not_acquired",
             "lease_acquired": False,
-            "timeout_requeue": timeout_requeue,
-            "review_scan": review_scan,
-            "preprocessing_scan": preprocessing_scan,
-            "eligible_marker_count": len(eligible_marker_ids),
-            "eligible_marker_ids": eligible_marker_ids,
+            "timeout_requeue": dict(skipped_scan),
+            "review_scan": dict(skipped_scan),
+            "preprocessing_scan": dict(skipped_scan),
+            "eligible_marker_count": 0,
+            "eligible_marker_ids": [],
             "processed_count": 0,
             "processed_markers": [],
             "claim_results": [],
         }
     lease_token = lease["lease"].get("lease_token") or ""
+
+    try:
+        timeout_requeue: dict[str, Any]
+        if clean_processor_kind == "preprocessing":
+            # The dedicated recovery path must not mutate a Review marker merely
+            # because it shares the leaf scope with the requested preprocessing.
+            timeout_requeue = {
+                "ok": True,
+                "skipped": True,
+                "reason": "preprocessing_only_recovery",
+            }
+        else:
+            timeout_requeue = await requeue_timed_out_work_review_processor_markers(
+                WorkReviewProcessorTimeoutRequeueRequest(
+                    item_id=clean_item_id or None,
+                    actor=clean_actor,
+                    source_surface=clean_source_surface,
+                    request_id=f"{clean_request_id}-requeue-timeouts",
+                    run_id=clean_run_id,
+                    metadata=source_metadata,
+                )
+            )
+        review_scan: dict[str, Any]
+        if clean_processor_kind == "preprocessing":
+            review_scan = {
+                "ok": True,
+                "skipped": True,
+                "reason": "preprocessing_only_recovery",
+            }
+        else:
+            review_scan = await trigger_work_review_processor_idle_scan(
+                WorkReviewProcessorIdleScanRequest(
+                    item_id=clean_item_id or None,
+                    max_items=scan_limit,
+                    include_empty=False,
+                    actor=clean_actor,
+                    source_surface=clean_source_surface,
+                    request_id=f"{clean_request_id}-review-scan",
+                    run_id=clean_run_id,
+                    metadata=source_metadata,
+                )
+            )
+        preprocessing_scan = await trigger_work_preprocessing_idle_scan(
+            WorkPreprocessingIdleScanRequest(
+                item_id=clean_item_id or None,
+                max_items=scan_limit,
+                actor=clean_actor,
+                source_surface=clean_source_surface,
+                request_id=f"{clean_request_id}-preprocessing-scan",
+                run_id=clean_run_id,
+                metadata=source_metadata,
+            )
+        )
+        eligible_marker_ids = await _run_personal_sync_work(
+            _work_queued_processor_marker_ids_for_item_sync,
+            clean_item_id,
+            processor_kind=clean_processor_kind or None,
+        )
+    except BaseException:
+        await release_work_review_processor_lease(
+            WorkReviewProcessorLeaseRequest(
+                holder_id=clean_holder_id,
+                item_id=clean_item_id or None,
+                lease_token=lease_token,
+                actor=clean_actor,
+                source_surface=clean_source_surface,
+                request_id=f"{clean_request_id}-release-after-scan-error",
+                run_id=clean_run_id,
+                metadata=source_metadata,
+            )
+        )
+        raise
+
     try:
         for index in range(process_limit):
             await heartbeat_work_review_processor_lease(
@@ -24792,29 +24819,15 @@ async def trigger_work_preprocessing_idle_scan(
 
 
 def _work_preprocessing_scan_cursor(conn: Any) -> dict[str, str]:
-    """Return the tip of the global scan-cursor chain without per-item writes."""
+    """Return the latest serialized global scan cursor without per-item writes."""
     row = conn.execute(
         """
-        SELECT cursor.audit_id, cursor.metadata_json
-        FROM kanban_audit_log cursor
-        WHERE cursor.action='trigger_preprocessing_idle_scan'
-          AND cursor.result='ok'
-          AND COALESCE(cursor.item_id, '')=''
-          AND NOT EXISTS (
-            SELECT 1
-            FROM kanban_audit_log successor
-            WHERE successor.action='trigger_preprocessing_idle_scan'
-              AND successor.result='ok'
-              AND COALESCE(successor.item_id, '')=''
-              AND COALESCE(
-                    json_extract(
-                      successor.metadata_json,
-                      '$.scan_cursor_previous_audit_id'
-                    ),
-                    ''
-                  )=cursor.audit_id
-          )
-        ORDER BY cursor.created_at DESC, cursor.audit_id DESC
+        SELECT audit_id, metadata_json
+        FROM kanban_audit_log
+        WHERE action='trigger_preprocessing_idle_scan'
+          AND result='ok'
+          AND COALESCE(item_id, '')=''
+        ORDER BY created_at DESC, audit_id DESC
         LIMIT 1
         """
     ).fetchone()

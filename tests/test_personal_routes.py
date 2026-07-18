@@ -3981,6 +3981,121 @@ def test_kanban_idle_worker_no_root_scans_automatic_todo_leaves(monkeypatch, tmp
     assert marker["status"] == "processed"
 
 
+def test_kanban_idle_worker_fences_same_holder_ticks_before_all_scans(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "test-node",
+    )
+    lease_tokens = []
+
+    async def blocked_acquire(body):
+        lease_tokens.append(body.lease_token)
+        return {
+            "ok": True,
+            "acquired": False,
+            "reason": "active_lease",
+            "lease": {"holder_id": "same-holder", "active": True},
+        }
+
+    async def forbidden_scan(*_args, **_kwargs):
+        raise AssertionError("a competing tick must not scan or requeue")
+
+    monkeypatch.setattr(
+        routes_personal,
+        "acquire_work_review_processor_lease",
+        blocked_acquire,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "requeue_timed_out_work_review_processor_markers",
+        forbidden_scan,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "trigger_work_review_processor_idle_scan",
+        forbidden_scan,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "trigger_work_preprocessing_idle_scan",
+        forbidden_scan,
+    )
+
+    ticks = [
+        asyncio.run(
+            routes_personal.run_work_kanban_automation_idle_tick(
+                max_scan_items=1,
+                max_process_items=1,
+                holder_id="same-holder",
+                run_id="same-run",
+            )
+        )
+        for _index in range(2)
+    ]
+
+    assert len(lease_tokens) == 2
+    assert all(token.startswith("tick-") for token in lease_tokens)
+    assert lease_tokens[0] != lease_tokens[1]
+    assert all(tick["lease_acquired"] is False for tick in ticks)
+    assert all(tick["reason"] == "active_lease" for tick in ticks)
+    assert all(tick["preprocessing_scan"]["skipped"] is True for tick in ticks)
+    assert all(tick["eligible_marker_count"] == 0 for tick in ticks)
+
+
+def test_kanban_idle_worker_releases_tick_lease_when_a_scan_fails(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "test-node",
+    )
+    released_tokens = []
+
+    async def acquired(body):
+        return {
+            "ok": True,
+            "acquired": True,
+            "reason": "acquired",
+            "lease": {"lease_token": body.lease_token},
+        }
+
+    async def failed_requeue(*_args, **_kwargs):
+        raise RuntimeError("scan failed")
+
+    async def released(body):
+        released_tokens.append(body.lease_token)
+        return {"ok": True, "released": True, "reason": "released"}
+
+    monkeypatch.setattr(
+        routes_personal,
+        "acquire_work_review_processor_lease",
+        acquired,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "requeue_timed_out_work_review_processor_markers",
+        failed_requeue,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "release_work_review_processor_lease",
+        released,
+    )
+
+    with pytest.raises(RuntimeError, match="scan failed"):
+        asyncio.run(
+            routes_personal.run_work_kanban_automation_idle_tick(
+                max_scan_items=1,
+                max_process_items=1,
+                holder_id="scan-failure-holder",
+                run_id="scan-failure-run",
+            )
+        )
+
+    assert len(released_tokens) == 1
+    assert released_tokens[0].startswith("tick-")
+
+
 def test_kanban_idle_worker_skips_non_owner_node(monkeypatch, tmp_path):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
@@ -6334,7 +6449,28 @@ def test_settings_upsert_sql_is_unambiguous_for_kanban_postgres_support_setting(
     assert "COALESCE(excluded.description, settings.description)" in statement
 
 
-def test_preprocessing_scan_cursor_multiline_json_extract_translates_for_postgres():
+def test_multiline_json_extract_still_translates_for_postgres():
+    statement, args = kanban_postgres.prepare_sqlite_query_for_postgres(
+        """
+        SELECT audit_id
+        FROM kanban_audit_log
+        WHERE COALESCE(
+            json_extract(
+                metadata_json,
+                '$.scan_cursor_previous_audit_id'
+            ),
+            ''
+        )=?
+        """,
+        ("audit-prior",),
+    )
+
+    assert "json_extract" not in statement.lower()
+    assert "((metadata_json)::jsonb #>> '{scan_cursor_previous_audit_id}')" in statement
+    assert args == ("audit-prior",)
+
+
+def test_preprocessing_scan_cursor_uses_latest_indexable_global_audit():
     class EmptyCursor:
         def fetchone(self):
             return None
@@ -6357,12 +6493,11 @@ def test_preprocessing_scan_cursor_multiline_json_extract_translates_for_postgre
         "item_id": "",
     }
     assert "json_extract" not in conn.statement.lower()
-    assert (
-        "((successor.metadata_json)::jsonb #>> '{scan_cursor_previous_audit_id}')" in conn.statement
-    )
+    assert "not exists" not in conn.statement.lower()
+    assert "order by created_at desc, audit_id desc" in " ".join(conn.statement.split()).lower()
 
 
-def test_preprocessing_scan_cursor_uses_translation_in_postgres_connection_adapter(monkeypatch):
+def test_preprocessing_scan_cursor_uses_bounded_postgres_connection_adapter(monkeypatch):
     class FakeAsyncpgConnection:
         def __init__(self):
             self.statement = ""
@@ -6399,9 +6534,10 @@ def test_preprocessing_scan_cursor_uses_translation_in_postgres_connection_adapt
         conn.close()
 
     assert "json_extract" not in runner.connection.statement.lower()
+    assert "not exists" not in runner.connection.statement.lower()
     assert (
-        "((successor.metadata_json)::jsonb #>> "
-        "'{scan_cursor_previous_audit_id}')" in runner.connection.statement
+        "order by created_at desc, audit_id desc"
+        in " ".join(runner.connection.statement.split()).lower()
     )
     assert runner.connection.args == ()
 
@@ -6535,6 +6671,45 @@ def test_kanban_postgres_pool_acquire_timeout_is_typed(monkeypatch):
     assert len(created) == 1
 
 
+def test_kanban_postgres_runner_timeout_is_typed_cancelled_and_reusable():
+    side_effects = []
+
+    async def delayed_side_effect():
+        await asyncio.sleep(0.05)
+        side_effects.append("late")
+
+    async def immediate_value():
+        return "ready"
+
+    runner = kanban_postgres._AsyncpgRunner()
+    try:
+        with pytest.raises(
+            kanban_postgres.KanbanPostgresOperationTimeout,
+            match="runner wall time",
+        ):
+            runner.run(delayed_side_effect(), timeout=0.01)
+        runner.run(asyncio.sleep(0.08), timeout=0.2)
+        assert side_effects == []
+        assert runner.run(immediate_value(), timeout=0.2) == "ready"
+    finally:
+        runner.shutdown()
+
+
+def test_kanban_postgres_command_timeout_is_typed():
+    async def command_timeout():
+        raise TimeoutError
+
+    runner = kanban_postgres._AsyncpgRunner()
+    try:
+        with pytest.raises(
+            kanban_postgres.KanbanPostgresOperationTimeout,
+            match="database command time",
+        ):
+            runner.run(command_timeout(), timeout=0.2)
+    finally:
+        runner.shutdown()
+
+
 def test_kanban_postgres_read_context_can_skip_transaction(monkeypatch):
     calls = []
 
@@ -6663,6 +6838,25 @@ def test_kanban_postgres_pool_timeout_response_is_retryable_503():
     assert (
         app_main.app.exception_handlers[kanban_postgres.KanbanPostgresPoolTimeout]
         is app_main._handle_kanban_postgres_pool_timeout
+    )
+
+
+def test_kanban_postgres_operation_timeout_response_is_retryable_503():
+    from app import main as app_main
+
+    exc = kanban_postgres.KanbanPostgresOperationTimeout("command busy")
+    response = asyncio.run(app_main._handle_kanban_postgres_operation_timeout(None, exc))
+    payload = json.loads(response.body)
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert payload["error"] == {
+        "code": "kanban_postgres_operation_timeout",
+        "retryable": True,
+    }
+    assert (
+        app_main.app.exception_handlers[kanban_postgres.KanbanPostgresOperationTimeout]
+        is app_main._handle_kanban_postgres_operation_timeout
     )
 
 
@@ -13088,6 +13282,17 @@ def test_work_preprocessing_idle_scan_rotates_marked_candidates_without_per_item
     assert second["scan_cursor"]["wrapped"] is False
     assert second["scan_cursor"]["previous_audit_id"] == first["audit"]["audit_id"]
 
+    # Production ticks are serialized and cadence-separated. Make that ordering
+    # explicit in the fast unit test, whose two calls otherwise share one-second
+    # audit timestamps.
+    conn.execute(
+        "UPDATE kanban_audit_log SET created_at=? WHERE audit_id=?",
+        ("2026-07-18T12:00:00Z", first["audit"]["audit_id"]),
+    )
+    conn.execute(
+        "UPDATE kanban_audit_log SET created_at=? WHERE audit_id=?",
+        ("2026-07-18T12:01:00Z", second["audit"]["audit_id"]),
+    )
     stored_cursor = routes_personal._work_preprocessing_scan_cursor(conn)
     assert stored_cursor == {
         "audit_id": second["audit"]["audit_id"],
