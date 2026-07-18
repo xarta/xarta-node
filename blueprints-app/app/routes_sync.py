@@ -707,13 +707,7 @@ def _strict_scheduler_restart_snapshot(
                 health.get("worker_stale_seconds"), "health.worker_stale_seconds"
             ),
         },
-        "active_work": active_work,
-        "non_blueprints_active_work": [
-            row
-            for row in active_work
-            if row["provider_id"] not in _BLUEPRINTS_SCHEDULER_PROVIDER_IDS
-            and (row["queued_runs"] or row["running_runs"])
-        ],
+        "schedules": active_work,
     }
 
 
