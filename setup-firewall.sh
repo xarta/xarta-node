@@ -21,8 +21,9 @@
 #        - UDP 41641 (Tailscale / WireGuard direct connections)
 #        - TCP 8443  (fleet sync, mTLS via Caddy) — per-peer-IP from .nodes.json only
 #        - TCP+UDP 22000 (Syncthing BEP asset sync)  — per-peer-IP from .nodes.json only
-#   Note: TCP 8080 is intentionally NOT opened to peers — uvicorn on 8080 is
-#         loopback-only. All inter-node sync uses mTLS on port 8443.
+#   Note: TCP 8080 is intentionally NOT opened to peers. A source- and
+#         interface-restricted rule admits only the dedicated local
+#         xarta-scheduler API bridge; all inter-node sync uses mTLS on 8443.
 #   4. Inserts a jump to XARTA_INPUT at position 1 of the INPUT chain
 #      (if not already present), so our rules run before any other rules.
 #   5. Sets the default INPUT policy to DROP.
@@ -146,6 +147,29 @@ echo "    added: TCP 80 (HTTP/Caddy redirect) → ACCEPT"
 iptables -A XARTA_INPUT -p tcp --dport 443 -j ACCEPT
 echo "    added: TCP 443 (HTTPS/Caddy) → ACCEPT"
 
+# Scheduler coordination bridge — the scheduler API calls the authenticated
+# node-local Blueprints bridge on uvicorn. The dedicated Docker network has one
+# application member and a fixed, reviewed subnet in the scheduler compose
+# contract. Resolve its actual bridge interface and subnet from Docker so the
+# rule cannot admit LAN, Tailscale, or another Docker network traffic.
+SCHEDULER_BRIDGE_NETWORK="xarta-scheduler-api-loopback"
+if command -v docker >/dev/null 2>&1 && docker network inspect "$SCHEDULER_BRIDGE_NETWORK" >/dev/null 2>&1; then
+    scheduler_network_id="$(docker network inspect -f '{{.Id}}' "$SCHEDULER_BRIDGE_NETWORK")"
+    scheduler_bridge_cidr="$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$SCHEDULER_BRIDGE_NETWORK")"
+    scheduler_bridge_interface="br-${scheduler_network_id:0:12}"
+    if [[ "$scheduler_network_id" =~ ^[0-9a-f]{12,64}$ ]] \
+        && [[ "$scheduler_bridge_cidr" == "172.31.254.0/29" ]] \
+        && [[ -e "/sys/class/net/$scheduler_bridge_interface" ]]; then
+        iptables -A XARTA_INPUT -i "$scheduler_bridge_interface" \
+            -s "$scheduler_bridge_cidr" -p tcp --dport 8080 -j ACCEPT
+        echo "    added: TCP 8080 from $scheduler_bridge_cidr on $scheduler_bridge_interface (local scheduler bridge) → ACCEPT"
+    else
+        echo -e "    ${YELLOW}Warning:${NC} scheduler bridge network contract is not the reviewed 172.31.254.0/29 shape; TCP 8080 rule not added."
+    fi
+else
+    echo -e "    ${YELLOW}Warning:${NC} scheduler bridge network is absent; TCP 8080 remains closed. Start xarta-scheduler, then re-run this script."
+fi
+
 # XRDP — optional remote desktop access for the transitional xarta user.
 if [[ "$XARTA_ENABLE_XRDP" == "true" ]]; then
     if [[ -n "$XARTA_XRDP_ALLOWED_CIDRS" ]]; then
@@ -197,8 +221,8 @@ echo "    added: UDP 41641 (Tailscale/WireGuard) → ACCEPT"
 # Fleet sync — allow fleet peers to reach the Blueprints app for node-to-node
 # sync (drain.py action pushes and git-pull triggers).
 #   Port 8443 — mTLS sync via Caddy only. Per-peer-IP from .nodes.json.
-# Port 8080 is deliberately excluded: uvicorn on 8080 is loopback-only and all
-# inter-node sync runs over mTLS on 8443. The browser GUI never uses either port.
+# Port 8080 remains excluded from peer rules: its only exception is the exact
+# local scheduler bridge above. The browser GUI never uses either sync port.
 if [[ ! -f "$NODES_JSON" ]]; then
     echo -e "${YELLOW}Warning:${NC} .nodes.json not found at $NODES_JSON"
     echo "  Port 8443 fleet-sync rules not added — run bp-nodes-push.sh first, then re-run this script."
