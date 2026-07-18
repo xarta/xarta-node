@@ -241,3 +241,53 @@ def test_web_research_bridge_profile_is_search_only():
 
     assert result["ok"] is True
     assert "route_apply=noop" in result["stdout"]
+
+
+def test_web_research_cache_redirect_outside_node_local_root_does_not_chown_ancestors(
+    tmp_path, monkeypatch
+):
+    redirected_cache = tmp_path / "redirected-web-research-cache"
+    node_local_root = tmp_path / "lone-wolf"
+    node_local_root.mkdir()
+    monkeypatch.setattr(routes_web_research, "_SPEECH_CACHE_ROOT", redirected_cache)
+    monkeypatch.setattr(routes_web_research, "_NODE_LOCAL_ROOT", node_local_root)
+
+    with pytest.raises(HTTPException):
+        routes_web_research._write_speech_cache("a" * 32, "speech", {})
+
+    assert not (redirected_cache / f"{'a' * 32}.json").exists()
+
+
+def test_web_research_ownership_boundary_refuses_root_ancestor_walk(monkeypatch):
+    monkeypatch.setattr(routes_web_research, "_SPEECH_CACHE_ROOT", Path("/root"))
+
+    with pytest.raises(HTTPException):
+        routes_web_research._write_speech_cache("b" * 32, "speech", {})
+
+    assert not Path(f"/root/{'b' * 32}.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_web_research_cache_hit_offloads_filesystem_read(monkeypatch):
+    calls = []
+
+    async def fake_to_thread(function, *args, **kwargs):
+        calls.append((function, args, kwargs))
+        return {
+            "generated_at": "2026-07-18T00:00:00Z",
+            "markdown": "cached speech",
+            "meta": {
+                "speech_version": routes_web_research._WEB_RESEARCH_SPEECH_VERSION,
+                "generation": {"model": "test"},
+            },
+        }
+
+    monkeypatch.setattr(routes_web_research.asyncio, "to_thread", fake_to_thread)
+
+    result = await routes_web_research.web_research_speech(
+        routes_web_research.WebResearchSpeechBody(cache_key="c" * 32)
+    )
+
+    assert result["cache"] == "hit"
+    assert result["markdown"] == "cached speech"
+    assert calls == [(routes_web_research._read_speech_cache, ("c" * 32,), {})]
