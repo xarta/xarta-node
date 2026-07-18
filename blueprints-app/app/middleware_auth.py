@@ -23,6 +23,7 @@ the token check is skipped with a debug log so the app still starts.
 
 import ipaddress
 import logging
+import secrets
 
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -80,6 +81,7 @@ _SYNC_PREFIX = "/api/v1/sync/"
 # Sync write endpoints used exclusively by node-to-node drain: require SYNC_SECRET only.
 # All other sync routes (status, git-pull, gui/*) are browser-accessible and accept either secret.
 _SYNC_WRITE_PATHS = ("/api/v1/sync/actions", "/api/v1/sync/restore")
+_SCHEDULER_COORDINATION_PREFIX = "/api/v1/sync/scheduler-coordination/"
 # Route-scoped service-auth surface for remote Hermes TTS companions. These
 # tokens cannot access the rest of the Blueprints API.
 _TTS_SERVICE_ROUTES = frozenset(
@@ -157,6 +159,29 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     tts_token,
                 ):
                     return await call_next(request)
+
+            if path.startswith(_SCHEDULER_COORDINATION_PREFIX):
+                scheduler_token = request.headers.get("x-blueprints-scheduler-token", "")
+                local_scheduler_valid = bool(
+                    cfg.SCHEDULER_BRIDGE_SECRET
+                    and scheduler_token
+                    and secrets.compare_digest(cfg.SCHEDULER_BRIDGE_SECRET, scheduler_token)
+                )
+                remote_sync_valid = bool(
+                    cfg.SYNC_SECRET and token and verify_token(cfg.SYNC_SECRET, token)
+                )
+                if not cfg.SCHEDULER_BRIDGE_SECRET or not cfg.SYNC_SECRET:
+                    log.error(
+                        "auth: scheduler coordination is fail-closed because required secrets are missing"
+                    )
+                    return JSONResponse(
+                        {"detail": "Scheduler coordination authentication unavailable"},
+                        status_code=503,
+                    )
+                if not (local_scheduler_valid or remote_sync_valid):
+                    log.warning("auth: invalid scheduler/sync token from %s for %s", ip_str, path)
+                    return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+                return await call_next(request)
 
             if any(path.startswith(p) for p in _SYNC_WRITE_PATHS):
                 # Node-to-node sync writes: SYNC_SECRET only.
