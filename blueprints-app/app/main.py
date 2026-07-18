@@ -114,6 +114,13 @@ from .routes_proxmox_config import router as proxmox_config_router
 from .routes_proxmox_nets import router as proxmox_nets_router
 from .routes_pve_hosts import router as pve_hosts_router
 from .routes_pwa import router as pwa_router
+from .routes_scheduler_coordination import (
+    router as scheduler_coordination_router,
+)
+from .routes_scheduler_coordination import (
+    start_scheduler_coordination_bridge,
+    stop_scheduler_coordination_bridge,
+)
 from .routes_schema import router as schema_router
 from .routes_scrapling import router as scrapling_router
 from .routes_services import router as services_router
@@ -312,6 +319,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Start async drain loop
     await start_drain_loop()
 
+    # Narrow lifecycle-owned scheduler plan fetch/invalidation bridge.
+    await start_scheduler_coordination_bridge()
+
     # Start background SQLite->SeekDB index sync loop
     start_seekdb_sync_loop()
 
@@ -375,6 +385,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     await _close_work_processor_http_clients()
     await timing.to_thread("kanban.postgres_pool_close", close_postgres_candidate_pools)
     await stop_seekdb_sync_loop()
+    await stop_scheduler_coordination_bridge()
     await stop_drain_loop()
 
 
@@ -562,6 +573,7 @@ def create_app() -> FastAPI:
     application.include_router(notifier_dnd_router, prefix="/api/v1")
     application.include_router(schema_router, prefix="/api/v1")
     application.include_router(sync_router, prefix="/api/v1")
+    application.include_router(scheduler_coordination_router, prefix="/api/v1")
     application.include_router(backup_router, prefix="/api/v1")
     application.include_router(kanban_backups_router, prefix="/api/v1")
     application.include_router(kanban_postgres_router, prefix="/api/v1")

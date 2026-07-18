@@ -160,6 +160,11 @@ SYNC_TLS_KEY: str = os.environ.get("SYNC_TLS_KEY", "")
 # Sync token: used by drain.py when calling peer /api/v1/sync/* endpoints.
 API_SECRET: str = os.environ.get("BLUEPRINTS_API_SECRET", "")
 SYNC_SECRET: str = os.environ.get("BLUEPRINTS_SYNC_SECRET", "")
+SCHEDULER_BRIDGE_SECRET: str = os.environ.get("BLUEPRINTS_SCHEDULER_BRIDGE_SECRET", "").strip()
+SCHEDULER_PRIME_NODE_ID: str = os.environ.get("BLUEPRINTS_SCHEDULER_PRIME_NODE_ID", "").strip()
+SCHEDULER_LOCAL_URL: str = (
+    os.environ.get("BLUEPRINTS_SCHEDULER_LOCAL_URL", "http://127.0.0.1:18111").strip().rstrip("/")
+)
 # Route-scoped TTS/Voice token for remote Hermes companions. This secret is
 # accepted only by a narrow set of TTS/Voice endpoints in middleware_auth.
 TTS_SERVICE_SECRET: str = os.environ.get("BLUEPRINTS_TTS_SERVICE_SECRET", "")
