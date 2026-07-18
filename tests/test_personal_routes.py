@@ -16709,6 +16709,199 @@ def test_work_preprocessing_repairs_once_on_same_route_and_preserves_identity(mo
     ]
 
 
+def test_work_preprocessing_repair_names_exact_ordered_operator_request_refs(monkeypatch):
+    item_id = "verbatim-repair"
+    item = {
+        "item_id": item_id,
+        "body_excerpt": "Preserve this exact request.",
+        "created_at": "2026-07-18T00:00:00Z",
+        "updated_at": "2026-07-18T00:00:00Z",
+    }
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda _item: {
+            "item_id": item_id,
+            "tags": ["operator-request-verbatim-v1"],
+            "created_at": item["created_at"],
+            "updated_at": item["updated_at"],
+        },
+    )
+    request_ref = f"kanban_items:{item_id}:body"
+
+    async def repair(**kwargs):
+        repair_request = json.loads(kwargs["messages"][-1]["content"])
+        operator_contract = repair_request["operator_request_contract"]
+        assert operator_contract["required"] is True
+        assert operator_contract["expected_record_refs_in_order"] == [request_ref]
+        assert operator_contract["preservable_planned_ownership_refs"] == ["work_unit:scoped-unit"]
+        assert operator_contract["planned_ownership_fallback"] == ["work_unit:scoped-unit"]
+        assert (
+            operator_contract["derive_from_repaired_response_when_fallback_empty"][
+                "require_at_least_one_valid_reference"
+            ]
+            is True
+        )
+        assert operator_contract["copy_refs_byte_for_byte"] is True
+        assert operator_contract["alignment_allowed_values"] == [
+            "aligned",
+            "deviation_requires_approval",
+            "contradiction_requires_approval",
+            "impossibility_requires_approval",
+            "necessary_constraint_requires_approval",
+        ]
+        assert operator_contract["aligned_requires_empty_deviations"] is True
+        assert (
+            operator_contract[
+                "non_aligned_requires_specific_approved_or_awaiting_operator_deviation"
+            ]
+            is True
+        )
+        component_contract = operator_contract["intent_component_contract"]
+        assert "component_id" in component_contract["required_fields"]
+        assert component_contract["component_id_pattern"] == "[a-z0-9][a-z0-9._-]{0,99}"
+        assert component_contract["cover_every_expected_request_ref"] is True
+        assert (
+            component_contract["planned_ownership_must_resolve_against_final_repaired_response"]
+            is True
+        )
+        payload = _preprocessing_contract_fields()
+        payload.update(_operator_assessment_payload([request_ref]))
+        payload["operator_request_assessment"]["intent_components"][0]["planned_ownership"] = [
+            "work_unit:scoped-unit"
+        ]
+        return {
+            "payload": payload,
+            "chosen_route_id": "chatgpt-5-6-sol",
+            "required_route_id": "chatgpt-5-6-sol",
+            "model_attempts": [{"route_id": "chatgpt-5-6-sol", "outcome": "chosen"}],
+        }
+
+    monkeypatch.setattr(routes_personal, "_work_automation_local_ai_json_repair", repair)
+    invalid_payload = _preprocessing_contract_fields()
+    invalid_payload.update(_operator_assessment_payload(["kanban_items:wrong:body"]))
+    invalid_payload["operator_request_assessment"]["intent_components"][0]["planned_ownership"] = [
+        "work_unit:scoped-unit"
+    ]
+
+    _ai, contract = asyncio.run(
+        routes_personal._work_preprocessing_validate_with_one_repair(
+            ai={
+                "payload": invalid_payload,
+                "chosen_route_id": "chatgpt-5-6-sol",
+                "model_attempts": [{"route_id": "chatgpt-5-6-sol", "outcome": "chosen"}],
+            },
+            messages=[{"role": "user", "content": "bounded original request"}],
+            item=item,
+            discussions=[],
+            source_hash="sha256:verbatim-repair",
+            marker_id="marker-verbatim-repair",
+            run_id="run-verbatim-repair",
+        )
+    )
+
+    assert contract["operator_request_assessment"]["record_refs_in_order"] == [request_ref]
+
+
+def test_work_preprocessing_repair_can_replace_malformed_ownership_source(monkeypatch):
+    item_id = "malformed-ownership-repair"
+    item = {
+        "item_id": item_id,
+        "body_excerpt": "Repair malformed work-unit ownership.",
+        "created_at": "2026-07-18T00:00:00Z",
+        "updated_at": "2026-07-18T00:00:00Z",
+    }
+    monkeypatch.setattr(
+        routes_personal,
+        "_row_to_work_item",
+        lambda _item: {
+            "item_id": item_id,
+            "tags": ["operator-request-verbatim-v1"],
+            "created_at": item["created_at"],
+            "updated_at": item["updated_at"],
+        },
+    )
+    request_ref = f"kanban_items:{item_id}:body"
+
+    async def repair(**kwargs):
+        repair_request = json.loads(kwargs["messages"][-1]["content"])
+        operator_contract = repair_request["operator_request_contract"]
+        assert operator_contract["preservable_planned_ownership_refs"] == []
+        assert operator_contract["planned_ownership_fallback"] == []
+        assert (
+            operator_contract["derive_from_repaired_response_when_fallback_empty"][
+                "work_unit_reference"
+            ]
+            == "work_unit:<exact repaired execution_directive.work_units[*].unit_id>"
+        )
+        payload = _preprocessing_contract_fields()
+        payload.update(_operator_assessment_payload([request_ref]))
+        payload["operator_request_assessment"]["intent_components"][0]["planned_ownership"] = [
+            "work_unit:scoped-unit"
+        ]
+        return {
+            "payload": payload,
+            "chosen_route_id": "chatgpt-5-6-sol",
+            "required_route_id": "chatgpt-5-6-sol",
+            "model_attempts": [{"route_id": "chatgpt-5-6-sol", "outcome": "chosen"}],
+        }
+
+    monkeypatch.setattr(routes_personal, "_work_automation_local_ai_json_repair", repair)
+    invalid_payload = _preprocessing_contract_fields()
+    invalid_payload["execution_directive"]["work_units"][0]["unit_id"] = "INVALID UNIT ID"
+    invalid_payload.update(_operator_assessment_payload([request_ref]))
+
+    _ai, contract = asyncio.run(
+        routes_personal._work_preprocessing_validate_with_one_repair(
+            ai={
+                "payload": invalid_payload,
+                "chosen_route_id": "chatgpt-5-6-sol",
+                "model_attempts": [{"route_id": "chatgpt-5-6-sol", "outcome": "chosen"}],
+            },
+            messages=[{"role": "user", "content": "bounded original request"}],
+            item=item,
+            discussions=[],
+            source_hash="sha256:malformed-ownership-repair",
+            marker_id="marker-malformed-ownership-repair",
+            run_id="run-malformed-ownership-repair",
+        )
+    )
+
+    assert contract["operator_request_assessment"]["intent_components"][0]["planned_ownership"] == [
+        "work_unit:scoped-unit"
+    ]
+
+
+def test_work_preprocessing_repair_normalizes_only_response_local_ownership_refs():
+    payload = _preprocessing_contract_fields()
+    payload.update(_operator_assessment_payload(["kanban_items:bounded:body"]))
+    payload["operator_request_assessment"]["intent_components"][0]["planned_ownership"] = [
+        "p200",
+        "invented-owner",
+    ]
+
+    repaired, normalizations = routes_personal._work_preprocessing_repair_planned_ownership_refs(
+        payload
+    )
+
+    assert repaired["operator_request_assessment"]["intent_components"][0]["planned_ownership"] == [
+        "work_unit:scoped-unit"
+    ]
+    assert normalizations == [
+        {
+            "component_index": 0,
+            "reason": "invalid_or_missing_response_local_reference",
+            "original": ["p200", "invented-owner"],
+            "selected": ["work_unit:scoped-unit"],
+            "selection_policy": "conservative_all_final_owners",
+        }
+    ]
+    assert payload["operator_request_assessment"]["intent_components"][0]["planned_ownership"] == [
+        "p200",
+        "invented-owner",
+    ]
+
+
 def test_work_preprocessing_exhausted_repair_stays_visible_and_is_not_repeated(monkeypatch):
     monkeypatch.setattr(
         routes_personal,
