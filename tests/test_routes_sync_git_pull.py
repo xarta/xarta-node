@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 import sys
@@ -654,6 +655,103 @@ def test_git_pull_receipt_replay_is_idempotent_and_request_mismatch_conflicts(mo
         routes_sync._git_pull_operation_create_sync(operation_id, ["outer"], "c" * 40)
 
 
+def test_maximum_scheduler_inventory_fits_completed_restart_receipt(monkeypatch):
+    conn = _git_pull_receipt_conn()
+
+    @contextmanager
+    def fake_conn():
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    schedules = []
+    for index in range(routes_sync._SCHEDULER_RESTART_MAX_SCHEDULES):
+        provider_id = "pim-email"
+        if index == 0:
+            provider_id = routes_sync.KANBAN_PROVIDER_ID
+        elif index == 1:
+            provider_id = routes_sync.PERSONAL_SEARCH_PROVIDER_ID
+        schedules.append(
+            {
+                "schedule_id": f"xarta-schedule-{index:024x}",
+                "execution_mode": "provider",
+                "provider_id": provider_id,
+                "queued_runs": 0,
+                "running_runs": 0,
+                "stale_running_runs": 0,
+                "owner_mismatch_runs": 0,
+            }
+        )
+    normalized = routes_sync._strict_scheduler_restart_snapshot(
+        {
+            "schema": routes_sync._SCHEDULER_RESTART_SNAPSHOT_SCHEMA,
+            "captured_at": "2026-07-18T19:00:00+00:00",
+            "snapshot_id": "1200000:1200000:",
+            "generation": 1200000,
+            "schedule_count": len(schedules),
+            "global_work": {
+                "queued_runs": 0,
+                "running_runs": 0,
+                "stale_running_runs": 0,
+            },
+            "health": {
+                "ok": True,
+                "database": "available",
+                "coordinator_available": True,
+                "executor_available": True,
+                "worker_stale_seconds": 10,
+            },
+            "schedules": schedules,
+        }
+    )
+    providers = [
+        {
+            "provider_id": routes_sync.PERSONAL_SEARCH_PROVIDER_ID,
+            "provider_effective_enabled": True,
+            "claim_loop_paused": True,
+            "active_run_ids": [],
+        },
+        {
+            "provider_id": routes_sync.KANBAN_PROVIDER_ID,
+            "provider_effective_enabled": False,
+            "legacy_loop_effective_enabled": False,
+            "claim_loop_paused": True,
+            "active_run_ids": [],
+        },
+    ]
+    result = {
+        "expected_runtime_heads": {"outer": "b" * 40, "inner": "c" * 40},
+        "guard_before_pull": {"providers": providers, "scheduler": normalized},
+        "guard_immediately_before_restart": {
+            "providers": providers,
+            "scheduler": normalized,
+        },
+        "guard_immediately_after_restart": {"scheduler": normalized},
+        "initiating_node_id": "test-node",
+        "initiating_pid": 1234,
+        "process_started_at": "2026-07-18T18:59:00+00:00",
+        "completed_node_id": "test-node",
+        "completed_process_started_at": "2026-07-18T19:00:00+00:00",
+        "restart_observed": True,
+    }
+    encoded = json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= routes_sync._GIT_PULL_RESULT_MAX_BYTES
+
+    monkeypatch.setattr(routes_sync, "get_conn", fake_conn)
+    operation_id = "git-pull-" + "a" * 32
+    routes_sync._git_pull_operation_create_sync(operation_id, ["outer"], "b" * 40)
+    receipt = routes_sync._git_pull_operation_update_sync(operation_id, "completed", result)
+
+    assert receipt["status"] == "completed"
+    assert (
+        receipt["result"]["guard_immediately_after_restart"]["scheduler"]["schedule_count"]
+        == routes_sync._SCHEDULER_RESTART_MAX_SCHEDULES
+    )
+
+
 def test_git_pull_receipt_pruning_never_deletes_nonterminal_rows(monkeypatch):
     conn = _git_pull_receipt_conn()
     for index in range(routes_sync._GIT_PULL_RECEIPT_LIMIT + 3):
@@ -861,7 +959,9 @@ def test_scheduler_restart_snapshot_allows_only_non_blueprints_queued_work(monke
     assert calls == ["/restart-snapshot"]
     assert snapshot["global_work"]["queued_runs"] == 4
     assert snapshot["generation"] == 1122542
-    assert snapshot["non_blueprints_active_work"] == [
+    assert "active_work" not in snapshot
+    assert "non_blueprints_active_work" not in snapshot
+    assert [row for row in snapshot["schedules"] if row["queued_runs"]] == [
         {
             "schedule_id": "xarta-schedule-" + "c" * 24,
             "execution_mode": "provider",
@@ -905,7 +1005,7 @@ def test_scheduler_restart_snapshot_allows_queued_owner_disabled_provider(monkey
     snapshot = asyncio.run(routes_sync._scheduler_quiescence_snapshot(providers))
 
     assert snapshot["global_work"]["queued_runs"] == 1
-    assert snapshot["non_blueprints_active_work"] == []
+    assert snapshot["schedules"][0]["queued_runs"] == 1
 
 
 def test_scheduler_restart_snapshot_refuses_running_owner_disabled_provider(monkeypatch):
