@@ -948,6 +948,12 @@ class SyncAction(BaseModel):
 
 class GitPullRequest(BaseModel):
     scope: str = "outer"  # "outer" | "inner" | "both" | "non_root" | "all"
+    local_only: bool = False
+    operation_id: Optional[str] = Field(
+        default=None,
+        pattern=r"^git-pull-[0-9a-f]{32}$",
+    )
+    expected_head: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{40}$")
 
 
 class SyncActionsPayload(BaseModel):
