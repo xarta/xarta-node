@@ -161,6 +161,14 @@ _GIT_PULL_OPERATION_ID = re.compile(r"^git-pull-[0-9a-f]{32}$")
 _GIT_PULL_RECEIPT_LIMIT = 128
 _GIT_PULL_RESULT_MAX_BYTES = 32_768
 _PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat()
+_BLUEPRINTS_SCHEDULER_PROVIDER_IDS = {
+    PERSONAL_SEARCH_PROVIDER_ID,
+    KANBAN_PROVIDER_ID,
+}
+_SCHEDULER_RESTART_MAX_SCHEDULES = 32
+_SCHEDULER_SCHEDULE_ID = re.compile(r"^xarta-schedule-[0-9a-f]{24}$")
+_SCHEDULER_RESTART_SNAPSHOT_SCHEMA = "xarta.scheduler.restart_active_work_snapshot.v2"
+_POSTGRES_SNAPSHOT_ID = re.compile(r"^[0-9]+:[0-9]+:(?:[0-9]+(?:,[0-9]+)*)?$")
 
 
 class GitPullOperationConflict(RuntimeError):
@@ -299,6 +307,49 @@ def _git_pull_operation_get_sync(operation_id: str) -> dict[str, Any] | None:
             (operation_id,),
         ).fetchone()
         return _git_pull_operation_public(row) if row is not None else None
+
+
+def _restart_operation_create_sync(operation_id: str) -> dict[str, Any]:
+    request_json = json.dumps(
+        {"operation": "blueprints_restart", "node_id": cfg.NODE_ID},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO sync_git_pull_operations(
+                   operation_id,request_json,status,result_json,error_code
+               ) VALUES(?,?,?,'{}','')""",
+            (operation_id, request_json, "queued"),
+        )
+        conn.execute(
+            """DELETE FROM sync_git_pull_operations
+               WHERE status IN ('completed','blocked','failed')
+                 AND operation_id NOT IN (
+                   SELECT operation_id FROM sync_git_pull_operations
+                   ORDER BY updated_at DESC,operation_id DESC LIMIT ?
+               )""",
+            (_GIT_PULL_RECEIPT_LIMIT,),
+        )
+        row = conn.execute(
+            "SELECT * FROM sync_git_pull_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        assert row is not None
+        return _git_pull_operation_public(row)
+
+
+def _restart_requested_operations_sync() -> list[dict[str, Any]]:
+    with get_read_conn(
+        busy_timeout_ms=100,
+        operation="sync_restart_requested_operations",
+    ) as conn:
+        rows = conn.execute(
+            """SELECT * FROM sync_git_pull_operations
+               WHERE status IN ('restart_requested','post_restart_proof_failed')
+               ORDER BY updated_at DESC,operation_id DESC LIMIT 16"""
+        ).fetchall()
+        return [_git_pull_operation_public(row) for row in rows]
 
 
 def _git_pull_operation_public(row) -> dict[str, Any]:
@@ -490,11 +541,30 @@ def _strict_nonnegative_int(value: Any, field: str) -> int:
     return value
 
 
-def _strict_scheduler_quiescence(payload: dict[str, Any]) -> dict[str, Any]:
+def _strict_scheduler_restart_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("schema") != _SCHEDULER_RESTART_SNAPSHOT_SCHEMA:
+        raise SchedulerRestartRefused(
+            "scheduler_snapshot_malformed", {"field": "schema", "reason": "unsupported"}
+        )
+    captured_at = payload.get("captured_at")
+    snapshot_id = payload.get("snapshot_id")
+    generation = _strict_nonnegative_int(payload.get("generation"), "generation")
+    if generation < 1:
+        raise SchedulerRestartRefused(
+            "scheduler_snapshot_malformed", {"field": "generation", "reason": "expected_positive"}
+        )
+    if not isinstance(captured_at, str) or not captured_at:
+        raise SchedulerRestartRefused(
+            "scheduler_snapshot_malformed", {"field": "captured_at", "reason": "expected_string"}
+        )
+    if not isinstance(snapshot_id, str) or _POSTGRES_SNAPSHOT_ID.fullmatch(snapshot_id) is None:
+        raise SchedulerRestartRefused(
+            "scheduler_snapshot_malformed", {"field": "snapshot_id", "reason": "invalid"}
+        )
     health = payload.get("health")
     if not isinstance(health, dict):
         raise SchedulerRestartRefused(
-            "scheduler_status_malformed", {"field": "health", "reason": "expected_object"}
+            "scheduler_snapshot_malformed", {"field": "health", "reason": "expected_object"}
         )
     required_true = ("ok", "coordinator_available", "executor_available")
     for field in required_true:
@@ -508,30 +578,140 @@ def _strict_scheduler_quiescence(payload: dict[str, Any]) -> dict[str, Any]:
             "scheduler_unhealthy",
             {"field": "health.database", "value": health.get("database")},
         )
-    counts = {
-        field: _strict_nonnegative_int(health.get(field), f"health.{field}")
+    schedule_count = _strict_nonnegative_int(payload.get("schedule_count"), "schedule_count")
+    if schedule_count > _SCHEDULER_RESTART_MAX_SCHEDULES:
+        raise SchedulerRestartRefused(
+            "scheduler_snapshot_malformed",
+            {"field": "schedule_count", "reason": "exceeds_bound"},
+        )
+    schedules = payload.get("schedules")
+    if not isinstance(schedules, list) or len(schedules) != schedule_count:
+        raise SchedulerRestartRefused(
+            "scheduler_snapshot_malformed",
+            {
+                "expected_schedule_count": schedule_count,
+                "actual_schedule_count": len(schedules) if isinstance(schedules, list) else None,
+            },
+        )
+    active_work: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for schedule in schedules:
+        if not isinstance(schedule, dict):
+            raise SchedulerRestartRefused(
+                "scheduler_snapshot_malformed", {"reason": "schedule_not_object"}
+            )
+        schedule_id = schedule.get("schedule_id")
+        execution_mode = schedule.get("execution_mode")
+        provider_id = schedule.get("provider_id")
+        if (
+            not isinstance(schedule_id, str)
+            or _SCHEDULER_SCHEDULE_ID.fullmatch(schedule_id) is None
+            or schedule_id in seen
+            or not isinstance(provider_id, str)
+            or execution_mode not in {"local", "provider"}
+            or (execution_mode == "provider" and not provider_id)
+            or (execution_mode == "local" and provider_id)
+        ):
+            raise SchedulerRestartRefused(
+                "scheduler_snapshot_malformed",
+                {"reason": "schedule_identity_invalid", "schedule_id": schedule_id},
+            )
+        seen.add(schedule_id)
+        active_work.append(
+            {
+                "schedule_id": schedule_id,
+                "execution_mode": execution_mode,
+                "provider_id": provider_id,
+                "queued_runs": _strict_nonnegative_int(
+                    schedule.get("queued_runs"), "schedule.queued_runs"
+                ),
+                "running_runs": _strict_nonnegative_int(
+                    schedule.get("running_runs"), "schedule.running_runs"
+                ),
+                "stale_running_runs": _strict_nonnegative_int(
+                    schedule.get("stale_running_runs"), "schedule.stale_running_runs"
+                ),
+                "owner_mismatch_runs": _strict_nonnegative_int(
+                    schedule.get("owner_mismatch_runs"), "schedule.owner_mismatch_runs"
+                ),
+            }
+        )
+    global_work = payload.get("global_work")
+    if not isinstance(global_work, dict):
+        raise SchedulerRestartRefused(
+            "scheduler_snapshot_malformed", {"field": "global_work", "reason": "expected_object"}
+        )
+    global_counts = {
+        field: _strict_nonnegative_int(global_work.get(field), f"global_work.{field}")
         for field in ("queued_runs", "running_runs", "stale_running_runs")
     }
-    schedule_count = _strict_nonnegative_int(payload.get("schedule_count"), "schedule_count")
-    checked_at = health.get("checked_at")
-    if not isinstance(checked_at, str) or not checked_at.strip():
-        raise SchedulerRestartRefused(
-            "scheduler_status_malformed",
-            {"field": "health.checked_at", "reason": "expected_nonempty_string"},
-        )
-    snapshot = {
-        "checked_at": checked_at,
-        "schedule_count": schedule_count,
-        **counts,
+    for field in global_counts:
+        if sum(row[field] for row in active_work) != global_counts[field]:
+            raise SchedulerRestartRefused(
+                "scheduler_snapshot_malformed", {"field": field, "reason": "sum_mismatch"}
+            )
+    actual_blueprints = {
+        schedule["provider_id"]
+        for schedule in active_work
+        if schedule["provider_id"] in _BLUEPRINTS_SCHEDULER_PROVIDER_IDS
     }
-    if any(counts.values()):
-        raise SchedulerRestartRefused("scheduler_not_quiescent", snapshot)
-    return snapshot
+    if actual_blueprints != _BLUEPRINTS_SCHEDULER_PROVIDER_IDS:
+        raise SchedulerRestartRefused(
+            "scheduler_snapshot_malformed",
+            {
+                "reason": "blueprints_provider_inventory_incomplete",
+                "expected_provider_ids": sorted(_BLUEPRINTS_SCHEDULER_PROVIDER_IDS),
+                "actual_provider_ids": sorted(actual_blueprints),
+            },
+        )
+    if global_counts["stale_running_runs"]:
+        raise SchedulerRestartRefused("scheduler_stale_work", global_counts)
+    ownership_mismatches = [row for row in active_work if row["owner_mismatch_runs"]]
+    if ownership_mismatches:
+        raise SchedulerRestartRefused(
+            "scheduler_active_owner_mismatch", {"active_work": ownership_mismatches}
+        )
+    unsafe_blueprints = [
+        row
+        for row in active_work
+        if row["provider_id"] in _BLUEPRINTS_SCHEDULER_PROVIDER_IDS
+        and (row["queued_runs"] or row["running_runs"])
+    ]
+    if unsafe_blueprints:
+        raise SchedulerRestartRefused(
+            "blueprints_scheduler_not_quiescent", {"active_work": unsafe_blueprints}
+        )
+    return {
+        "schema": _SCHEDULER_RESTART_SNAPSHOT_SCHEMA,
+        "captured_at": captured_at,
+        "snapshot_id": snapshot_id,
+        "generation": generation,
+        "schedule_count": schedule_count,
+        "global_work": global_counts,
+        "health": {
+            "ok": True,
+            "database": "available",
+            "coordinator_available": True,
+            "executor_available": True,
+            "worker_stale_seconds": _strict_nonnegative_int(
+                health.get("worker_stale_seconds"), "health.worker_stale_seconds"
+            ),
+        },
+        "active_work": active_work,
+        "non_blueprints_active_work": [
+            row
+            for row in active_work
+            if row["provider_id"] not in _BLUEPRINTS_SCHEDULER_PROVIDER_IDS
+            and (row["queued_runs"] or row["running_runs"])
+        ],
+    }
 
 
 async def _scheduler_quiescence_snapshot() -> dict[str, Any]:
     try:
-        payload = await scheduler_local_get_json("/status")
+        return _strict_scheduler_restart_snapshot(
+            await scheduler_local_get_json("/restart-snapshot")
+        )
     except SchedulerRestartRefused:
         raise
     except Exception as exc:
@@ -539,7 +719,6 @@ async def _scheduler_quiescence_snapshot() -> dict[str, Any]:
             "scheduler_status_unavailable",
             {"error_class": type(exc).__name__},
         ) from exc
-    return _strict_scheduler_quiescence(payload)
 
 
 async def _resume_blueprints_provider_claims() -> None:
@@ -649,6 +828,7 @@ async def _git_pull_scopes_and_maybe_restart(
     guard_before: dict[str, Any] = {}
     running_heads_before: dict[str, str] = {}
     operation_evidence: dict[str, Any] = {}
+    restart_receipt_id = operation_id
     async with _GIT_PULL_LOCK:
         if _RESTART_PENDING:
             log.info("git pull batch%s skipped: service restart already pending", source_label)
@@ -692,23 +872,29 @@ async def _git_pull_scopes_and_maybe_restart(
             if restart_needed:
                 if not cfg.SERVICE_RESTART_CMD:
                     raise RuntimeError("service_restart_command_unset")
-                _RESTART_PENDING = True
-                restarted = (
-                    await _restart_service(
-                        operation_id=operation_id,
-                        expected_runtime_heads=disk_heads_after,
-                        guard_before=guard_before,
-                        claims_already_paused=claims_paused,
+                if restart_receipt_id is None:
+                    restart_receipt_id = f"git-pull-{uuid.uuid4().hex}"
+                    await timing.to_thread(
+                        "sync.restart_operation_create",
+                        _restart_operation_create_sync,
+                        restart_receipt_id,
                     )
-                    if operation_id is not None
-                    else await _restart_service()
+                _RESTART_PENDING = True
+                restart_heads = (
+                    disk_heads_after if operation_id is not None else await _runtime_heads()
+                )
+                restarted = await _restart_service(
+                    operation_id=restart_receipt_id,
+                    expected_runtime_heads=restart_heads,
+                    guard_before=guard_before,
+                    claims_already_paused=claims_paused,
                 )
                 if not restarted:
                     raise RuntimeError("service_restart_command_failed")
                 return {
                     "ok": True,
                     "status": "restart_requested",
-                    "expected_runtime_heads": disk_heads_after,
+                    "expected_runtime_heads": restart_heads,
                 }
             result = {
                 "restart_required": False,
@@ -730,7 +916,7 @@ async def _git_pull_scopes_and_maybe_restart(
             if claims_paused:
                 await _resume_blueprints_provider_claims()
             await _update_git_pull_operation(
-                operation_id,
+                restart_receipt_id,
                 "blocked",
                 {**operation_evidence, "reason": exc.code, "detail": exc.detail},
                 exc.code,
@@ -743,7 +929,7 @@ async def _git_pull_scopes_and_maybe_restart(
                 await _resume_blueprints_provider_claims()
             code = str(exc).split(":", 1)[0] if str(exc) else type(exc).__name__
             await _update_git_pull_operation(
-                operation_id,
+                restart_receipt_id,
                 "failed",
                 {
                     **operation_evidence,
@@ -1419,14 +1605,28 @@ def _enqueue_git_pull_scopes_sync(scopes: list[str]) -> None:
             enqueue_for_all_peers(conn, action_type, "_system", scope, None, gen)
 
 
-async def _reconcile_git_pull_operation(receipt: dict[str, Any]) -> dict[str, Any]:
-    if receipt.get("status") != "restart_requested":
+async def _reconcile_git_pull_operation(
+    receipt: dict[str, Any], *, require_new_process_proof: bool = False
+) -> dict[str, Any]:
+    if receipt.get("status") not in {"restart_requested", "post_restart_proof_failed"}:
         return receipt
     result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
     expected = result.get("expected_runtime_heads")
     if not isinstance(expected, dict) or not expected:
+        if require_new_process_proof:
+            raise SchedulerRestartRefused(
+                "restart_receipt_malformed", {"field": "expected_runtime_heads"}
+            )
         return receipt
     if result.get("initiating_node_id") != cfg.NODE_ID:
+        if require_new_process_proof:
+            raise SchedulerRestartRefused(
+                "restart_receipt_wrong_node",
+                {
+                    "expected_node_id": cfg.NODE_ID,
+                    "initiating_node_id": result.get("initiating_node_id"),
+                },
+            )
         return receipt
     process_started = _parse_sync_updated_at(_PROCESS_STARTED_AT)
     initiating_process_started = _parse_sync_updated_at(result.get("process_started_at"))
@@ -1435,19 +1635,95 @@ async def _reconcile_git_pull_operation(receipt: dict[str, Any]) -> dict[str, An
         or initiating_process_started is None
         or process_started <= initiating_process_started
     ):
+        if require_new_process_proof:
+            raise SchedulerRestartRefused(
+                "restart_process_not_advanced",
+                {
+                    "current_process_started_at": _PROCESS_STARTED_AT,
+                    "initiating_process_started_at": result.get("process_started_at"),
+                },
+            )
         return receipt
     if expected != _RUNNING_RUNTIME_REPO_HEADS:
+        if require_new_process_proof:
+            raise SchedulerRestartRefused(
+                "restart_runtime_heads_mismatch",
+                {
+                    "expected_runtime_heads": expected,
+                    "running_runtime_heads": dict(_RUNNING_RUNTIME_REPO_HEADS),
+                },
+            )
         return receipt
+    scheduler_immediately_after = await _scheduler_quiescence_snapshot()
     completed = {
         **result,
         "completed_node_id": cfg.NODE_ID,
         "completed_process_started_at": _PROCESS_STARTED_AT,
         "running_runtime_heads": dict(_RUNNING_RUNTIME_REPO_HEADS),
+        "guard_immediately_after_restart": {
+            "scheduler": scheduler_immediately_after,
+        },
         "restart_observed": True,
     }
     updated = await _update_git_pull_operation(str(receipt["operation_id"]), "completed", completed)
     assert updated is not None
     return updated
+
+
+async def reconcile_pending_restart_operations() -> list[dict[str, Any]]:
+    """Capture immediate after-restart scheduler proof before providers start."""
+    receipts = await timing.to_thread(
+        "sync.restart_requested_operations",
+        _restart_requested_operations_sync,
+    )
+    reconciled: list[dict[str, Any]] = []
+    for receipt in receipts:
+        try:
+            reconciled.append(
+                await _reconcile_git_pull_operation(receipt, require_new_process_proof=True)
+            )
+        except Exception as exc:
+            result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+            proof_code = (
+                exc.code
+                if isinstance(exc, SchedulerRestartRefused)
+                else "scheduler_status_unavailable"
+            )
+            permanent_receipt_failure = proof_code in {
+                "restart_receipt_malformed",
+                "restart_receipt_wrong_node",
+                "restart_process_not_advanced",
+                "restart_runtime_heads_mismatch",
+            }
+            failure = {
+                **result,
+                "completed_node_id": cfg.NODE_ID,
+                "completed_process_started_at": _PROCESS_STARTED_AT,
+                "restart_observed": True,
+                "post_restart_proof_error": {
+                    "code": proof_code,
+                    "error_class": type(exc).__name__,
+                },
+            }
+            updated = await _update_git_pull_operation(
+                str(receipt["operation_id"]),
+                "failed" if permanent_receipt_failure else "post_restart_proof_failed",
+                failure,
+                proof_code if permanent_receipt_failure else "post_restart_scheduler_proof_failed",
+            )
+            if updated is not None:
+                reconciled.append(updated)
+            log.exception(
+                "post-restart scheduler proof failed for operation %s",
+                receipt["operation_id"],
+            )
+    failures = [item for item in reconciled if item.get("status") != "completed"]
+    if failures:
+        raise RuntimeError(
+            "post_restart_scheduler_proof_failed:"
+            + ",".join(str(item.get("operation_id")) for item in failures)
+        )
+    return reconciled
 
 
 async def _run_tracked_git_pull_operation(
@@ -1466,22 +1742,51 @@ async def _run_tracked_git_pull_operation(
         _ACTIVE_GIT_PULL_OPERATION_IDS.discard(operation_id)
 
 
-async def _run_guarded_restart() -> None:
+async def _run_guarded_restart(
+    *, operation_id: str | None = None, expected_runtime_heads: dict[str, str] | None = None
+) -> None:
     global _RESTART_PENDING
     try:
         async with _GIT_PULL_LOCK:
             if _RESTART_PENDING:
+                await _update_git_pull_operation(
+                    operation_id,
+                    "blocked",
+                    {"reason": "restart_already_pending"},
+                    "restart_already_pending",
+                )
                 log.warning("service restart refused: restart_already_pending")
                 return
             _RESTART_PENDING = True
-            restarted = await _restart_service()
+            restarted = await _restart_service(
+                operation_id=operation_id,
+                expected_runtime_heads=expected_runtime_heads,
+            )
             if not restarted:
                 _RESTART_PENDING = False
+                await _update_git_pull_operation(
+                    operation_id,
+                    "failed",
+                    {"reason": "restart_dispatch_failed"},
+                    "restart_dispatch_failed",
+                )
     except SchedulerRestartRefused as exc:
         _RESTART_PENDING = False
+        await _update_git_pull_operation(
+            operation_id,
+            "blocked",
+            {"reason": exc.code, "detail": exc.detail},
+            exc.code,
+        )
         log.warning("service restart refused: %s detail=%s", exc.code, exc.detail)
-    except Exception:
+    except Exception as exc:
         _RESTART_PENDING = False
+        await _update_git_pull_operation(
+            operation_id,
+            "failed",
+            {"reason": "restart_exception", "error_class": type(exc).__name__},
+            "restart_exception",
+        )
         log.exception("service restart failed before command completion")
 
 
@@ -1570,7 +1875,7 @@ async def git_pull_capabilities() -> dict[str, Any]:
         "broadcast": False,
         "operation_receipt_schema": "xarta.blueprints.git_pull_operation.v1",
         "supported_scopes": ["outer"],
-        "restart_guard": "scheduler-and-provider-quiescence-v1",
+        "restart_guard": "atomic-provider-scoped-snapshot-v4",
         "exact_expected_head": True,
     }
 
@@ -1580,8 +1885,19 @@ async def trigger_restart() -> Response:
     """Restart the blueprints-app service on this node (via SERVICE_RESTART_CMD)."""
     if not cfg.SERVICE_RESTART_CMD:
         raise HTTPException(503, "SERVICE_RESTART_CMD not configured on this node")
-    asyncio.create_task(_run_guarded_restart())
-    log.info("service restart triggered via API")
+    operation_id = f"git-pull-{uuid.uuid4().hex}"
+    await timing.to_thread(
+        "sync.restart_operation_create",
+        _restart_operation_create_sync,
+        operation_id,
+    )
+    asyncio.create_task(
+        _run_guarded_restart(
+            operation_id=operation_id,
+            expected_runtime_heads=dict(_RUNNING_RUNTIME_REPO_HEADS),
+        )
+    )
+    log.info("service restart triggered via API operation_id=%s", operation_id)
     return Response(status_code=204)
 
 

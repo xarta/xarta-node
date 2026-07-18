@@ -129,6 +129,7 @@ from .routes_settings import router as settings_router
 from .routes_ssh_targets import router as ssh_targets_router
 from .routes_ssh_terminal import router as ssh_terminal_router
 from .routes_ssh_terminal import run_terminal_process_reaper
+from .routes_sync import reconcile_pending_restart_operations
 from .routes_sync import router as sync_router
 from .routes_table_layouts import router as table_layouts_router
 from .routes_timing import router as timing_router
@@ -324,6 +325,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     if not ok:
         log.warning("DB integrity check FAILED — sync-out is disabled until restored")
 
+    # Establish the local scheduler client and complete exact after-restart
+    # proof before node loading, drain work, or either provider can claim.
+    await start_scheduler_coordination_bridge()
+    try:
+        await reconcile_pending_restart_operations()
+    except Exception:
+        await stop_scheduler_coordination_bridge()
+        raise
+
     # Mount GUI static files (GUI dir must exist before mounting)
     if os.path.isdir(cfg.GUI_DIR):
         application.mount(
@@ -337,9 +347,6 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     # Start async drain loop
     await start_drain_loop()
-
-    # Narrow lifecycle-owned scheduler plan fetch/invalidation bridge.
-    await start_scheduler_coordination_bridge()
 
     # Start background SQLite->SeekDB index sync loop
     start_seekdb_sync_loop()
