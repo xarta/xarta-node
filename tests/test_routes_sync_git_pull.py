@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import sqlite3
 import sys
@@ -267,18 +266,29 @@ def test_exact_git_pull_fetches_main_but_merges_only_reviewed_head(monkeypatch):
 def test_git_pull_batch_restarts_once_when_runtime_repo_changes(monkeypatch):
     calls = []
     restarts = []
+    created_operations = []
 
     async def fake_git_pull(repo_path, label):
         calls.append(label)
         return label in {"outer", "non_root", "inner"}
 
-    async def fake_restart():
-        restarts.append("restart")
+    async def fake_restart(**kwargs):
+        restarts.append(kwargs)
         return True
+
+    async def fake_to_thread(_label, func, *args, **_kwargs):
+        assert func is routes_sync._restart_operation_create_sync
+        created_operations.append(args[0])
+        return {"operation_id": args[0], "status": "queued"}
+
+    async def runtime_heads():
+        return {"outer": "a" * 40, "inner": "b" * 40}
 
     monkeypatch.setattr(routes_sync, "_RESTART_PENDING", False)
     monkeypatch.setattr(routes_sync, "_git_pull", fake_git_pull)
     monkeypatch.setattr(routes_sync, "_restart_service", fake_restart)
+    monkeypatch.setattr(routes_sync.timing, "to_thread", fake_to_thread)
+    monkeypatch.setattr(routes_sync, "_runtime_heads", runtime_heads)
     monkeypatch.setattr(
         routes_sync,
         "_repo_pull_targets",
@@ -293,12 +303,18 @@ def test_git_pull_batch_restarts_once_when_runtime_repo_changes(monkeypatch):
     asyncio.run(routes_sync._git_pull_scopes_and_maybe_restart(["outer", "non_root", "inner"]))
 
     assert calls == ["outer", "non_root", "inner"]
-    assert restarts == ["restart"]
+    assert len(created_operations) == 1
+    assert restarts[0]["operation_id"] == created_operations[0]
+    assert restarts[0]["expected_runtime_heads"] == {
+        "outer": "a" * 40,
+        "inner": "b" * 40,
+    }
 
 
 def test_git_pull_batch_restarts_when_runtime_process_is_stale(monkeypatch):
     calls = []
     restarts = []
+    created_operations = []
 
     async def fake_git_pull(repo_path, label):
         calls.append(label)
@@ -307,13 +323,23 @@ def test_git_pull_batch_restarts_when_runtime_process_is_stale(monkeypatch):
     async def fake_runtime_repo_is_stale(repo_path, label):
         return label == "outer"
 
-    async def fake_restart():
-        restarts.append("restart")
+    async def fake_restart(**kwargs):
+        restarts.append(kwargs)
         return True
+
+    async def fake_to_thread(_label, func, *args, **_kwargs):
+        assert func is routes_sync._restart_operation_create_sync
+        created_operations.append(args[0])
+        return {"operation_id": args[0], "status": "queued"}
+
+    async def runtime_heads():
+        return {"outer": "a" * 40}
 
     monkeypatch.setattr(routes_sync, "_git_pull", fake_git_pull)
     monkeypatch.setattr(routes_sync, "_runtime_repo_is_stale", fake_runtime_repo_is_stale)
     monkeypatch.setattr(routes_sync, "_restart_service", fake_restart)
+    monkeypatch.setattr(routes_sync.timing, "to_thread", fake_to_thread)
+    monkeypatch.setattr(routes_sync, "_runtime_heads", runtime_heads)
     monkeypatch.setattr(
         routes_sync,
         "_repo_pull_targets",
@@ -326,7 +352,8 @@ def test_git_pull_batch_restarts_when_runtime_process_is_stale(monkeypatch):
     asyncio.run(routes_sync._git_pull_scopes_and_maybe_restart(["outer"]))
 
     assert calls == ["outer"]
-    assert restarts == ["restart"]
+    assert len(created_operations) == 1
+    assert restarts[0]["operation_id"] == created_operations[0]
 
 
 def test_receive_actions_offloads_db_apply(monkeypatch):
@@ -660,33 +687,126 @@ def test_legacy_git_pull_still_broadcasts_and_returns_204(monkeypatch):
     assert jobs == [(["outer"], {"source": "local trigger"})]
 
 
-def test_scheduler_quiescence_parser_is_strict_and_rejects_queued_work():
-    healthy = {
-        "schedule_count": 5,
+def _restart_snapshot_payload(*, kanban_queued=0, pim_queued=4):
+    kanban = "xarta-schedule-" + "a" * 24
+    search = "xarta-schedule-" + "b" * 24
+    pim = "xarta-schedule-" + "c" * 24
+    return {
+        "schema": "xarta.scheduler.restart_active_work_snapshot.v2",
+        "captured_at": "2026-07-18T13:30:00+00:00",
+        "snapshot_id": "1122542:1122542:",
+        "generation": 1122542,
+        "schedule_count": 3,
+        "global_work": {
+            "queued_runs": kanban_queued + pim_queued,
+            "running_runs": 0,
+            "stale_running_runs": 0,
+        },
         "health": {
             "ok": True,
             "database": "available",
             "coordinator_available": True,
             "executor_available": True,
-            "queued_runs": 0,
+            "worker_stale_seconds": 10,
+        },
+        "schedules": [
+            {
+                "schedule_id": kanban,
+                "execution_mode": "provider",
+                "provider_id": routes_sync.KANBAN_PROVIDER_ID,
+                "queued_runs": kanban_queued,
+                "running_runs": 0,
+                "stale_running_runs": 0,
+                "owner_mismatch_runs": 0,
+            },
+            {
+                "schedule_id": search,
+                "execution_mode": "provider",
+                "provider_id": routes_sync.PERSONAL_SEARCH_PROVIDER_ID,
+                "queued_runs": 0,
+                "running_runs": 0,
+                "stale_running_runs": 0,
+                "owner_mismatch_runs": 0,
+            },
+            {
+                "schedule_id": pim,
+                "execution_mode": "provider",
+                "provider_id": "pim-email",
+                "queued_runs": pim_queued,
+                "running_runs": 0,
+                "stale_running_runs": 0,
+                "owner_mismatch_runs": 0,
+            },
+        ],
+    }
+
+
+def test_scheduler_restart_snapshot_allows_only_non_blueprints_queued_work(monkeypatch):
+    calls = []
+
+    async def get_json(path):
+        calls.append(path)
+        return _restart_snapshot_payload()
+
+    monkeypatch.setattr(routes_sync, "scheduler_local_get_json", get_json)
+
+    snapshot = asyncio.run(routes_sync._scheduler_quiescence_snapshot())
+
+    assert calls == ["/restart-snapshot"]
+    assert snapshot["global_work"]["queued_runs"] == 4
+    assert snapshot["generation"] == 1122542
+    assert snapshot["non_blueprints_active_work"] == [
+        {
+            "schedule_id": "xarta-schedule-" + "c" * 24,
+            "execution_mode": "provider",
+            "provider_id": "pim-email",
+            "queued_runs": 4,
             "running_runs": 0,
             "stale_running_runs": 0,
-            "checked_at": "2026-07-18T13:30:00+00:00",
-        },
-    }
-    assert routes_sync._strict_scheduler_quiescence(healthy)["queued_runs"] == 0
+            "owner_mismatch_runs": 0,
+        }
+    ]
 
-    malformed = json.loads(json.dumps(healthy))
-    malformed["health"]["queued_runs"] = False
-    with pytest.raises(routes_sync.SchedulerRestartRefused) as malformed_exc:
-        routes_sync._strict_scheduler_quiescence(malformed)
-    assert malformed_exc.value.code == "scheduler_status_malformed"
 
-    queued = json.loads(json.dumps(healthy))
-    queued["health"]["queued_runs"] = 1
-    with pytest.raises(routes_sync.SchedulerRestartRefused) as queued_exc:
-        routes_sync._strict_scheduler_quiescence(queued)
-    assert queued_exc.value.code == "scheduler_not_quiescent"
+def test_scheduler_restart_snapshot_refuses_queued_blueprints_work(monkeypatch):
+    async def get_json(_path):
+        return _restart_snapshot_payload(kanban_queued=1, pim_queued=0)
+
+    monkeypatch.setattr(routes_sync, "scheduler_local_get_json", get_json)
+
+    with pytest.raises(routes_sync.SchedulerRestartRefused) as exc:
+        asyncio.run(routes_sync._scheduler_quiescence_snapshot())
+
+    assert exc.value.code == "blueprints_scheduler_not_quiescent"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "code"),
+    [
+        (
+            lambda p: p["global_work"].__setitem__("queued_runs", False),
+            "scheduler_status_malformed",
+        ),
+        (lambda p: p["global_work"].__setitem__("queued_runs", 5), "scheduler_snapshot_malformed"),
+        (lambda p: p["schedules"].pop(), "scheduler_snapshot_malformed"),
+        (
+            lambda p: p["schedules"][1].__setitem__("provider_id", "different-provider"),
+            "scheduler_snapshot_malformed",
+        ),
+        (
+            lambda p: p["schedules"][2].__setitem__("owner_mismatch_runs", 1),
+            "scheduler_active_owner_mismatch",
+        ),
+    ],
+)
+def test_scheduler_restart_snapshot_rejects_malformed_or_incomplete_inventory(mutate, code):
+    payload = _restart_snapshot_payload()
+    mutate(payload)
+
+    with pytest.raises(routes_sync.SchedulerRestartRefused) as exc:
+        routes_sync._strict_scheduler_restart_snapshot(payload)
+
+    assert exc.value.code == code
 
 
 def test_provider_claim_gate_requires_both_typed_provider_results(monkeypatch):
@@ -818,7 +938,7 @@ def test_direct_restart_waits_for_git_pull_lock(monkeypatch):
     restarts = []
     held_lock = asyncio.Lock()
 
-    async def restart():
+    async def restart(**_kwargs):
         restarts.append("restart")
         return True
 
@@ -850,7 +970,7 @@ def test_git_pull_capability_is_typed_non_broadcast_and_node_bound(monkeypatch):
         "broadcast": False,
         "operation_receipt_schema": "xarta.blueprints.git_pull_operation.v1",
         "supported_scopes": ["outer"],
-        "restart_guard": "scheduler-and-provider-quiescence-v1",
+        "restart_guard": "atomic-provider-scoped-snapshot-v4",
         "exact_expected_head": True,
     }
 
@@ -965,6 +1085,13 @@ def test_restart_receipt_completes_only_in_new_process_with_exact_runtime_heads(
         updates.append((operation_id, status, result, error_code))
         return {**receipt, "status": status, "result": result}
 
+    async def after_snapshot():
+        return {
+            "schema": "xarta.scheduler.restart_active_work_snapshot.v2",
+            "captured_at": "2026-07-18T13:01:00+00:00",
+            "generation": 1122542,
+        }
+
     monkeypatch.setattr(routes_sync.cfg, "NODE_ID", "test-node")
     monkeypatch.setattr(routes_sync, "_PROCESS_STARTED_AT", "2026-07-18T13:01:00+00:00")
     monkeypatch.setattr(
@@ -973,6 +1100,7 @@ def test_restart_receipt_completes_only_in_new_process_with_exact_runtime_heads(
         {"outer": "a" * 40, "inner": "wrong"},
     )
     monkeypatch.setattr(routes_sync, "_update_git_pull_operation", update)
+    monkeypatch.setattr(routes_sync, "_scheduler_quiescence_snapshot", after_snapshot)
     unchanged = asyncio.run(routes_sync._reconcile_git_pull_operation(receipt))
     assert unchanged is receipt
     assert updates == []
@@ -985,6 +1113,194 @@ def test_restart_receipt_completes_only_in_new_process_with_exact_runtime_heads(
     completed = asyncio.run(routes_sync._reconcile_git_pull_operation(receipt))
     assert completed["status"] == "completed"
     assert completed["result"]["restart_observed"] is True
+    assert (
+        completed["result"]["guard_immediately_after_restart"]["scheduler"]["generation"] == 1122542
+    )
+
+
+def test_startup_reconciliation_persists_failed_after_snapshot_proof(monkeypatch):
+    receipt = {
+        "operation_id": "git-pull-" + "a" * 32,
+        "status": "restart_requested",
+        "result": {"expected_runtime_heads": {"outer": "a" * 40}},
+    }
+    updates = []
+
+    async def to_thread(_label, _func, *_args):
+        return [receipt]
+
+    async def refuse(_receipt, **_kwargs):
+        raise routes_sync.SchedulerRestartRefused("scheduler_unhealthy", {"field": "health.ok"})
+
+    async def update(operation_id, status, result, error_code=""):
+        updates.append((operation_id, status, result, error_code))
+        return {**receipt, "status": status, "result": result, "error_code": error_code}
+
+    monkeypatch.setattr(routes_sync.timing, "to_thread", to_thread)
+    monkeypatch.setattr(routes_sync, "_reconcile_git_pull_operation", refuse)
+    monkeypatch.setattr(routes_sync, "_update_git_pull_operation", update)
+
+    with pytest.raises(RuntimeError, match="post_restart_scheduler_proof_failed"):
+        asyncio.run(routes_sync.reconcile_pending_restart_operations())
+
+    assert updates[0][1] == "post_restart_proof_failed"
+    assert updates[0][3] == "post_restart_scheduler_proof_failed"
+    assert updates[0][2]["post_restart_proof_error"]["code"] == "scheduler_unhealthy"
+
+
+@pytest.mark.parametrize(
+    ("restart_pending", "restart_result", "restart_error", "expected_status", "expected_code"),
+    [
+        (True, True, None, "blocked", "restart_already_pending"),
+        (False, False, None, "failed", "restart_dispatch_failed"),
+        (False, None, OSError("systemd failed"), "failed", "restart_exception"),
+    ],
+)
+def test_direct_restart_terminalizes_every_pre_dispatch_or_dispatch_failure(
+    monkeypatch,
+    restart_pending,
+    restart_result,
+    restart_error,
+    expected_status,
+    expected_code,
+):
+    updates = []
+
+    async def restart(**_kwargs):
+        if restart_error is not None:
+            raise restart_error
+        return restart_result
+
+    async def update(operation_id, status, result, error_code=""):
+        updates.append((operation_id, status, result, error_code))
+        return {}
+
+    monkeypatch.setattr(routes_sync, "_RESTART_PENDING", restart_pending)
+    monkeypatch.setattr(routes_sync, "_restart_service", restart)
+    monkeypatch.setattr(routes_sync, "_update_git_pull_operation", update)
+
+    asyncio.run(
+        routes_sync._run_guarded_restart(
+            operation_id="git-pull-" + "a" * 32,
+            expected_runtime_heads={"outer": "b" * 40},
+        )
+    )
+
+    assert updates[-1][1] == expected_status
+    assert updates[-1][3] == expected_code
+
+
+def test_startup_reconciliation_terminalizes_wrong_node_receipt(monkeypatch):
+    receipt = {
+        "operation_id": "git-pull-" + "a" * 32,
+        "status": "restart_requested",
+        "result": {
+            "initiating_node_id": "different-node",
+            "process_started_at": "2026-07-18T12:59:00+00:00",
+            "expected_runtime_heads": {"outer": "a" * 40},
+        },
+    }
+    monkeypatch.setattr(routes_sync.cfg, "NODE_ID", "test-node")
+
+    with pytest.raises(routes_sync.SchedulerRestartRefused) as exc:
+        asyncio.run(
+            routes_sync._reconcile_git_pull_operation(receipt, require_new_process_proof=True)
+        )
+
+    assert exc.value.code == "restart_receipt_wrong_node"
+
+
+def test_startup_reconciliation_quarantines_permanent_receipt_failure(monkeypatch):
+    receipt = {
+        "operation_id": "git-pull-" + "a" * 32,
+        "status": "restart_requested",
+        "result": {"expected_runtime_heads": {"outer": "a" * 40}},
+    }
+    updates = []
+
+    async def to_thread(_label, _func, *_args):
+        return [receipt]
+
+    async def refuse(_receipt, **_kwargs):
+        raise routes_sync.SchedulerRestartRefused(
+            "restart_receipt_wrong_node", {"initiating_node_id": "wrong"}
+        )
+
+    async def update(operation_id, status, result, error_code=""):
+        updates.append((operation_id, status, result, error_code))
+        return {**receipt, "status": status, "result": result, "error_code": error_code}
+
+    monkeypatch.setattr(routes_sync.timing, "to_thread", to_thread)
+    monkeypatch.setattr(routes_sync, "_reconcile_git_pull_operation", refuse)
+    monkeypatch.setattr(routes_sync, "_update_git_pull_operation", update)
+
+    with pytest.raises(RuntimeError, match="post_restart_scheduler_proof_failed"):
+        asyncio.run(routes_sync.reconcile_pending_restart_operations())
+
+    assert updates[0][1] == "failed"
+    assert updates[0][3] == "restart_receipt_wrong_node"
+
+
+def test_direct_restart_receipt_creation_applies_bounded_retention(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """CREATE TABLE sync_git_pull_operations (
+               operation_id TEXT PRIMARY KEY,
+               request_json TEXT NOT NULL,
+               status TEXT NOT NULL,
+               result_json TEXT NOT NULL DEFAULT '{}',
+               error_code TEXT NOT NULL DEFAULT '',
+               created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+               updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+           )"""
+    )
+    for index in range(130):
+        conn.execute(
+            """INSERT INTO sync_git_pull_operations
+               VALUES(?,?,?,'{}','',?,?)""",
+            (
+                f"git-pull-{index:032x}",
+                "{}",
+                "completed",
+                f"2026-07-18T13:{index // 60:02d}:{index % 60:02d}Z",
+                f"2026-07-18T13:{index // 60:02d}:{index % 60:02d}Z",
+            ),
+        )
+
+    @contextmanager
+    def get_conn():
+        with conn:
+            yield conn
+
+    monkeypatch.setattr(routes_sync, "get_conn", get_conn)
+    created = routes_sync._restart_operation_create_sync("git-pull-" + "f" * 32)
+
+    assert created["status"] == "queued"
+    assert conn.execute("SELECT count(*) FROM sync_git_pull_operations").fetchone()[0] == 128
+
+
+def test_lifespan_captures_after_restart_proof_before_work_or_provider_startup():
+    source = (APP_ROOT / "app" / "main.py").read_text(encoding="utf-8")
+    lifespan = source[
+        source.index("async def lifespan") : source.index("def _load_nodes_from_json")
+    ]
+
+    assert lifespan.index("db.init_db()") < lifespan.index(
+        "await start_scheduler_coordination_bridge()"
+    )
+    assert lifespan.index("await reconcile_pending_restart_operations()") < lifespan.index(
+        "_load_nodes_from_json()"
+    )
+    assert lifespan.index("await reconcile_pending_restart_operations()") < lifespan.index(
+        "await start_drain_loop()"
+    )
+    assert lifespan.index("await reconcile_pending_restart_operations()") < lifespan.index(
+        "await start_personal_search_scheduler()"
+    )
+    assert lifespan.index("await reconcile_pending_restart_operations()") < lifespan.index(
+        "await start_kanban_automation_scheduler()"
+    )
 
 
 def test_restart_receipt_cannot_complete_in_initiating_process(monkeypatch):
