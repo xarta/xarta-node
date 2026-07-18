@@ -324,6 +324,8 @@ class KanbanAutomationScheduler:
         self.worker_id = ""
         self._loop_tasks: list[asyncio.Task[Any]] = []
         self._active_runs: dict[str, asyncio.Task[Any]] = {}
+        self._claim_attempt_lock: asyncio.Lock | None = None
+        self._claims_paused_for_restart = False
         self._status_lock: asyncio.Lock | None = None
         self._status_inflight_task: asyncio.Task[dict[str, Any]] | None = None
         self._closing = False
@@ -363,6 +365,7 @@ class KanbanAutomationScheduler:
             log.info("Kanban scheduler provider disabled: token is not configured")
             return False
         self._closing = False
+        self._claims_paused_for_restart = False
         self._loop_tasks = [
             asyncio.create_task(self._heartbeat_loop(), name="kanban-scheduler-heartbeat"),
             asyncio.create_task(self._claim_loop(), name="kanban-scheduler-claims"),
@@ -385,6 +388,34 @@ class KanbanAutomationScheduler:
             with suppress(Exception):
                 await self.client.aclose()
             self.client = None
+
+    async def pause_new_claims_for_restart(self) -> dict[str, Any]:
+        """Fence new claims without cancelling an in-flight or retained claim."""
+        self._claims_paused_for_restart = True
+        async with self._get_claim_attempt_lock():
+            pass
+        await asyncio.sleep(0)
+        producer = await self._producer_config()
+        return {
+            "provider_id": PROVIDER_ID,
+            "claim_loop_paused": True,
+            "legacy_loop_effective_enabled": bool(producer.get("legacy_loop_effective_enabled")),
+            "active_run_ids": sorted(
+                run_id for run_id, task in self._active_runs.items() if not task.done()
+            ),
+        }
+
+    async def resume_new_claims_after_restart_abort(self) -> bool:
+        """Resume a previously paused claim loop when the restart is refused."""
+        if self._closing:
+            return False
+        self._claims_paused_for_restart = False
+        return True
+
+    def _get_claim_attempt_lock(self) -> asyncio.Lock:
+        if self._claim_attempt_lock is None:
+            self._claim_attempt_lock = asyncio.Lock()
+        return self._claim_attempt_lock
 
     def _auth_headers(self) -> dict[str, str]:
         if not self.config or not self.config.token:
@@ -457,34 +488,42 @@ class KanbanAutomationScheduler:
         backoff = self.config.claim_interval
         while not self._closing:
             try:
-                if self._active_runs:
+                if self._active_runs or self._claims_paused_for_restart:
                     await asyncio.sleep(self.config.claim_interval)
                     continue
-                response = await self._request_json(
-                    "POST",
-                    f"/providers/{PROVIDER_ID}/claims/next",
-                    body={
-                        "worker_id": self.worker_id,
-                        "request_id": f"blueprints-kanban-claim-{uuid.uuid4().hex}",
-                    },
-                    authenticated=True,
-                )
-                claim = response.get("claim")
-                if isinstance(claim, dict) and claim.get("actionable"):
-                    run = claim.get("run") if isinstance(claim.get("run"), dict) else {}
-                    run_id = str(run.get("run_id") or "")
-                    if (
-                        not run_id
-                        or not str(claim.get("claim_token") or "")
-                        or not str(claim.get("fence_token") or "")
-                        or _parse_iso(claim.get("lease_until")) is None
-                    ):
-                        raise SchedulerProtocolError("actionable claim omitted fencing data")
-                    task = asyncio.create_task(self._run_claim(claim), name=f"kanban-{run_id}")
-                    self._active_runs[run_id] = task
-                    task.add_done_callback(lambda done, rid=run_id: self._claim_done(rid, done))
-                else:
-                    self._last_error = ""
+                async with self._get_claim_attempt_lock():
+                    if not self._claims_paused_for_restart:
+                        response = await self._request_json(
+                            "POST",
+                            f"/providers/{PROVIDER_ID}/claims/next",
+                            body={
+                                "worker_id": self.worker_id,
+                                "request_id": f"blueprints-kanban-claim-{uuid.uuid4().hex}",
+                            },
+                            authenticated=True,
+                        )
+                        claim = response.get("claim")
+                        if isinstance(claim, dict) and claim.get("actionable"):
+                            run = claim.get("run") if isinstance(claim.get("run"), dict) else {}
+                            run_id = str(run.get("run_id") or "")
+                            if (
+                                not run_id
+                                or not str(claim.get("claim_token") or "")
+                                or not str(claim.get("fence_token") or "")
+                                or _parse_iso(claim.get("lease_until")) is None
+                            ):
+                                raise SchedulerProtocolError(
+                                    "actionable claim omitted fencing data"
+                                )
+                            task = asyncio.create_task(
+                                self._run_claim(claim), name=f"kanban-{run_id}"
+                            )
+                            self._active_runs[run_id] = task
+                            task.add_done_callback(
+                                lambda done, rid=run_id: self._claim_done(rid, done)
+                            )
+                        else:
+                            self._last_error = ""
                 backoff = self.config.claim_interval
             except asyncio.CancelledError:
                 raise
@@ -920,6 +959,14 @@ async def start_kanban_automation_scheduler() -> bool:
 
 async def stop_kanban_automation_scheduler() -> None:
     await service.stop()
+
+
+async def pause_kanban_claims_for_restart() -> dict[str, Any]:
+    return await service.pause_new_claims_for_restart()
+
+
+async def resume_kanban_claims_after_restart_abort() -> bool:
+    return await service.resume_new_claims_after_restart_abort()
 
 
 @router.get("/status")

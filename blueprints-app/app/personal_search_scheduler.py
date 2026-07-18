@@ -230,6 +230,8 @@ class PersonalSearchScheduler:
         self.worker_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self._loop_tasks: list[asyncio.Task[Any]] = []
         self._active_runs: dict[str, asyncio.Task[Any]] = {}
+        self._claim_attempt_lock: asyncio.Lock | None = None
+        self._claims_paused_for_restart = False
         self._closing = False
         self._last_error = ""
         self.config_error = ""
@@ -254,6 +256,7 @@ class PersonalSearchScheduler:
             log.info("Personal Search scheduler provider disabled: token is not configured")
             return False
         self._closing = False
+        self._claims_paused_for_restart = False
         self._loop_tasks = [
             asyncio.create_task(self._heartbeat_loop(), name="personal-search-scheduler-heartbeat"),
             asyncio.create_task(self._claim_loop(), name="personal-search-scheduler-claims"),
@@ -273,6 +276,40 @@ class PersonalSearchScheduler:
             with suppress(Exception):
                 await self.client.aclose()
             self.client = None
+
+    async def pause_new_claims_for_restart(self) -> dict[str, Any]:
+        """Fence new claims without cancelling an in-flight or retained claim.
+
+        Existing target tasks and their claim maintainers are deliberately left
+        running.  The restart owner must refuse while ``active_run_ids`` is
+        non-empty; it must never cancel retained scheduler work to make a
+        deployment appear quiescent.
+        """
+        self._claims_paused_for_restart = True
+        async with self._get_claim_attempt_lock():
+            # Acquiring the barrier proves any /claims/next response has already
+            # been fully materialized into _active_runs.
+            pass
+        await asyncio.sleep(0)
+        return {
+            "provider_id": PROVIDER_ID,
+            "claim_loop_paused": True,
+            "active_run_ids": sorted(
+                run_id for run_id, task in self._active_runs.items() if not task.done()
+            ),
+        }
+
+    async def resume_new_claims_after_restart_abort(self) -> bool:
+        """Resume a previously paused claim loop when the restart is refused."""
+        if self._closing:
+            return False
+        self._claims_paused_for_restart = False
+        return True
+
+    def _get_claim_attempt_lock(self) -> asyncio.Lock:
+        if self._claim_attempt_lock is None:
+            self._claim_attempt_lock = asyncio.Lock()
+        return self._claim_attempt_lock
 
     def _auth_headers(self) -> dict[str, str]:
         if not self.config or not self.config.token:
@@ -344,34 +381,42 @@ class PersonalSearchScheduler:
         backoff = self.config.claim_interval
         while not self._closing:
             try:
-                if self._active_runs:
+                if self._active_runs or self._claims_paused_for_restart:
                     await asyncio.sleep(self.config.claim_interval)
                     continue
-                response = await self._request_json(
-                    "POST",
-                    f"/providers/{PROVIDER_ID}/claims/next",
-                    body={
-                        "worker_id": self.worker_id,
-                        "request_id": f"blueprints-search-claim-{uuid.uuid4().hex}",
-                    },
-                    authenticated=True,
-                )
-                claim = response.get("claim")
-                if isinstance(claim, dict) and claim.get("actionable"):
-                    run = claim.get("run") if isinstance(claim.get("run"), dict) else {}
-                    run_id = str(run.get("run_id") or "")
-                    if (
-                        not run_id
-                        or not str(claim.get("claim_token") or "")
-                        or not str(claim.get("fence_token") or "")
-                        or _parse_iso(claim.get("lease_until")) is None
-                    ):
-                        raise SchedulerProtocolError("actionable claim omitted fencing data")
-                    task = asyncio.create_task(self._run_claim(claim), name=f"search-sync-{run_id}")
-                    self._active_runs[run_id] = task
-                    task.add_done_callback(lambda done, rid=run_id: self._claim_done(rid, done))
-                else:
-                    self._last_error = ""
+                async with self._get_claim_attempt_lock():
+                    if not self._claims_paused_for_restart:
+                        response = await self._request_json(
+                            "POST",
+                            f"/providers/{PROVIDER_ID}/claims/next",
+                            body={
+                                "worker_id": self.worker_id,
+                                "request_id": f"blueprints-search-claim-{uuid.uuid4().hex}",
+                            },
+                            authenticated=True,
+                        )
+                        claim = response.get("claim")
+                        if isinstance(claim, dict) and claim.get("actionable"):
+                            run = claim.get("run") if isinstance(claim.get("run"), dict) else {}
+                            run_id = str(run.get("run_id") or "")
+                            if (
+                                not run_id
+                                or not str(claim.get("claim_token") or "")
+                                or not str(claim.get("fence_token") or "")
+                                or _parse_iso(claim.get("lease_until")) is None
+                            ):
+                                raise SchedulerProtocolError(
+                                    "actionable claim omitted fencing data"
+                                )
+                            task = asyncio.create_task(
+                                self._run_claim(claim), name=f"search-sync-{run_id}"
+                            )
+                            self._active_runs[run_id] = task
+                            task.add_done_callback(
+                                lambda done, rid=run_id: self._claim_done(rid, done)
+                            )
+                        else:
+                            self._last_error = ""
                 backoff = self.config.claim_interval
             except asyncio.CancelledError:
                 raise
@@ -711,6 +756,14 @@ async def start_personal_search_scheduler() -> bool:
 
 async def stop_personal_search_scheduler() -> None:
     await service.stop()
+
+
+async def pause_personal_search_claims_for_restart() -> dict[str, Any]:
+    return await service.pause_new_claims_for_restart()
+
+
+async def resume_personal_search_claims_after_restart_abort() -> bool:
+    return await service.resume_new_claims_after_restart_abort()
 
 
 @router.get("/status")

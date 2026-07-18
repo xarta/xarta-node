@@ -25,16 +25,33 @@ import time
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 
 from . import config as cfg
 from . import timing
 from .auth import compute_token
 from .db import get_conn, get_gen, get_meta, get_read_conn, increment_gen
 from .events import bus as events_bus
+from .kanban_automation_scheduler import (
+    PROVIDER_ID as KANBAN_PROVIDER_ID,
+)
+from .kanban_automation_scheduler import (
+    pause_kanban_claims_for_restart,
+    resume_kanban_claims_after_restart_abort,
+)
 from .models import GitPullRequest, SyncActionsPayload, SyncStatus
+from .personal_search_scheduler import (
+    PROVIDER_ID as PERSONAL_SEARCH_PROVIDER_ID,
+)
+from .personal_search_scheduler import (
+    pause_personal_search_claims_for_restart,
+    resume_personal_search_claims_after_restart_abort,
+)
+from .routes_scheduler_coordination import scheduler_local_get_json
 from .sync.queue import (
     enqueue,
     enqueue_for_all_peers,
@@ -139,6 +156,22 @@ _SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner", "sync_git_non_root"}
 _GIT_PULL_SCOPE_ORDER = ("outer", "non_root", "inner")
 _GIT_PULL_LOCK = asyncio.Lock()
 _RESTART_PENDING = False
+_ACTIVE_GIT_PULL_OPERATION_IDS: set[str] = set()
+_GIT_PULL_OPERATION_ID = re.compile(r"^git-pull-[0-9a-f]{32}$")
+_GIT_PULL_RECEIPT_LIMIT = 128
+_GIT_PULL_RESULT_MAX_BYTES = 32_768
+_PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat()
+
+
+class GitPullOperationConflict(RuntimeError):
+    pass
+
+
+class SchedulerRestartRefused(RuntimeError):
+    def __init__(self, code: str, detail: dict[str, Any]):
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
 
 
 # ── Git pull helpers ──────────────────────────────────────────────────────────
@@ -185,6 +218,133 @@ def _ordered_git_scopes(scopes) -> list[str]:
     return [scope for scope in _GIT_PULL_SCOPE_ORDER if scope in wanted]
 
 
+def _git_pull_request_json(scopes: list[str], expected_head: str) -> str:
+    return json.dumps(
+        {"expected_head": expected_head, "local_only": True, "scopes": scopes},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _git_pull_operation_create_sync(
+    operation_id: str, scopes: list[str], expected_head: str
+) -> dict[str, Any]:
+    request_json = _git_pull_request_json(scopes, expected_head)
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM sync_git_pull_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_json"] != request_json:
+                raise GitPullOperationConflict("operation_id was reused with a different request")
+            return {**_git_pull_operation_public(existing), "idempotent_replay": True}
+        conn.execute(
+            """INSERT INTO sync_git_pull_operations(
+                   operation_id,request_json,status,result_json,error_code
+               ) VALUES(?,?,?,'{}','')""",
+            (operation_id, request_json, "queued"),
+        )
+        conn.execute(
+            """DELETE FROM sync_git_pull_operations
+               WHERE status IN ('completed','blocked','failed')
+                 AND operation_id NOT IN (
+                   SELECT operation_id FROM sync_git_pull_operations
+                   ORDER BY updated_at DESC,operation_id DESC LIMIT ?
+               )""",
+            (_GIT_PULL_RECEIPT_LIMIT,),
+        )
+        row = conn.execute(
+            "SELECT * FROM sync_git_pull_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        assert row is not None
+        return {**_git_pull_operation_public(row), "idempotent_replay": False}
+
+
+def _git_pull_operation_update_sync(
+    operation_id: str,
+    status: str,
+    result: dict[str, Any],
+    error_code: str = "",
+) -> dict[str, Any]:
+    result_json = json.dumps(result, sort_keys=True, separators=(",", ":"))
+    if len(result_json.encode("utf-8")) > _GIT_PULL_RESULT_MAX_BYTES:
+        raise ValueError("git-pull operation result exceeded its bound")
+    with get_conn() as conn:
+        cursor = conn.execute(
+            """UPDATE sync_git_pull_operations
+               SET status=?,result_json=?,error_code=?,
+                   updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+               WHERE operation_id=?""",
+            (status, result_json, error_code, operation_id),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(operation_id)
+        row = conn.execute(
+            "SELECT * FROM sync_git_pull_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        assert row is not None
+        return _git_pull_operation_public(row)
+
+
+def _git_pull_operation_get_sync(operation_id: str) -> dict[str, Any] | None:
+    with get_read_conn(
+        busy_timeout_ms=100,
+        operation="sync_git_pull_operation_get",
+    ) as conn:
+        row = conn.execute(
+            "SELECT * FROM sync_git_pull_operations WHERE operation_id=?",
+            (operation_id,),
+        ).fetchone()
+        return _git_pull_operation_public(row) if row is not None else None
+
+
+def _git_pull_operation_public(row) -> dict[str, Any]:
+    try:
+        request = json.loads(row["request_json"])
+        result = json.loads(row["result_json"])
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("git-pull operation receipt is malformed") from exc
+    if not isinstance(request, dict) or not isinstance(result, dict):
+        raise RuntimeError("git-pull operation receipt is malformed")
+    return {
+        "schema": "xarta.blueprints.git_pull_operation.v1",
+        "operation_id": row["operation_id"],
+        "request": request,
+        "status": row["status"],
+        "result": result,
+        "error_code": row["error_code"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "terminal": row["status"] in {"completed", "blocked", "failed"},
+    }
+
+
+async def _update_git_pull_operation(
+    operation_id: str | None,
+    status: str,
+    result: dict[str, Any],
+    error_code: str = "",
+) -> dict[str, Any] | None:
+    if operation_id is None:
+        return None
+    return await timing.to_thread(
+        "sync.git_pull_operation_update",
+        _git_pull_operation_update_sync,
+        operation_id,
+        status,
+        result,
+        error_code,
+    )
+
+
+def _raw_client_is_loopback(request: Request) -> bool:
+    host = request.client.host if request.client is not None else ""
+    return host in {"127.0.0.1", "::1"}
+
+
 def _scope_for_system_action(action_type: str) -> str | None:
     prefix = "sync_git_"
     if action_type.startswith(prefix):
@@ -211,9 +371,8 @@ async def _git_head(repo_path: str, label: str) -> str | None:
 
 async def _git_pull(repo_path: str, label: str) -> bool:
     """Run git pull for one repo and return whether HEAD changed."""
-    if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
-        log.info("git pull [%s] skipped: no repo at %r", label, repo_path)
-        return False
+    if not repo_path:
+        raise RuntimeError(f"git_pull_repo_missing:{label}")
     before = await _git_head(repo_path, label)
     proc = await asyncio.create_subprocess_exec(
         "git",
@@ -234,12 +393,78 @@ async def _git_pull(repo_path: str, label: str) -> bool:
         log.info("git pull [%s]: %s (%s)", label, result, "changed" if changed else "unchanged")
         return changed
     log.warning("git pull [%s] failed: %s", label, stderr.decode().strip())
-    return False
+    raise RuntimeError(f"git_pull_failed:{label}")
+
+
+async def _git_pull_exact(repo_path: str, label: str, expected_head: str) -> bool:
+    """Fetch and fast-forward to one reviewed commit, never an unreviewed newer tip."""
+    if not repo_path:
+        raise RuntimeError(f"git_pull_repo_missing:{label}")
+    before = await _git_head(repo_path, label)
+    fetch = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        repo_path,
+        "fetch",
+        "--no-tags",
+        "origin",
+        "main",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _fetch_stdout, fetch_stderr = await fetch.communicate()
+    if fetch.returncode != 0:
+        log.warning("git fetch exact [%s] failed: %s", label, fetch_stderr.decode().strip())
+        raise RuntimeError(f"git_fetch_expected_failed:{label}")
+    contains = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        repo_path,
+        "merge-base",
+        "--is-ancestor",
+        expected_head,
+        "origin/main",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _contains_stdout, contains_stderr = await contains.communicate()
+    if contains.returncode != 0:
+        log.warning(
+            "expected head [%s] is not on origin/main: %s",
+            label,
+            contains_stderr.decode().strip(),
+        )
+        raise RuntimeError(f"expected_head_not_on_origin_main:{label}")
+    merge = await asyncio.create_subprocess_exec(
+        "git",
+        "-C",
+        repo_path,
+        "merge",
+        "--ff-only",
+        expected_head,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    merge_stdout, merge_stderr = await merge.communicate()
+    if merge.returncode != 0:
+        log.warning("git merge exact [%s] failed: %s", label, merge_stderr.decode().strip())
+        raise RuntimeError(f"git_merge_expected_failed:{label}")
+    after = await _git_head(repo_path, label)
+    if after != expected_head:
+        raise RuntimeError(f"expected_head_mismatch:{label}")
+    changed = before != after
+    log.info(
+        "git exact [%s]: %s (%s)",
+        label,
+        merge_stdout.decode().strip(),
+        "changed" if changed else "unchanged",
+    )
+    return changed
 
 
 async def _runtime_repo_is_stale(repo_path: str, label: str) -> bool:
     """Return True when the checked-out runtime repo is newer than this process."""
-    if not repo_path or not os.path.isdir(os.path.join(repo_path, ".git")):
+    if not repo_path:
         return False
     head = await _git_head(repo_path, label)
     running = _RUNNING_RUNTIME_REPO_HEADS.get(label)
@@ -256,40 +481,279 @@ async def _runtime_repo_is_stale(repo_path: str, label: str) -> bool:
     return stale
 
 
-async def _git_pull_scopes_and_maybe_restart(scopes, *, source: str = "") -> None:
+def _strict_nonnegative_int(value: Any, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise SchedulerRestartRefused(
+            "scheduler_status_malformed",
+            {"field": field, "reason": "expected_nonnegative_integer"},
+        )
+    return value
+
+
+def _strict_scheduler_quiescence(payload: dict[str, Any]) -> dict[str, Any]:
+    health = payload.get("health")
+    if not isinstance(health, dict):
+        raise SchedulerRestartRefused(
+            "scheduler_status_malformed", {"field": "health", "reason": "expected_object"}
+        )
+    required_true = ("ok", "coordinator_available", "executor_available")
+    for field in required_true:
+        if health.get(field) is not True:
+            raise SchedulerRestartRefused(
+                "scheduler_unhealthy",
+                {"field": f"health.{field}", "value": health.get(field)},
+            )
+    if health.get("database") != "available":
+        raise SchedulerRestartRefused(
+            "scheduler_unhealthy",
+            {"field": "health.database", "value": health.get("database")},
+        )
+    counts = {
+        field: _strict_nonnegative_int(health.get(field), f"health.{field}")
+        for field in ("queued_runs", "running_runs", "stale_running_runs")
+    }
+    schedule_count = _strict_nonnegative_int(payload.get("schedule_count"), "schedule_count")
+    checked_at = health.get("checked_at")
+    if not isinstance(checked_at, str) or not checked_at.strip():
+        raise SchedulerRestartRefused(
+            "scheduler_status_malformed",
+            {"field": "health.checked_at", "reason": "expected_nonempty_string"},
+        )
+    snapshot = {
+        "checked_at": checked_at,
+        "schedule_count": schedule_count,
+        **counts,
+    }
+    if any(counts.values()):
+        raise SchedulerRestartRefused("scheduler_not_quiescent", snapshot)
+    return snapshot
+
+
+async def _scheduler_quiescence_snapshot() -> dict[str, Any]:
+    try:
+        payload = await scheduler_local_get_json("/status")
+    except SchedulerRestartRefused:
+        raise
+    except Exception as exc:
+        raise SchedulerRestartRefused(
+            "scheduler_status_unavailable",
+            {"error_class": type(exc).__name__},
+        ) from exc
+    return _strict_scheduler_quiescence(payload)
+
+
+async def _resume_blueprints_provider_claims() -> None:
+    results = await asyncio.gather(
+        resume_personal_search_claims_after_restart_abort(),
+        resume_kanban_claims_after_restart_abort(),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, BaseException):
+            log.exception("failed to resume a Blueprints scheduler claim gate", exc_info=result)
+
+
+async def _pause_blueprints_provider_claims() -> list[dict[str, Any]]:
+    results = await asyncio.gather(
+        pause_personal_search_claims_for_restart(),
+        pause_kanban_claims_for_restart(),
+        return_exceptions=True,
+    )
+    if any(isinstance(result, BaseException) for result in results):
+        await _resume_blueprints_provider_claims()
+        raise SchedulerRestartRefused(
+            "provider_claim_gate_failed",
+            {
+                "errors": [
+                    type(result).__name__ for result in results if isinstance(result, BaseException)
+                ]
+            },
+        )
+    providers = [result for result in results if isinstance(result, dict)]
+    expected_provider_ids = {PERSONAL_SEARCH_PROVIDER_ID, KANBAN_PROVIDER_ID}
+    actual_provider_ids = {
+        provider.get("provider_id")
+        for provider in providers
+        if isinstance(provider.get("provider_id"), str)
+    }
+    malformed_provider = any(
+        provider.get("claim_loop_paused") is not True
+        or not isinstance(provider.get("active_run_ids"), list)
+        for provider in providers
+    )
+    if actual_provider_ids != expected_provider_ids or malformed_provider:
+        await _resume_blueprints_provider_claims()
+        raise SchedulerRestartRefused(
+            "provider_claim_gate_malformed",
+            {
+                "expected_provider_ids": sorted(expected_provider_ids),
+                "actual_provider_ids": sorted(actual_provider_ids),
+                "result_count": len(providers),
+            },
+        )
+    active = {
+        str(provider.get("provider_id") or "unknown"): provider.get("active_run_ids")
+        for provider in providers
+        if provider.get("active_run_ids")
+    }
+    legacy_enabled = any(
+        provider.get("legacy_loop_effective_enabled") is True for provider in providers
+    )
+    if active or legacy_enabled:
+        await _resume_blueprints_provider_claims()
+        raise SchedulerRestartRefused(
+            "blueprints_provider_not_quiescent",
+            {"active_run_ids": active, "legacy_loop_effective_enabled": legacy_enabled},
+        )
+    return providers
+
+
+async def _pause_and_snapshot_scheduler() -> dict[str, Any]:
+    providers = await _pause_blueprints_provider_claims()
+    try:
+        scheduler = await _scheduler_quiescence_snapshot()
+    except Exception:
+        await _resume_blueprints_provider_claims()
+        raise
+    return {"providers": providers, "scheduler": scheduler}
+
+
+async def _runtime_heads() -> dict[str, str]:
+    heads: dict[str, str] = {}
+    for label, (repo_path, restart_service) in _repo_pull_targets().items():
+        if not restart_service:
+            continue
+        head = await _git_head(repo_path, label)
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+            raise RuntimeError(f"git_head_unavailable:{label}")
+        heads[label] = head
+    return heads
+
+
+async def _git_pull_scopes_and_maybe_restart(
+    scopes,
+    *,
+    source: str = "",
+    operation_id: str | None = None,
+    expected_head: str = "",
+) -> dict[str, Any] | None:
     """Run a coalesced git-pull batch and restart once if runtime code changed."""
     global _RESTART_PENDING
     ordered_scopes = _ordered_git_scopes(scopes)
     if not ordered_scopes:
-        return
+        return None
     source_label = f" {source}" if source else ""
     targets = _repo_pull_targets()
     restart_needed = False
+    claims_paused = False
+    guard_before: dict[str, Any] = {}
+    running_heads_before: dict[str, str] = {}
+    operation_evidence: dict[str, Any] = {}
     async with _GIT_PULL_LOCK:
         if _RESTART_PENDING:
             log.info("git pull batch%s skipped: service restart already pending", source_label)
-            return
-        log.info("git pull batch%s: scopes=%s", source_label, ",".join(ordered_scopes))
-        for scope in ordered_scopes:
-            repo_path, restart_service = targets[scope]
-            changed = await _git_pull(repo_path, scope)
-            runtime_stale = restart_service and await _runtime_repo_is_stale(repo_path, scope)
-            restart_needed = restart_needed or (restart_service and (changed or runtime_stale))
-        if restart_needed:
-            if cfg.SERVICE_RESTART_CMD:
-                _RESTART_PENDING = True
-                if not await _restart_service():
-                    _RESTART_PENDING = False
-            else:
-                log.warning(
-                    "git pull batch%s changed runtime code but SERVICE_RESTART_CMD is unset",
-                    source_label,
+            await _update_git_pull_operation(
+                operation_id,
+                "blocked",
+                {"reason": "restart_already_pending"},
+                "restart_already_pending",
+            )
+            return {"ok": False, "code": "restart_already_pending"}
+        try:
+            if operation_id is not None:
+                running_heads_before = dict(_RUNNING_RUNTIME_REPO_HEADS)
+                guard_before = await _pause_and_snapshot_scheduler()
+                claims_paused = True
+                operation_evidence = {
+                    "guard_before_pull": guard_before,
+                    "initiating_node_id": cfg.NODE_ID,
+                    "initiating_pid": os.getpid(),
+                    "process_started_at": _PROCESS_STARTED_AT,
+                    "running_heads_before": running_heads_before,
+                }
+                await _update_git_pull_operation(
+                    operation_id,
+                    "pulling",
+                    operation_evidence,
                 )
-        else:
+            log.info("git pull batch%s: scopes=%s", source_label, ",".join(ordered_scopes))
+            for scope in ordered_scopes:
+                repo_path, restart_service = targets[scope]
+                changed = (
+                    await _git_pull_exact(repo_path, scope, expected_head)
+                    if operation_id is not None
+                    else await _git_pull(repo_path, scope)
+                )
+                runtime_stale = restart_service and await _runtime_repo_is_stale(repo_path, scope)
+                restart_needed = restart_needed or (restart_service and (changed or runtime_stale))
+            disk_heads_after = await _runtime_heads() if operation_id is not None else {}
+            if operation_id is not None and disk_heads_after.get("outer") != expected_head:
+                raise RuntimeError("expected_head_mismatch:outer")
+            if restart_needed:
+                if not cfg.SERVICE_RESTART_CMD:
+                    raise RuntimeError("service_restart_command_unset")
+                _RESTART_PENDING = True
+                restarted = (
+                    await _restart_service(
+                        operation_id=operation_id,
+                        expected_runtime_heads=disk_heads_after,
+                        guard_before=guard_before,
+                        claims_already_paused=claims_paused,
+                    )
+                    if operation_id is not None
+                    else await _restart_service()
+                )
+                if not restarted:
+                    raise RuntimeError("service_restart_command_failed")
+                return {
+                    "ok": True,
+                    "status": "restart_requested",
+                    "expected_runtime_heads": disk_heads_after,
+                }
+            result = {
+                "restart_required": False,
+                "expected_head": expected_head,
+                "runtime_heads": disk_heads_after,
+                "guard_before_pull": guard_before,
+            }
+            await _update_git_pull_operation(operation_id, "completed", result)
+            if claims_paused:
+                await _resume_blueprints_provider_claims()
+                claims_paused = False
             log.info(
                 "git pull batch%s completed with no runtime repo changes; restart skipped",
                 source_label,
             )
+            return {"ok": True, "status": "completed", **result}
+        except SchedulerRestartRefused as exc:
+            _RESTART_PENDING = False
+            if claims_paused:
+                await _resume_blueprints_provider_claims()
+            await _update_git_pull_operation(
+                operation_id,
+                "blocked",
+                {**operation_evidence, "reason": exc.code, "detail": exc.detail},
+                exc.code,
+            )
+            log.warning("git pull batch%s restart refused: %s", source_label, exc.code)
+            return {"ok": False, "code": exc.code, "detail": exc.detail}
+        except Exception as exc:
+            _RESTART_PENDING = False
+            if claims_paused:
+                await _resume_blueprints_provider_claims()
+            code = str(exc).split(":", 1)[0] if str(exc) else type(exc).__name__
+            await _update_git_pull_operation(
+                operation_id,
+                "failed",
+                {
+                    **operation_evidence,
+                    "reason": code,
+                    "error_class": type(exc).__name__,
+                },
+                code,
+            )
+            log.exception("git pull batch%s failed", source_label)
+            return {"ok": False, "code": code}
 
 
 def _restart_command_parts() -> list[str]:
@@ -313,7 +777,13 @@ def _restart_command_parts() -> list[str]:
     return parts
 
 
-async def _restart_service() -> bool:
+async def _restart_service(
+    *,
+    operation_id: str | None = None,
+    expected_runtime_heads: dict[str, str] | None = None,
+    guard_before: dict[str, Any] | None = None,
+    claims_already_paused: bool = False,
+) -> bool:
     """Run SERVICE_RESTART_CMD, logging the outcome.
 
     Sleep briefly first so the HTTP response that triggered this call
@@ -324,22 +794,48 @@ async def _restart_service() -> bool:
         log.info("closing %d SSE subscriber(s) before restart", subscriber_count)
         await events_bus.close_all()
     await asyncio.sleep(1)
-    parts = _restart_command_parts()
-    if not parts:
-        return False
-    log.info("service restart requested: %s", " ".join(parts))
-    proc = await asyncio.create_subprocess_exec(
-        *parts,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    providers = (
+        list((guard_before or {}).get("providers") or [])
+        if claims_already_paused
+        else await _pause_blueprints_provider_claims()
     )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode == 0:
-        log.info("service restart: %s", stdout.decode().strip() or "ok")
-        return True
-    else:
+    dispatched_successfully = False
+    try:
+        scheduler_immediately_before = await _scheduler_quiescence_snapshot()
+        parts = _restart_command_parts()
+        if not parts:
+            return False
+        await _update_git_pull_operation(
+            operation_id,
+            "restart_requested",
+            {
+                "expected_runtime_heads": expected_runtime_heads or {},
+                "guard_before_pull": guard_before or {},
+                "guard_immediately_before_restart": {
+                    "providers": providers,
+                    "scheduler": scheduler_immediately_before,
+                },
+                "initiating_node_id": cfg.NODE_ID,
+                "initiating_pid": os.getpid(),
+                "process_started_at": _PROCESS_STARTED_AT,
+            },
+        )
+        log.info("service restart requested: %s", " ".join(parts))
+        proc = await asyncio.create_subprocess_exec(
+            *parts,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            dispatched_successfully = True
+            log.info("service restart: %s", stdout.decode().strip() or "ok")
+            return True
         log.warning("service restart failed: %s", stderr.decode().strip())
         return False
+    finally:
+        if not dispatched_successfully:
+            await _resume_blueprints_provider_claims()
 
 
 # ── Internal helper: apply one sync action ────────────────────────────────────
@@ -915,8 +1411,82 @@ async def receive_actions(payload: SyncActionsPayload) -> Response:
     return Response(status_code=204)
 
 
-@router.post("/git-pull", status_code=204)
-async def trigger_git_pull(payload: GitPullRequest) -> Response:
+def _enqueue_git_pull_scopes_sync(scopes: list[str]) -> None:
+    with get_conn() as conn:
+        gen = get_gen(conn)
+        for scope in scopes:
+            action_type = f"sync_git_{scope}"
+            enqueue_for_all_peers(conn, action_type, "_system", scope, None, gen)
+
+
+async def _reconcile_git_pull_operation(receipt: dict[str, Any]) -> dict[str, Any]:
+    if receipt.get("status") != "restart_requested":
+        return receipt
+    result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+    expected = result.get("expected_runtime_heads")
+    if not isinstance(expected, dict) or not expected:
+        return receipt
+    if result.get("initiating_node_id") != cfg.NODE_ID:
+        return receipt
+    process_started = _parse_sync_updated_at(_PROCESS_STARTED_AT)
+    initiating_process_started = _parse_sync_updated_at(result.get("process_started_at"))
+    if (
+        process_started is None
+        or initiating_process_started is None
+        or process_started <= initiating_process_started
+    ):
+        return receipt
+    if expected != _RUNNING_RUNTIME_REPO_HEADS:
+        return receipt
+    completed = {
+        **result,
+        "completed_node_id": cfg.NODE_ID,
+        "completed_process_started_at": _PROCESS_STARTED_AT,
+        "running_runtime_heads": dict(_RUNNING_RUNTIME_REPO_HEADS),
+        "restart_observed": True,
+    }
+    updated = await _update_git_pull_operation(str(receipt["operation_id"]), "completed", completed)
+    assert updated is not None
+    return updated
+
+
+async def _run_tracked_git_pull_operation(
+    operation_id: str,
+    scopes: list[str],
+    expected_head: str,
+) -> None:
+    try:
+        await _git_pull_scopes_and_maybe_restart(
+            scopes,
+            source=f"local operation {operation_id}",
+            operation_id=operation_id,
+            expected_head=expected_head,
+        )
+    finally:
+        _ACTIVE_GIT_PULL_OPERATION_IDS.discard(operation_id)
+
+
+async def _run_guarded_restart() -> None:
+    global _RESTART_PENDING
+    try:
+        async with _GIT_PULL_LOCK:
+            if _RESTART_PENDING:
+                log.warning("service restart refused: restart_already_pending")
+                return
+            _RESTART_PENDING = True
+            restarted = await _restart_service()
+            if not restarted:
+                _RESTART_PENDING = False
+    except SchedulerRestartRefused as exc:
+        _RESTART_PENDING = False
+        log.warning("service restart refused: %s detail=%s", exc.code, exc.detail)
+    except Exception:
+        _RESTART_PENDING = False
+        log.exception("service restart failed before command completion")
+
+
+@router.post("/git-pull")
+async def trigger_git_pull(payload: GitPullRequest, request: Request) -> Response:
     """
     Trigger a git pull on this node and enqueue sync_git actions for all peers.
     scope: "outer" | "inner" | "both" | "non_root" | "all"
@@ -932,11 +1502,42 @@ async def trigger_git_pull(payload: GitPullRequest) -> Response:
     else:
         scopes = [payload.scope]
 
-    with get_conn() as conn:
-        gen = get_gen(conn)
-        for scope in scopes:
-            action_type = f"sync_git_{scope}"
-            enqueue_for_all_peers(conn, action_type, "_system", scope, None, gen)
+    if payload.local_only:
+        if not _raw_client_is_loopback(request):
+            raise HTTPException(403, "local_only git pull requires a raw loopback connection")
+        if payload.scope != "outer":
+            raise HTTPException(400, "local_only git pull currently supports scope='outer' only")
+        if payload.operation_id is None or payload.expected_head is None:
+            raise HTTPException(
+                400,
+                "local_only git pull requires operation_id and expected_head",
+            )
+        try:
+            receipt = await timing.to_thread(
+                "sync.git_pull_operation_create",
+                _git_pull_operation_create_sync,
+                payload.operation_id,
+                scopes,
+                payload.expected_head,
+            )
+        except GitPullOperationConflict as exc:
+            raise HTTPException(409, str(exc)) from None
+        resumable = receipt.get("status") in {"queued", "pulling"}
+        if resumable and payload.operation_id not in _ACTIVE_GIT_PULL_OPERATION_IDS:
+            _ACTIVE_GIT_PULL_OPERATION_IDS.add(payload.operation_id)
+            asyncio.create_task(
+                _run_tracked_git_pull_operation(
+                    payload.operation_id,
+                    scopes,
+                    payload.expected_head,
+                )
+            )
+        return JSONResponse(status_code=202, content=receipt)
+
+    if payload.operation_id is not None or payload.expected_head is not None:
+        raise HTTPException(400, "operation_id and expected_head require local_only=true")
+
+    await timing.to_thread("sync.git_pull_broadcast_enqueue", _enqueue_git_pull_scopes_sync, scopes)
 
     _invalidate_sync_status_cache()
     asyncio.create_task(_git_pull_scopes_and_maybe_restart(scopes, source="local trigger"))
@@ -945,12 +1546,41 @@ async def trigger_git_pull(payload: GitPullRequest) -> Response:
     return Response(status_code=204)
 
 
+@router.get("/git-pull/{operation_id}")
+async def git_pull_operation(operation_id: str) -> dict[str, Any]:
+    if _GIT_PULL_OPERATION_ID.fullmatch(operation_id) is None:
+        raise HTTPException(404, "git-pull operation not found")
+    receipt = await timing.to_thread(
+        "sync.git_pull_operation_get",
+        _git_pull_operation_get_sync,
+        operation_id,
+    )
+    if receipt is None:
+        raise HTTPException(404, "git-pull operation not found")
+    return await _reconcile_git_pull_operation(receipt)
+
+
+@router.get("/git-pull-capabilities")
+async def git_pull_capabilities() -> dict[str, Any]:
+    """Advertise the fail-closed node-local deployment protocol without mutation."""
+    return {
+        "schema": "xarta.blueprints.git_pull_capabilities.v1",
+        "node_id": cfg.NODE_ID,
+        "local_only": True,
+        "broadcast": False,
+        "operation_receipt_schema": "xarta.blueprints.git_pull_operation.v1",
+        "supported_scopes": ["outer"],
+        "restart_guard": "scheduler-and-provider-quiescence-v1",
+        "exact_expected_head": True,
+    }
+
+
 @router.post("/restart", status_code=204)
 async def trigger_restart() -> Response:
     """Restart the blueprints-app service on this node (via SERVICE_RESTART_CMD)."""
     if not cfg.SERVICE_RESTART_CMD:
         raise HTTPException(503, "SERVICE_RESTART_CMD not configured on this node")
-    asyncio.create_task(_restart_service())
+    asyncio.create_task(_run_guarded_restart())
     log.info("service restart triggered via API")
     return Response(status_code=204)
 

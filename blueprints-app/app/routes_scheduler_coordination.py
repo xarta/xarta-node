@@ -187,6 +187,25 @@ class SchedulerCoordinationBridge:
             self._failure(exc)
             raise
 
+    async def local_get_json(self, path: str) -> dict[str, Any]:
+        """Fetch one bounded object from the lifecycle-owned local client."""
+        if not path.startswith("/") or "//" in path or "?" in path or "#" in path:
+            raise ValueError("Local scheduler path is not a bounded absolute path")
+        try:
+            response = await self._local().get(path)
+            self.local_request_count += 1
+            response.raise_for_status()
+            if not response.content or len(response.content) > MAX_PLAN_BYTES:
+                raise RuntimeError("Local scheduler JSON response is empty or unbounded")
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError("Local scheduler JSON response is not an object")
+            self._success()
+            return payload
+        except Exception as exc:
+            self._failure(exc)
+            raise
+
     async def peer_get_plan(self, prime_node_id: str) -> bytes:
         urls = list(cfg.PEER_SYNC_URLS.get(prime_node_id, []))
         if not urls:
@@ -318,6 +337,10 @@ async def start_scheduler_coordination_bridge() -> None:
 
 async def stop_scheduler_coordination_bridge() -> None:
     await bridge.stop()
+
+
+async def scheduler_local_get_json(path: str) -> dict[str, Any]:
+    return await bridge.local_get_json(path)
 
 
 @router.get("/identity")

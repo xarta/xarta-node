@@ -98,6 +98,53 @@ def claim(run_id="run-1", target_key=scheduler.AUTOMATION_TARGET_KEY):
     }
 
 
+@async_test
+async def test_restart_pause_waits_for_inflight_claim_materialization(monkeypatch):
+    async_client = client(lambda _: None)
+    instance = scheduler.KanbanAutomationScheduler(config=config(), client=async_client)
+    instance.worker_id = "test-worker"
+    entered = asyncio.Event()
+    release_response = asyncio.Event()
+    keep_target = asyncio.Event()
+    request_count = 0
+
+    async def request_json(method, path, **_kwargs):
+        nonlocal request_count
+        assert method == "POST"
+        assert path.endswith("/claims/next")
+        request_count += 1
+        entered.set()
+        await release_response.wait()
+        return {"claim": claim("run-race")}
+
+    async def run_claim(_claim):
+        await keep_target.wait()
+
+    async def current_producer():
+        return {**producer_config("scheduler"), "legacy_loop_effective_enabled": False}
+
+    monkeypatch.setattr(instance, "_request_json", request_json)
+    monkeypatch.setattr(instance, "_run_claim", run_claim)
+    monkeypatch.setattr(instance, "_producer_config", current_producer)
+    claim_loop = asyncio.create_task(instance._claim_loop(), name="kanban-scheduler-claims")
+    instance._loop_tasks = [claim_loop]
+    await entered.wait()
+
+    pause_task = asyncio.create_task(instance.pause_new_claims_for_restart())
+    await asyncio.sleep(0)
+    assert pause_task.done() is False
+    release_response.set()
+    paused = await asyncio.wait_for(pause_task, timeout=0.2)
+
+    assert paused["active_run_ids"] == ["run-race"]
+    assert request_count == 1
+    await asyncio.sleep(0.03)
+    assert request_count == 1
+    assert await instance.resume_new_claims_after_restart_abort() is True
+    await instance.stop()
+    await async_client.aclose()
+
+
 def test_producer_modes_default_legacy_and_invalid_fail_closed(monkeypatch):
     monkeypatch.setenv(routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV, "test-node")
     monkeypatch.delenv(routes_personal.KANBAN_AUTOMATION_PRODUCER_MODE_ENV, raising=False)

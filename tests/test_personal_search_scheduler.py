@@ -143,6 +143,60 @@ def scheduler_handler(payloads, seen=None):
     return handler
 
 
+@async_test
+async def test_restart_pause_waits_for_inflight_claim_materialization():
+    instance = scheduler.PersonalSearchScheduler(config=config(), client=client(lambda _: None))
+    instance.worker_id = "test-worker"
+    entered = asyncio.Event()
+    release_response = asyncio.Event()
+    keep_target = asyncio.Event()
+    request_count = 0
+
+    async def request_json(method, path, **_kwargs):
+        nonlocal request_count
+        assert method == "POST"
+        assert path.endswith("/claims/next")
+        request_count += 1
+        entered.set()
+        await release_response.wait()
+        return {
+            "claim": {
+                "actionable": True,
+                "run": {"run_id": "run-race", "target_key": scheduler.TARGET_KEY},
+                "target_config": {},
+                "claim_token": "c" * 40,
+                "fence_token": 7,
+                "lease_until": "2999-01-01T00:00:00+00:00",
+                "policies": {"lease_seconds": 60},
+            }
+        }
+
+    async def run_claim(_claim):
+        await keep_target.wait()
+
+    instance._request_json = request_json
+    instance._run_claim = run_claim
+    claim_loop = asyncio.create_task(
+        instance._claim_loop(), name="personal-search-scheduler-claims"
+    )
+    instance._loop_tasks = [claim_loop]
+    await entered.wait()
+
+    pause_task = asyncio.create_task(instance.pause_new_claims_for_restart())
+    await asyncio.sleep(0)
+    assert pause_task.done() is False
+    release_response.set()
+    paused = await asyncio.wait_for(pause_task, timeout=0.2)
+
+    assert paused["active_run_ids"] == ["run-race"]
+    assert request_count == 1
+    await asyncio.sleep(0.03)
+    assert request_count == 1
+    assert await instance.resume_new_claims_after_restart_abort() is True
+    await instance.stop()
+    await instance.client.aclose()
+
+
 def test_source_signature_covers_imports_and_discussions(monkeypatch):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row

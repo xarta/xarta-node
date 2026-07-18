@@ -93,6 +93,22 @@ CREATE TABLE IF NOT EXISTS sync_seen_guids (
     received_at INTEGER NOT NULL       -- unix epoch; purged after 3 days
 );
 
+-- Node-local, bounded audit/receipt state for explicit git-pull operations.
+-- This table is intentionally excluded from fleet row sync: each receipt
+-- describes work owned by this exact Blueprints process/node.
+CREATE TABLE IF NOT EXISTS sync_git_pull_operations (
+    operation_id   TEXT PRIMARY KEY,
+    request_json   TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    result_json    TEXT NOT NULL DEFAULT '{}',
+    error_code     TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_git_pull_operations_updated
+    ON sync_git_pull_operations(updated_at DESC, operation_id DESC);
+
 CREATE TABLE IF NOT EXISTS disks_notes (
     node_id    TEXT PRIMARY KEY,
     note       TEXT NOT NULL DEFAULT '',
