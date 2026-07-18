@@ -4806,9 +4806,7 @@ def _review_lease_is_active(row: Any | None, now_dt: datetime | None = None) -> 
 
 
 def _review_lease_owner_matches(row: Any, holder_id: str, lease_token: str = "") -> bool:
-    if row["holder_id"] != holder_id:
-        return False
-    return not lease_token or row["lease_token"] == lease_token
+    return bool(lease_token) and row["holder_id"] == holder_id and row["lease_token"] == lease_token
 
 
 def _row_to_work_review_processor_lease(
@@ -24276,6 +24274,9 @@ async def run_work_kanban_automation_idle_tick(
     if isinstance(source_metadata_extra, dict) and source_metadata_extra:
         source_metadata.update(source_metadata_extra)
 
+    tick_lease_ttl_seconds = max(ttl_seconds, timeout_seconds)
+    source_metadata["tick_lease_ttl_seconds"] = tick_lease_ttl_seconds
+
     # Fence the complete tick, including scans. A unique token prevents two
     # invocations using the same configured holder id from refreshing and
     # sharing one lease.
@@ -24285,7 +24286,7 @@ async def run_work_kanban_automation_idle_tick(
             holder_id=clean_holder_id,
             item_id=clean_item_id or None,
             lease_token=tick_lease_token,
-            ttl_seconds=ttl_seconds,
+            ttl_seconds=tick_lease_ttl_seconds,
             actor=clean_actor,
             source_surface=clean_source_surface,
             request_id=f"{clean_request_id}-lease",
@@ -24329,6 +24330,76 @@ async def run_work_kanban_automation_idle_tick(
         }
     lease_token = lease["lease"].get("lease_token") or ""
 
+    async def heartbeat_tick_lease(request_suffix: str) -> dict[str, Any]:
+        heartbeat = await heartbeat_work_review_processor_lease(
+            WorkReviewProcessorLeaseRequest(
+                holder_id=clean_holder_id,
+                item_id=clean_item_id or None,
+                lease_token=lease_token,
+                ttl_seconds=tick_lease_ttl_seconds,
+                actor=clean_actor,
+                source_surface=clean_source_surface,
+                request_id=f"{clean_request_id}-{request_suffix}",
+                run_id=clean_run_id,
+                metadata=source_metadata,
+            )
+        )
+        if not heartbeat.get("heartbeated"):
+            reason = _clean_short_text(
+                str(heartbeat.get("reason") or "lease_not_active"),
+                "lease_not_active",
+                limit=160,
+            )
+            raise HTTPException(409, f"Review Processor tick lease lost: {reason}")
+        return heartbeat
+
+    async def release_tick_lease(
+        request_suffix: str, *, suppress_release_errors: bool = False
+    ) -> dict[str, Any]:
+        release_task = asyncio.create_task(
+            release_work_review_processor_lease(
+                WorkReviewProcessorLeaseRequest(
+                    holder_id=clean_holder_id,
+                    item_id=clean_item_id or None,
+                    lease_token=lease_token,
+                    actor=clean_actor,
+                    source_surface=clean_source_surface,
+                    request_id=f"{clean_request_id}-{request_suffix}",
+                    run_id=clean_run_id,
+                    metadata=source_metadata,
+                )
+            )
+        )
+        try:
+            return await asyncio.shield(release_task)
+        except asyncio.CancelledError:
+            # Finish the exact-token release, but never turn task cancellation
+            # into a successful tick response.
+            try:
+                await release_task
+            except Exception as exc:
+                log.warning(
+                    "Kanban automation tick lease release failed during cancellation "
+                    "run_id=%s error=%s",
+                    clean_run_id,
+                    type(exc).__name__,
+                )
+            raise
+        except Exception as exc:
+            log.warning(
+                "Kanban automation tick lease release failed run_id=%s error=%s",
+                clean_run_id,
+                type(exc).__name__,
+            )
+            if not suppress_release_errors:
+                raise
+            return {
+                "ok": False,
+                "released": False,
+                "reason": "lease_release_failed",
+                "error_class": type(exc).__name__,
+            }
+
     try:
         timeout_requeue: dict[str, Any]
         if clean_processor_kind == "preprocessing":
@@ -24350,6 +24421,7 @@ async def run_work_kanban_automation_idle_tick(
                     metadata=source_metadata,
                 )
             )
+        await heartbeat_tick_lease("heartbeat-after-timeout-requeue")
         review_scan: dict[str, Any]
         if clean_processor_kind == "preprocessing":
             review_scan = {
@@ -24370,6 +24442,7 @@ async def run_work_kanban_automation_idle_tick(
                     metadata=source_metadata,
                 )
             )
+        await heartbeat_tick_lease("heartbeat-after-review-scan")
         preprocessing_scan = await trigger_work_preprocessing_idle_scan(
             WorkPreprocessingIdleScanRequest(
                 item_id=clean_item_id or None,
@@ -24381,40 +24454,19 @@ async def run_work_kanban_automation_idle_tick(
                 metadata=source_metadata,
             )
         )
+        await heartbeat_tick_lease("heartbeat-after-preprocessing-scan")
         eligible_marker_ids = await _run_personal_sync_work(
             _work_queued_processor_marker_ids_for_item_sync,
             clean_item_id,
             processor_kind=clean_processor_kind or None,
         )
     except BaseException:
-        await release_work_review_processor_lease(
-            WorkReviewProcessorLeaseRequest(
-                holder_id=clean_holder_id,
-                item_id=clean_item_id or None,
-                lease_token=lease_token,
-                actor=clean_actor,
-                source_surface=clean_source_surface,
-                request_id=f"{clean_request_id}-release-after-scan-error",
-                run_id=clean_run_id,
-                metadata=source_metadata,
-            )
-        )
+        await release_tick_lease("release-after-scan-error", suppress_release_errors=True)
         raise
 
     try:
         for index in range(process_limit):
-            await heartbeat_work_review_processor_lease(
-                WorkReviewProcessorLeaseRequest(
-                    holder_id=clean_holder_id,
-                    item_id=clean_item_id or None,
-                    lease_token=lease_token,
-                    ttl_seconds=ttl_seconds,
-                    actor=clean_actor,
-                    source_surface=clean_source_surface,
-                    request_id=f"{clean_request_id}-heartbeat-{index}",
-                    run_id=clean_run_id,
-                )
-            )
+            await heartbeat_tick_lease(f"heartbeat-{index}")
             try:
                 claimed = await claim_next_work_review_processor_marker(
                     WorkReviewProcessorMarkerClaimRequest(
@@ -24462,19 +24514,11 @@ async def run_work_kanban_automation_idle_tick(
                     run_id=clean_run_id,
                 )
             )
-    finally:
-        release = await release_work_review_processor_lease(
-            WorkReviewProcessorLeaseRequest(
-                holder_id=clean_holder_id,
-                item_id=clean_item_id or None,
-                lease_token=lease_token,
-                actor=clean_actor,
-                source_surface=clean_source_surface,
-                request_id=f"{clean_request_id}-release",
-                run_id=clean_run_id,
-                metadata=source_metadata,
-            )
-        )
+    except BaseException:
+        await release_tick_lease("release-after-processing-error", suppress_release_errors=True)
+        raise
+    else:
+        release = await release_tick_lease("release")
     return {
         "ok": True,
         "schema": KANBAN_AUTOMATION_IDLE_WORKER_SCHEMA,
@@ -24818,25 +24862,60 @@ async def trigger_work_preprocessing_idle_scan(
     return await _run_personal_sync_work(_trigger_work_preprocessing_idle_scan_sync, body)
 
 
-def _work_preprocessing_scan_cursor(conn: Any) -> dict[str, str]:
-    """Return the latest serialized global scan cursor without per-item writes."""
-    row = conn.execute(
+def _work_preprocessing_scan_cursor(conn: Any) -> dict[str, Any]:
+    """Return one bounded, monotonic global cursor without per-item writes."""
+    rows = conn.execute(
         """
-        SELECT audit_id, metadata_json
+        SELECT audit_id, created_at, metadata_json
         FROM kanban_audit_log
         WHERE action='trigger_preprocessing_idle_scan'
           AND result='ok'
           AND COALESCE(item_id, '')=''
         ORDER BY created_at DESC, audit_id DESC
-        LIMIT 1
+        LIMIT 32
         """
-    ).fetchone()
-    metadata = _json_value(row["metadata_json"], {}) if row is not None else {}
+    ).fetchall()
+    if not rows:
+        return {"audit_id": "", "item_id": "", "generation": 0}
+
+    entries: list[dict[str, Any]] = []
+    referenced_ids: set[str] = set()
+    for row in rows:
+        metadata = _json_value(row["metadata_json"], {})
+        previous_audit_id = _clean_short_text(
+            str(metadata.get("scan_cursor_previous_audit_id") or ""),
+            "",
+            limit=180,
+        )
+        if previous_audit_id:
+            referenced_ids.add(previous_audit_id)
+        try:
+            generation = max(0, int(metadata.get("scan_cursor_generation") or 0))
+        except (TypeError, ValueError):
+            generation = 0
+        entries.append(
+            {
+                "row": row,
+                "metadata": metadata,
+                "generation": generation,
+                "created_at": str(row["created_at"] or ""),
+                "audit_id": str(row["audit_id"] or ""),
+            }
+        )
+
+    highest_generation = max(entry["generation"] for entry in entries)
+    generation_entries = [entry for entry in entries if entry["generation"] == highest_generation]
+    tips = [entry for entry in generation_entries if entry["audit_id"] not in referenced_ids]
+    selected = max(
+        tips or generation_entries,
+        key=lambda entry: (entry["created_at"], entry["audit_id"]),
+    )
+    row = selected["row"]
+    metadata = selected["metadata"]
     return {
-        "audit_id": _clean_short_text(
-            str(row["audit_id"] if row is not None else ""), "", limit=180
-        ),
+        "audit_id": _clean_short_text(str(row["audit_id"]), "", limit=180),
         "item_id": _clean_short_text(str(metadata.get("scan_cursor_item_id") or ""), "", limit=180),
+        "generation": selected["generation"],
     }
 
 
@@ -24964,10 +25043,14 @@ def _trigger_work_preprocessing_idle_scan_sync(
             }
 
         scan_cursor = (
-            {"audit_id": "", "item_id": ""} if scope_ids else _work_preprocessing_scan_cursor(conn)
+            {"audit_id": "", "item_id": "", "generation": 0}
+            if scope_ids
+            else _work_preprocessing_scan_cursor(conn)
         )
         scan_cursor_audit_id = scan_cursor["audit_id"]
         scan_cursor_item_id = scan_cursor["item_id"]
+        scan_cursor_generation = int(scan_cursor["generation"] or 0)
+        next_scan_cursor_generation = 0 if scope_ids else scan_cursor_generation + 1
         args: list[Any] = []
         where = f"""
         WHERE {_work_preprocessing_candidate_predicate("item")}
@@ -25293,6 +25376,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "unchanged_cancelled_count": unchanged_cancelled,
                 "scan_cursor_previous_item_id": scan_cursor_item_id,
                 "scan_cursor_previous_audit_id": scan_cursor_audit_id,
+                "scan_cursor_generation": next_scan_cursor_generation,
                 "scan_cursor_item_id": next_scan_cursor_item_id,
                 "scan_cursor_wrapped": scan_cursor_wrapped,
             }
@@ -25331,6 +25415,7 @@ def _trigger_work_preprocessing_idle_scan_sync(
                 "unchanged_cancelled_count": unchanged_cancelled,
                 "scan_cursor_previous_item_id": scan_cursor_item_id,
                 "scan_cursor_previous_audit_id": scan_cursor_audit_id,
+                "scan_cursor_generation": next_scan_cursor_generation,
                 "scan_cursor_item_id": next_scan_cursor_item_id,
                 "scan_cursor_wrapped": scan_cursor_wrapped,
                 "provider_mode": _work_review_processing_policy()["active_mode"],
@@ -25501,6 +25586,8 @@ def _trigger_work_preprocessing_idle_scan_sync(
             "scope": "scoped" if scope_ids else "global",
             "previous_audit_id": scan_cursor_audit_id,
             "audit_id": audit_id,
+            "previous_generation": scan_cursor_generation,
+            "generation": next_scan_cursor_generation,
             "previous_item_id": scan_cursor_item_id,
             "item_id": next_scan_cursor_item_id,
             "wrapped": scan_cursor_wrapped,

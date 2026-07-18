@@ -19,9 +19,10 @@
   },
   "tick_serialization": {
     "lease_scope": "The durable Review Processor lease is acquired before timeout requeue, Review discovery, preprocessing discovery, eligible-marker reads, claims, or model processing and is released after the complete tick.",
-    "run_fencing": "Every tick supplies a unique nonempty lease token, including ticks that share the configured holder id or scheduler worker identity.",
+    "run_fencing": "Every tick supplies a unique nonempty lease token, including ticks that share the configured holder id or scheduler worker identity. A supplied token matches only the exact stored token; holder identity alone cannot refresh another run's active lease.",
     "competing_tick_result": "Return active_lease with lease_acquired=false and explicit skipped scan/requeue results; do not scan, claim, process, or wait for the active tick.",
-    "failure_cleanup": "Release the exact token-owned lease when a scan or later phase raises; otherwise retain only the bounded expiry recovery path."
+    "lease_duration": "The effective whole-tick lease is never shorter than the configured marker-processing timeout. Heartbeat after timeout requeue, Review scan, preprocessing scan, and before every claim so no completed phase consumes the remaining lease budget.",
+    "failure_cleanup": "Release the exact token-owned lease when a scan or later phase raises. A release failure is reported and logged without masking the original timeout; cancellation remains cancellation while the shielded exact-token release is allowed to finish. Bounded expiry remains the recovery path."
   },
   "postgres_timeout_contract": {
     "pool_timeout": "Return HTTP 503 with Retry-After and kanban_postgres_pool_saturated.",
@@ -169,7 +170,7 @@
       "rollups"
     ],
     "readiness_marker_storage": "kanban_agent_hints.metadata.context_readiness_marker",
-    "scan_coverage_rule": "A bounded global scan must not repeatedly select the same current marked leaves. Missing readiness remains first priority; marked candidates advance through the latest successful serialized global scan audit so every eligible ToDo leaf is eventually rebuilt against the complete normalized context manifest without per-item heartbeat writes. Cursor lineage remains in scan_cursor_previous_audit_id, but lookup must use the indexed latest-action ordering and must not self-join the audit ledger or parse successor JSON.",
+    "scan_coverage_rule": "A bounded global scan must not repeatedly select the same current marked leaves. Missing readiness remains first priority; marked candidates advance through a monotonic scan_cursor_generation plus scan_cursor_previous_audit_id lineage so every eligible ToDo leaf is eventually rebuilt against the complete normalized context manifest without per-item heartbeat writes. Cursor lookup reads at most the 32 latest successful global scan audits through the existing action/time index path, resolves legacy same-second lineage in memory, and must not self-join the audit ledger or parse successor JSON in SQL.",
     "scan_database_boundary": "Cursor lookup, candidate selection, context rebuilding, and marker writes remain inside the existing measured synchronous scan worker and Kanban connection boundary reached through _run_personal_sync_work. No synchronous SQLite or PostgreSQL work is added to the async route or Blueprints event loop.",
     "queue_rule": "Queue when an eligible ToDo leaf is not backed by a processed preprocessing marker for the exact current normalized source hash, unless a current queued or processing marker already exists. A fresh context_readiness_marker in agent hints is semantic evidence, not an operational readiness attestation by itself.",
     "operator_authorized_recovery_rule": "An explicit current operator request to work one named leaf may use the dedicated recovery surface only for the initial missing-readiness case or a clean queued marker for the exact source. The server rechecks candidacy, owner/manual recovery, profile health, sessions, lease, marker state, and source; it forces one preprocessing-only scan/claim and preserves requester/authorization metadata separately from canonical worker provenance. It never writes readiness directly or bypasses failure, retry, awaiting_operator, stale, terminal, exclusion, lane, session, schedule, target, or ownership guards.",

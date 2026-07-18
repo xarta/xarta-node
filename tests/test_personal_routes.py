@@ -4043,6 +4043,121 @@ def test_kanban_idle_worker_fences_same_holder_ticks_before_all_scans(monkeypatc
     assert all(tick["eligible_marker_count"] == 0 for tick in ticks)
 
 
+def test_review_processor_lease_fences_same_holder_by_exact_token(monkeypatch):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+
+    token_a = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="same-holder",
+                lease_token="tick-token-a",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="lease-token-a",
+            )
+        )
+    )
+    token_b_blocked = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="same-holder",
+                lease_token="tick-token-b",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="lease-token-b-blocked",
+            )
+        )
+    )
+
+    assert token_a["acquired"] is True
+    assert token_a["lease"]["lease_token"] == "tick-token-a"
+    assert token_b_blocked["acquired"] is False
+    assert token_b_blocked["reason"] == "active_lease"
+
+    blank_token_blocked = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="same-holder",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="lease-blank-token-blocked",
+            )
+        )
+    )
+    assert blank_token_blocked["acquired"] is False
+    assert blank_token_blocked["reason"] == "active_lease"
+
+    blank_heartbeat = asyncio.run(
+        routes_personal.heartbeat_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="same-holder",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="lease-blank-heartbeat-blocked",
+            )
+        )
+    )
+    assert blank_heartbeat["heartbeated"] is False
+    assert blank_heartbeat["reason"] == "not_lease_owner"
+
+    wrong_release = asyncio.run(
+        routes_personal.release_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="same-holder",
+                lease_token="wrong-token",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="lease-wrong-release-blocked",
+            )
+        )
+    )
+    assert wrong_release["released"] is False
+    assert wrong_release["reason"] == "not_lease_owner"
+
+    with pytest.raises(routes_personal.HTTPException, match="another worker") as claim_error:
+        asyncio.run(
+            routes_personal.claim_next_work_review_processor_marker(
+                routes_personal.WorkReviewProcessorMarkerClaimRequest(
+                    holder_id="same-holder",
+                    eligible_marker_ids=[],
+                    actor="codex-test",
+                    source_surface="pytest",
+                    request_id="lease-blank-claim-blocked",
+                )
+            )
+        )
+    assert claim_error.value.status_code == 409
+    conn.rollback()
+
+    released_a = asyncio.run(
+        routes_personal.release_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="same-holder",
+                lease_token="tick-token-a",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="lease-token-a-release",
+            )
+        )
+    )
+    assert released_a["released"] is True
+
+    token_b = asyncio.run(
+        routes_personal.acquire_work_review_processor_lease(
+            routes_personal.WorkReviewProcessorLeaseRequest(
+                holder_id="same-holder",
+                lease_token="tick-token-b",
+                actor="codex-test",
+                source_surface="pytest",
+                request_id="lease-token-b",
+            )
+        )
+    )
+    assert token_b["acquired"] is True
+    assert token_b["lease"]["lease_token"] == "tick-token-b"
+
+
 def test_kanban_idle_worker_releases_tick_lease_when_a_scan_fails(monkeypatch):
     monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
     monkeypatch.setenv(
@@ -4050,8 +4165,10 @@ def test_kanban_idle_worker_releases_tick_lease_when_a_scan_fails(monkeypatch):
         "test-node",
     )
     released_tokens = []
+    acquired_ttls = []
 
     async def acquired(body):
+        acquired_ttls.append(body.ttl_seconds)
         return {
             "ok": True,
             "acquired": True,
@@ -4089,11 +4206,276 @@ def test_kanban_idle_worker_releases_tick_lease_when_a_scan_fails(monkeypatch):
                 max_process_items=1,
                 holder_id="scan-failure-holder",
                 run_id="scan-failure-run",
+                lease_ttl_seconds=60,
+                marker_timeout_seconds=60,
             )
         )
 
     assert len(released_tokens) == 1
     assert released_tokens[0].startswith("tick-")
+    assert acquired_ttls == [60]
+
+
+def test_kanban_idle_worker_release_failure_does_not_mask_scan_error(monkeypatch, caplog):
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "test-node",
+    )
+
+    async def acquired(body):
+        return {
+            "ok": True,
+            "acquired": True,
+            "reason": "acquired",
+            "lease": {"lease_token": body.lease_token},
+        }
+
+    async def failed_requeue(*_args, **_kwargs):
+        raise RuntimeError("original scan failure")
+
+    async def failed_release(_body):
+        raise ValueError("release failure")
+
+    monkeypatch.setattr(
+        routes_personal,
+        "acquire_work_review_processor_lease",
+        acquired,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "requeue_timed_out_work_review_processor_markers",
+        failed_requeue,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "release_work_review_processor_lease",
+        failed_release,
+    )
+
+    with pytest.raises(RuntimeError, match="original scan failure"):
+        asyncio.run(
+            routes_personal.run_work_kanban_automation_idle_tick(
+                max_scan_items=1,
+                max_process_items=1,
+                holder_id="release-failure-holder",
+                run_id="release-failure-run",
+                lease_ttl_seconds=60,
+                marker_timeout_seconds=60,
+            )
+        )
+
+    assert "tick lease release failed" in caplog.text
+    assert "ValueError" in caplog.text
+
+
+def test_kanban_idle_worker_stops_before_next_scan_when_phase_heartbeat_loses_lease(
+    monkeypatch,
+):
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "test-node",
+    )
+    release_count = 0
+
+    async def acquired(body):
+        return {
+            "ok": True,
+            "acquired": True,
+            "reason": "acquired",
+            "lease": {"lease_token": body.lease_token},
+        }
+
+    async def requeued(*_args, **_kwargs):
+        return {"ok": True}
+
+    async def lease_lost(*_args, **_kwargs):
+        return {"ok": True, "heartbeated": False, "reason": "inactive_or_expired_lease"}
+
+    async def forbidden_scan(*_args, **_kwargs):
+        raise AssertionError("a tick that lost its lease must not start the next scan")
+
+    async def released(_body):
+        nonlocal release_count
+        release_count += 1
+        return {"ok": True, "released": False, "reason": "no_active_lease"}
+
+    monkeypatch.setattr(routes_personal, "acquire_work_review_processor_lease", acquired)
+    monkeypatch.setattr(
+        routes_personal,
+        "requeue_timed_out_work_review_processor_markers",
+        requeued,
+    )
+    monkeypatch.setattr(routes_personal, "heartbeat_work_review_processor_lease", lease_lost)
+    monkeypatch.setattr(
+        routes_personal,
+        "trigger_work_review_processor_idle_scan",
+        forbidden_scan,
+    )
+    monkeypatch.setattr(routes_personal, "release_work_review_processor_lease", released)
+
+    with pytest.raises(routes_personal.HTTPException, match="tick lease lost") as error:
+        asyncio.run(
+            routes_personal.run_work_kanban_automation_idle_tick(
+                max_scan_items=1,
+                max_process_items=1,
+                holder_id="lost-lease-holder",
+                run_id="lost-lease-run",
+            )
+        )
+
+    assert error.value.status_code == 409
+    assert release_count == 1
+
+
+def test_kanban_idle_worker_release_failure_does_not_mask_processing_error(monkeypatch, caplog):
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "test-node",
+    )
+
+    async def acquired(body):
+        return {
+            "ok": True,
+            "acquired": True,
+            "reason": "acquired",
+            "lease": {"lease_token": body.lease_token},
+        }
+
+    async def phase_result(*_args, **_kwargs):
+        return {"ok": True}
+
+    async def heartbeat(*_args, **_kwargs):
+        return {"ok": True, "heartbeated": True}
+
+    async def eligible_ids(*_args, **_kwargs):
+        return ["marker-one"]
+
+    async def claimed(*_args, **_kwargs):
+        return {
+            "ok": True,
+            "claimed": True,
+            "reason": "claimed",
+            "marker": {"marker_id": "marker-one", "processor_kind": "review"},
+        }
+
+    async def process_failed(*_args, **_kwargs):
+        raise RuntimeError("original processing failure")
+
+    async def release_failed(_body):
+        raise ValueError("release failure")
+
+    monkeypatch.setattr(routes_personal, "acquire_work_review_processor_lease", acquired)
+    monkeypatch.setattr(
+        routes_personal,
+        "requeue_timed_out_work_review_processor_markers",
+        phase_result,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "trigger_work_review_processor_idle_scan",
+        phase_result,
+    )
+    monkeypatch.setattr(
+        routes_personal,
+        "trigger_work_preprocessing_idle_scan",
+        phase_result,
+    )
+    monkeypatch.setattr(routes_personal, "heartbeat_work_review_processor_lease", heartbeat)
+    monkeypatch.setattr(routes_personal, "_run_personal_sync_work", eligible_ids)
+    monkeypatch.setattr(routes_personal, "claim_next_work_review_processor_marker", claimed)
+    monkeypatch.setattr(routes_personal, "_process_work_automation_claimed_marker", process_failed)
+    monkeypatch.setattr(routes_personal, "release_work_review_processor_lease", release_failed)
+
+    with pytest.raises(RuntimeError, match="original processing failure"):
+        asyncio.run(
+            routes_personal.run_work_kanban_automation_idle_tick(
+                max_scan_items=1,
+                max_process_items=1,
+                holder_id="process-failure-holder",
+                run_id="process-failure-run",
+            )
+        )
+
+    assert "tick lease release failed" in caplog.text
+    assert "ValueError" in caplog.text
+
+
+def test_kanban_idle_worker_cancellation_remains_cancelled_during_final_release(monkeypatch):
+    monkeypatch.setenv("BLUEPRINTS_KANBAN_AUTOMATION_IDLE_WORKER", "1")
+    monkeypatch.setenv(
+        routes_personal.KANBAN_AUTOMATION_OWNER_NODE_ID_ENV,
+        "test-node",
+    )
+
+    async def scenario():
+        release_started = asyncio.Event()
+        release_finished = asyncio.Event()
+
+        async def acquired(body):
+            return {
+                "ok": True,
+                "acquired": True,
+                "reason": "acquired",
+                "lease": {"lease_token": body.lease_token},
+            }
+
+        async def phase_result(*_args, **_kwargs):
+            return {"ok": True}
+
+        async def heartbeat(*_args, **_kwargs):
+            return {"ok": True, "heartbeated": True}
+
+        async def eligible_ids(*_args, **_kwargs):
+            return []
+
+        async def no_claim(*_args, **_kwargs):
+            return {"ok": True, "claimed": False, "reason": "no_queued_marker"}
+
+        async def released(_body):
+            release_started.set()
+            await asyncio.sleep(0.01)
+            release_finished.set()
+            return {"ok": True, "released": True, "reason": "released"}
+
+        monkeypatch.setattr(routes_personal, "acquire_work_review_processor_lease", acquired)
+        monkeypatch.setattr(
+            routes_personal,
+            "requeue_timed_out_work_review_processor_markers",
+            phase_result,
+        )
+        monkeypatch.setattr(
+            routes_personal,
+            "trigger_work_review_processor_idle_scan",
+            phase_result,
+        )
+        monkeypatch.setattr(
+            routes_personal,
+            "trigger_work_preprocessing_idle_scan",
+            phase_result,
+        )
+        monkeypatch.setattr(routes_personal, "heartbeat_work_review_processor_lease", heartbeat)
+        monkeypatch.setattr(routes_personal, "_run_personal_sync_work", eligible_ids)
+        monkeypatch.setattr(routes_personal, "claim_next_work_review_processor_marker", no_claim)
+        monkeypatch.setattr(routes_personal, "release_work_review_processor_lease", released)
+
+        tick = asyncio.create_task(
+            routes_personal.run_work_kanban_automation_idle_tick(
+                max_scan_items=1,
+                max_process_items=1,
+                holder_id="cancel-holder",
+                run_id="cancel-run",
+            )
+        )
+        await release_started.wait()
+        tick.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tick
+        assert release_finished.is_set()
+
+    asyncio.run(scenario())
 
 
 def test_kanban_idle_worker_skips_non_owner_node(monkeypatch, tmp_path):
@@ -6472,8 +6854,8 @@ def test_multiline_json_extract_still_translates_for_postgres():
 
 def test_preprocessing_scan_cursor_uses_latest_indexable_global_audit():
     class EmptyCursor:
-        def fetchone(self):
-            return None
+        def fetchall(self):
+            return []
 
     class TranslatingPostgresConnection:
         def __init__(self):
@@ -6491,10 +6873,51 @@ def test_preprocessing_scan_cursor_uses_latest_indexable_global_audit():
     assert routes_personal._work_preprocessing_scan_cursor(conn) == {
         "audit_id": "",
         "item_id": "",
+        "generation": 0,
     }
     assert "json_extract" not in conn.statement.lower()
     assert "not exists" not in conn.statement.lower()
     assert "order by created_at desc, audit_id desc" in " ".join(conn.statement.split()).lower()
+
+
+def test_preprocessing_scan_cursor_resolves_same_second_legacy_lineage():
+    conn = _make_conn()
+    shared_time = "2026-07-18T12:00:00Z"
+    conn.execute(
+        """
+        INSERT INTO kanban_audit_log (
+            audit_id, action, item_id, created_at, result, metadata_json
+        ) VALUES (?, 'trigger_preprocessing_idle_scan', '', ?, 'ok', ?)
+        """,
+        (
+            "audit-zzzz-predecessor",
+            shared_time,
+            json.dumps({"scan_cursor_item_id": "item-a"}),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO kanban_audit_log (
+            audit_id, action, item_id, created_at, result, metadata_json
+        ) VALUES (?, 'trigger_preprocessing_idle_scan', '', ?, 'ok', ?)
+        """,
+        (
+            "audit-aaaa-successor",
+            shared_time,
+            json.dumps(
+                {
+                    "scan_cursor_previous_audit_id": "audit-zzzz-predecessor",
+                    "scan_cursor_item_id": "item-b",
+                }
+            ),
+        ),
+    )
+
+    assert routes_personal._work_preprocessing_scan_cursor(conn) == {
+        "audit_id": "audit-aaaa-successor",
+        "item_id": "item-b",
+        "generation": 0,
+    }
 
 
 def test_preprocessing_scan_cursor_uses_bounded_postgres_connection_adapter(monkeypatch):
@@ -6529,6 +6952,7 @@ def test_preprocessing_scan_cursor_uses_bounded_postgres_connection_adapter(monk
         assert routes_personal._work_preprocessing_scan_cursor(conn) == {
             "audit_id": "",
             "item_id": "",
+            "generation": 0,
         }
     finally:
         conn.close()
@@ -13257,6 +13681,8 @@ def test_work_preprocessing_idle_scan_rotates_marked_candidates_without_per_item
         "scope": "global",
         "previous_audit_id": "",
         "audit_id": first["audit"]["audit_id"],
+        "previous_generation": 0,
+        "generation": 1,
         "previous_item_id": "",
         "item_id": "work-preprocess-cursor-b",
         "wrapped": False,
@@ -13281,22 +13707,14 @@ def test_work_preprocessing_idle_scan_rotates_marked_candidates_without_per_item
     assert second["scan_cursor"]["item_id"] == "work-preprocess-cursor-d"
     assert second["scan_cursor"]["wrapped"] is False
     assert second["scan_cursor"]["previous_audit_id"] == first["audit"]["audit_id"]
+    assert second["scan_cursor"]["previous_generation"] == 1
+    assert second["scan_cursor"]["generation"] == 2
 
-    # Production ticks are serialized and cadence-separated. Make that ordering
-    # explicit in the fast unit test, whose two calls otherwise share one-second
-    # audit timestamps.
-    conn.execute(
-        "UPDATE kanban_audit_log SET created_at=? WHERE audit_id=?",
-        ("2026-07-18T12:00:00Z", first["audit"]["audit_id"]),
-    )
-    conn.execute(
-        "UPDATE kanban_audit_log SET created_at=? WHERE audit_id=?",
-        ("2026-07-18T12:01:00Z", second["audit"]["audit_id"]),
-    )
     stored_cursor = routes_personal._work_preprocessing_scan_cursor(conn)
     assert stored_cursor == {
         "audit_id": second["audit"]["audit_id"],
         "item_id": "work-preprocess-cursor-d",
+        "generation": 2,
     }
     marker_rows = conn.execute(
         "SELECT item_id, updated_at FROM kanban_review_processor_markers ORDER BY item_id"
