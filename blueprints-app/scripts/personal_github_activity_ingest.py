@@ -484,9 +484,18 @@ def is_live_db_path(db_path: Path) -> bool:
 
 def repo_commit_ts(repo_path: Path) -> int:
     try:
+        command = ["git", "-C", str(repo_path), "log", "-1", "--format=%ct"]
+        if repo_path.resolve(strict=False) == Path("/xarta-node/.lone-wolf"):
+            command = [
+                "/root/xarta-node/.xarta/.agents/bin/xarta-lone-wolf-git-owner",
+                "--",
+                "log",
+                "-1",
+                "--format=%ct",
+            ]
         return int(
             subprocess.check_output(
-                ["git", "-C", str(repo_path), "log", "-1", "--format=%ct"],
+                command,
                 stderr=subprocess.DEVNULL,
                 text=True,
             ).strip()
