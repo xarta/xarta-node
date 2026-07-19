@@ -40,11 +40,11 @@ OWNER_CRON_LINE="* * * * * root bash $OWNER_FIX_SCRIPT"
 STACK_RUNTIME_OWNER_CRON_FILE="/etc/cron.d/lone-wolf-stack-runtime-owner"
 STACK_RUNTIME_OWNER_CRON_MARKER="lone-wolf-stack-runtime-fix-owner"
 STACK_RUNTIME_OWNER_CRON_LINE="* * * * * root bash $STACK_RUNTIME_OWNER_FIX_SCRIPT --check"
+PUBLISH_HELPER="/root/xarta-node/.xarta/.agents/bin/xarta-lone-wolf-publish"
 
 commit_gitignore_change() {
     local message="$1"
-    git -C "$LONE_WOLF" add .gitignore
-    git -C "$LONE_WOLF" commit --only .gitignore -m "$message" || true
+    "$PUBLISH_HELPER" publish --message "$message" --path .gitignore
 }
 
 ensure_gitignore_line() {
@@ -70,6 +70,8 @@ remove_gitignore_line() {
         local tmp
         tmp="$(mktemp)"
         grep -vxF "$line" "$GITIGNORE" > "$tmp" || true
+        chown --reference="$GITIGNORE" "$tmp"
+        chmod --reference="$GITIGNORE" "$tmp"
         mv "$tmp" "$GITIGNORE"
         commit_gitignore_change "$message"
         echo "  gitignore: removed '$line' entry ($label)"

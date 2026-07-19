@@ -17,6 +17,7 @@ LONE_WOLF="${NODE_LOCAL_PARENT}/.lone-wolf"
 SENTINEL="${LONE_WOLF}/.docs-pending-commit"
 OWNER_FIX_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-fix-owner.sh"
 PUBLISH_HELPER="/root/xarta-node/.xarta/.agents/bin/xarta-lone-wolf-publish"
+GIT_OWNER_HELPER="/root/xarta-node/.xarta/.agents/bin/xarta-lone-wolf-git-owner"
 DELAY=300  # seconds — 5 minutes
 
 # The cron installation is role-gated too, but the writer itself fails closed if
@@ -45,7 +46,7 @@ fi
     exit 1
 }
 
-if [[ -z "$(runuser -u xarta -- git -C "$LONE_WOLF" status --porcelain --untracked-files=all -- docs/)" ]]; then
+if [[ -z "$("$GIT_OWNER_HELPER" -- status --porcelain --untracked-files=all -- docs/)" ]]; then
     # Nothing actually changed in docs/ (sentinel may be stale)
     rm -f "$SENTINEL"
     exit 0

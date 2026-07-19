@@ -6,6 +6,7 @@ PUBLIC_ROOT="${PUBLIC_ROOT:-/root/xarta-node}"
 PRIVATE_ROOT="${PRIVATE_ROOT:-/root/xarta-node/.xarta}"
 NODE_LOCAL_PARENT="${NODE_LOCAL_PARENT:-/xarta-node}"
 NODE_LOCAL_ROOT="${NODE_LOCAL_ROOT:-${NODE_LOCAL_PARENT}/.lone-wolf}"
+LONE_WOLF_GIT_OWNER="${LONE_WOLF_GIT_OWNER:-${PRIVATE_ROOT}/.agents/bin/xarta-lone-wolf-git-owner}"
 AUDIT_ARCHIVE_ROOT="${AUDIT_ARCHIVE_ROOT:-${PRIVATE_ROOT}/.audit/gui-migration-paths}"
 TMP_REPORT=""
 PREVIOUS_LATEST=""
@@ -109,7 +110,13 @@ scan_repo_for_pattern() {
         return 0
     fi
 
-    if [[ "$have_rg" -eq 1 ]]; then
+    if [[ -d "$root/.git" ]]; then
+        if [[ "$root" == "$NODE_LOCAL_ROOT" ]]; then
+            "$LONE_WOLF_GIT_OWNER" -- grep -n --fixed-strings -- "$pattern" 2>/dev/null || true
+        else
+            GIT_OPTIONAL_LOCKS=0 git -C "$root" grep -n --fixed-strings -- "$pattern" 2>/dev/null || true
+        fi
+    elif [[ "$have_rg" -eq 1 ]]; then
         rg_scan "$pattern" "$root"
     else
         grep_scan "$pattern" "$root"
@@ -153,7 +160,7 @@ generate_report() {
     echo "Node-local repo:     $NODE_LOCAL_ROOT"
     echo "Audit archive root:  $AUDIT_ARCHIVE_ROOT"
     echo
-    echo "This scan includes hidden and gitignored files, but excludes .git internals, the audit archive, and common binary blobs."
+    echo "Git repositories scan their bounded maintained index only. Non-repository fallback roots exclude .git internals, the audit archive, and common binary blobs."
     echo
     echo "== Current live symlink/layout check =="
     report_symlink "$PUBLIC_ROOT/gui-fallback/db"
