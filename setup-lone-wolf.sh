@@ -56,10 +56,15 @@ commit_gitignore_change() {
         return
     fi
 
-    if ! "$GIT_OWNER_HELPER" -- diff --cached --quiet; then
-        echo "ERROR: staged p400 changes already exist; refusing mixed .gitignore commit" >&2
-        return 1
-    fi
+    mapfile -t staged_paths < <("$GIT_OWNER_HELPER" -- diff --cached --name-only)
+    for staged_path in "${staged_paths[@]}"; do
+        if [[ "$staged_path" != ".gitignore" ]]; then
+            echo "ERROR: staged p400 changes already exist outside .gitignore; refusing mixed commit" >&2
+            return 1
+        fi
+    done
+    "$GIT_OWNER_HELPER" -- config user.name xarta-node
+    "$GIT_OWNER_HELPER" -- config user.email xarta-node@localhost
     "$GIT_OWNER_HELPER" -- add -- .gitignore
     "$GIT_OWNER_HELPER" -- commit -m "$message"
 }
@@ -207,6 +212,12 @@ else
     else
         echo "  skills-cron: not installed — OK (non-skills-backup node)"
     fi
+fi
+
+if [[ "$DOCS_BACKUP" != "true" && "$SKILLS_BACKUP" != "true" ]] &&
+   { ! "$GIT_OWNER_HELPER" -- diff --quiet -- .gitignore ||
+     ! "$GIT_OWNER_HELPER" -- diff --cached --quiet -- .gitignore; }; then
+    commit_gitignore_change "Complete pending lone-wolf Git ignore policy"
 fi
 
 echo "Done."
