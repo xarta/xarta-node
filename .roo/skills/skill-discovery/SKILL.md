@@ -1,15 +1,15 @@
 ---
 name: skill-discovery
-description: Use at the start of xarta-node repository, docs, stack, UI, provider, fleet, recovery, or development work in Roo. Discover the authoritative .claude skills and shared helpers through orientation and the maintained catalog adapter; this is Roo's bridge to the shared skill system.
+description: Use at the start of xarta-node repository, docs, stack, UI, provider, fleet, recovery, or development work in Roo. Discover Syncthing-backed common skills, declared local overlays, and shared helpers through orientation and the maintained catalog adapter.
 ---
 
 # Roo Skill Discovery Adapter
 
-The authoritative workflow system is `.claude/skills`. This Roo adapter owns no duplicate skill policy, private catalog, or semantic routing.
+The common workflow system is `/xarta-node/.lone-wolf/skills`. This Roo adapter owns no duplicate skill policy, private catalog, or semantic routing. Read `shared-governance/SKILL.md` before managing or selecting shared skills.
 
 1. Open `/root/xarta-node/.xarta/.agent/orientation.md`.
 2. Use the relevant `paths01.md` through `paths10.md` bucket; avoid `paths00.md` unless exhaustive lookup is necessary.
-3. Resolve the selected canonical `SKILL.md` under p101, p201, p301, p401, or a maintained stack-local `.claude/skills` path and read it completely.
+3. Resolve the selected common `SKILL.md` under `/xarta-node/.lone-wolf/skills` first. Use p101, p201, p301, p401, or a maintained stack-local `.claude/skills` path only for a declared local/repository overlay or an unreconciled skill, and read the selected files completely.
 4. Use p103 `/root/xarta-node/.xarta/.agents` for shared executable helpers. Treat `.roo` and `.codex` copies as adapters only.
 5. List current canonical skills with
    `bash /root/xarta-node/.roo/skills/skill-discovery/scripts/catalog-skills.sh`.
