@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # setup-lone-wolf.sh — run after .env is loaded on any fleet node
-# Manages .lone-wolf/.gitignore runtime/docs/syncthing entries and cron backup.
+# Manages .lone-wolf/.gitignore runtime/docs/syncthing/skills entries and
+# independently role-gated docs and skills backup crons.
 # DOCS_ROOT is set in .env; no symlink needed (Option B).
 
 set -euo pipefail
@@ -15,6 +16,7 @@ STALE_SYMLINK="/root/xarta-node/.xarta/docs"
 source /root/xarta-node/.env 2>/dev/null || true
 
 DOCS_BACKUP="${THIS_NODE_DOCS_BACKUP:-false}"
+SKILLS_BACKUP="${THIS_NODE_SKILLS_BACKUP:-false}"
 
 echo "=== setup-lone-wolf.sh ==="
 
@@ -30,10 +32,14 @@ fi
 
 # --- .gitignore ---
 COMMIT_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-commit.sh"
+SKILLS_COMMIT_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-skills-commit.sh"
 OWNER_FIX_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-docs-fix-owner.sh"
 STACK_RUNTIME_OWNER_FIX_SCRIPT="/root/xarta-node/blueprints-app/scripts/lone-wolf-stack-runtime-fix-owner.sh"
 CRON_MARKER="lone-wolf-docs-commit"
 CRON_LINE="* * * * * root bash $COMMIT_SCRIPT"
+SKILLS_CRON_FILE="/etc/cron.d/lone-wolf-skills"
+SKILLS_CRON_MARKER="lone-wolf-skills-commit"
+SKILLS_CRON_LINE="* * * * * root bash $SKILLS_COMMIT_SCRIPT"
 OWNER_CRON_FILE="/etc/cron.d/lone-wolf-docs-owner"
 OWNER_CRON_MARKER="lone-wolf-docs-fix-owner"
 OWNER_CRON_LINE="* * * * * root bash $OWNER_FIX_SCRIPT"
@@ -41,10 +47,21 @@ STACK_RUNTIME_OWNER_CRON_FILE="/etc/cron.d/lone-wolf-stack-runtime-owner"
 STACK_RUNTIME_OWNER_CRON_MARKER="lone-wolf-stack-runtime-fix-owner"
 STACK_RUNTIME_OWNER_CRON_LINE="* * * * * root bash $STACK_RUNTIME_OWNER_FIX_SCRIPT --check"
 PUBLISH_HELPER="/root/xarta-node/.xarta/.agents/bin/xarta-lone-wolf-publish"
+GIT_OWNER_HELPER="/root/xarta-node/.xarta/.agents/bin/xarta-lone-wolf-git-owner"
 
 commit_gitignore_change() {
     local message="$1"
-    "$PUBLISH_HELPER" publish --message "$message" --path .gitignore
+    if [[ "$DOCS_BACKUP" == "true" || "$SKILLS_BACKUP" == "true" ]]; then
+        "$PUBLISH_HELPER" publish --message "$message" --path .gitignore
+        return
+    fi
+
+    if ! "$GIT_OWNER_HELPER" -- diff --cached --quiet; then
+        echo "ERROR: staged p400 changes already exist; refusing mixed .gitignore commit" >&2
+        return 1
+    fi
+    "$GIT_OWNER_HELPER" -- add -- .gitignore
+    "$GIT_OWNER_HELPER" -- commit -m "$message"
 }
 
 ensure_gitignore_line() {
@@ -164,6 +181,31 @@ else
         echo "  cron: removed lone-wolf-docs-commit (non-backup node)"
     else
         echo "  cron: not installed — OK (non-backup node)"
+    fi
+fi
+
+if [[ "$SKILLS_BACKUP" == "true" ]]; then
+    # Skills backup/publication authority is independent from docs authority.
+    remove_gitignore_line 'skills' "Unignore skills — this is the designated skills backup node" "skills backup node"
+
+    if [[ "$(cat "$SKILLS_CRON_FILE" 2>/dev/null || true)" != "# $SKILLS_CRON_MARKER
+$SKILLS_CRON_LINE" ]]; then
+        printf '# %s\n%s\n' "$SKILLS_CRON_MARKER" "$SKILLS_CRON_LINE" > "$SKILLS_CRON_FILE"
+        chmod 644 "$SKILLS_CRON_FILE"
+        echo "  skills-cron: installed lone-wolf-skills-commit (skills backup node)"
+    else
+        echo "  skills-cron: already installed — OK (skills backup node)"
+    fi
+else
+    # Non-backup nodes may receive skills through Syncthing but cannot publish
+    # that shared payload from their node-local lone-wolf repository.
+    ensure_gitignore_line 'skills' "Gitignore skills — distributed via Syncthing, not git-tracked here" "non-skills-backup node"
+
+    if [[ -f "$SKILLS_CRON_FILE" ]]; then
+        rm -f "$SKILLS_CRON_FILE"
+        echo "  skills-cron: removed lone-wolf-skills-commit (non-skills-backup node)"
+    else
+        echo "  skills-cron: not installed — OK (non-skills-backup node)"
     fi
 fi
 
