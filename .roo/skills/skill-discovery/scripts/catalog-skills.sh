@@ -6,7 +6,7 @@ usage() {
 Usage: catalog-skills.sh [options]
        catalog-skills.sh [/root/xarta-node] [json|text]  # legacy form
 
-List maintained canonical xarta-node skills through the shared p103 audit.
+List maintained common and overlay xarta-node skills through the shared p103 audit.
 
 Options:
   --name NAME       Exact front-matter name filter; may return root variants
@@ -63,7 +63,7 @@ fi
 FILTER+='] | sort_by(.name,.path_role,.path)'
 
 if [[ "$FORMAT" == json ]]; then
-  jq -c --arg name "$NAME" "$FILTER | map({name,path,resolved_path,description,repo:(if .path_role == \"private-canonical\" then \"p100\" elif .path_role == \"public-root-canonical\" then \"p200\" elif .path_role == \"public-nonroot-canonical\" then \"p300\" else \"p400\" end),type:.path_role})" "$OUTPUT"
+  jq -c --arg name "$NAME" "$FILTER | map({name,path,resolved_path,description,repo:(if .path_role == \"shared-common-canonical\" then \"shared\" elif .path_role == \"private-canonical\" then \"p100\" elif .path_role == \"public-root-canonical\" then \"p200\" elif .path_role == \"public-nonroot-canonical\" then \"p300\" else \"p400\" end),type:.path_role})" "$OUTPUT"
 else
   jq -r --arg name "$NAME" "$FILTER[] | [.name,.path_role,.path] | @tsv" "$OUTPUT"
   printf 'raw_audit\t%s\n' "$OUTPUT"
