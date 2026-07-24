@@ -5,7 +5,7 @@
 #   1. Installs Syncthing from the official apt repository + python3-bcrypt.
 #   2. Ensures managed share paths exist with Syncthing .stfolder markers:
 #      gui-fallback/assets/icons/, sounds/, fonts/, .lone-wolf/docs/,
-#      .lone-wolf/syncthing/tts/voices/, and each
+#      .lone-wolf/skills/, .lone-wolf/syncthing/tts/voices/, and each
 #      .lone-wolf/interests/<category>/ wiki/vault root.
 #   3. Generates a stable SYNCTHING_API_KEY in .env (if not already set).
 #   4. Temporarily starts syncthing@xarta.service so Syncthing generates its
@@ -79,6 +79,7 @@ REPO_OUTER_PATH="${REPO_OUTER_PATH:-$SCRIPT_DIR}"
 BLUEPRINTS_FALLBACK_GUI_DIR="${BLUEPRINTS_FALLBACK_GUI_DIR:-/xarta-node/gui-fallback}"
 BLUEPRINTS_ASSETS_DIR="${BLUEPRINTS_ASSETS_DIR:-/xarta-node/gui-fallback/assets}"
 BLUEPRINTS_DOCS_DIR="${BLUEPRINTS_DOCS_DIR:-/xarta-node/.lone-wolf/docs}"
+BLUEPRINTS_SKILLS_DIR="${BLUEPRINTS_SKILLS_DIR:-/xarta-node/.lone-wolf/skills}"
 BLUEPRINTS_TTS_VOICES_DIR="${BLUEPRINTS_TTS_VOICES_DIR:-/xarta-node/.lone-wolf/syncthing/tts/voices}"
 BLUEPRINTS_INTERESTS_DIR="${BLUEPRINTS_INTERESTS_DIR:-/xarta-node/.lone-wolf/interests}"
 BLUEPRINTS_INTERESTS_CATEGORIES_JSON="${BLUEPRINTS_INTERESTS_CATEGORIES_JSON:-[\"ai-developments\",\"software\",\"politics\",\"hardware\",\"science\",\"games\",\"media\",\"personal\",\"testing\",\"testing-games\",\"testing-tech\",\"testing-culture\",\"uncategorized\"]}"
@@ -100,6 +101,10 @@ SYNCTHING_EXTRA_DEVICES_JSON="${SYNCTHING_EXTRA_DEVICES_JSON:-[]}"
 # Example:
 #   SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON='{"xarta-node-docs":["AAAA...","BBBB..."]}'
 SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON="${SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON:-{}}"
+# The shared skills folder is intentionally hub-and-spoke even though existing
+# fleet folders may use broader membership. Every spoke shares it only with
+# this named hub; the hub includes every enrolled spoke.
+SYNCTHING_SKILLS_HUB_NODE_ID="${SYNCTHING_SKILLS_HUB_NODE_ID:?SYNCTHING_SKILLS_HUB_NODE_ID not set}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 env_set() {
@@ -171,6 +176,8 @@ echo "GUI hostname : $SYNCTHING_HOSTNAME"
 echo "Repo path    : $REPO_OUTER_PATH"
 echo "Assets path  : $BLUEPRINTS_ASSETS_DIR"
 echo "Docs path    : $BLUEPRINTS_DOCS_DIR"
+echo "Skills path  : $BLUEPRINTS_SKILLS_DIR"
+echo "Skills hub   : $SYNCTHING_SKILLS_HUB_NODE_ID"
 echo "TTS voices   : $BLUEPRINTS_TTS_VOICES_DIR"
 echo "Interests    : $BLUEPRINTS_INTERESTS_DIR"
 echo ""
@@ -210,6 +217,7 @@ ICONS_DIR="$BLUEPRINTS_ASSETS_DIR/icons"
 SOUNDS_DIR="$BLUEPRINTS_ASSETS_DIR/sounds"
 FONTS_DIR="$BLUEPRINTS_ASSETS_DIR/fonts"
 DOCS_DIR="$BLUEPRINTS_DOCS_DIR"
+SKILLS_DIR="$BLUEPRINTS_SKILLS_DIR"
 TTS_VOICES_DIR="$BLUEPRINTS_TTS_VOICES_DIR"
 INTERESTS_DIR="$BLUEPRINTS_INTERESTS_DIR"
 INTEREST_CATEGORIES_TEXT="$(
@@ -236,12 +244,13 @@ for category in categories:
 PY
 )"
 mapfile -t INTEREST_CATEGORIES <<< "$INTEREST_CATEGORIES_TEXT"
-mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" "$DOCS_DIR" "$TTS_VOICES_DIR" "$INTERESTS_DIR"
+mkdir -p "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR" "$SOUNDS_DIR" "$FONTS_DIR" "$DOCS_DIR" "$SKILLS_DIR" "$TTS_VOICES_DIR" "$INTERESTS_DIR"
 chown_like "$(dirname "$BLUEPRINTS_ASSETS_DIR")" "$BLUEPRINTS_ASSETS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$ICONS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$SOUNDS_DIR"
 chown_like "$BLUEPRINTS_ASSETS_DIR" "$FONTS_DIR"
 chown_like "$(dirname "$DOCS_DIR")" "$DOCS_DIR"
+chown_like "$(dirname "$SKILLS_DIR")" "$SKILLS_DIR"
 chown_like "$(dirname "$TTS_VOICES_DIR")" "$TTS_VOICES_DIR"
 # .stfolder is Syncthing's required presence marker. Without it Syncthing will
 # refuse to sync the folder (treats a missing marker as an accidental deletion).
@@ -249,21 +258,26 @@ touch "$ICONS_DIR/.stfolder"
 touch "$SOUNDS_DIR/.stfolder"
 touch "$FONTS_DIR/.stfolder"
 touch "$DOCS_DIR/.stfolder"
+touch "$SKILLS_DIR/.stfolder"
 touch "$TTS_VOICES_DIR/.stfolder"
 chown_like "$ICONS_DIR" "$ICONS_DIR/.stfolder"
 chown_like "$SOUNDS_DIR" "$SOUNDS_DIR/.stfolder"
 chown_like "$FONTS_DIR" "$FONTS_DIR/.stfolder"
 chown_like "$DOCS_DIR" "$DOCS_DIR/.stfolder"
+chown_like "$SKILLS_DIR" "$SKILLS_DIR/.stfolder"
 chown_like "$TTS_VOICES_DIR" "$TTS_VOICES_DIR/.stfolder"
 echo -e "    ${GREEN}ok${NC}: $ICONS_DIR ($(find "$ICONS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $SOUNDS_DIR ($(find "$SOUNDS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $FONTS_DIR ($(find "$FONTS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $DOCS_DIR ($(find "$DOCS_DIR" -not -name '.stfolder' | wc -l) files)"
+echo -e "    ${GREEN}ok${NC}: $SKILLS_DIR ($(find "$SKILLS_DIR" -not -name '.stfolder' | wc -l) files)"
 echo -e "    ${GREEN}ok${NC}: $TTS_VOICES_DIR ($(find "$TTS_VOICES_DIR" -not -name '.stfolder' | wc -l) files)"
 chown -R xarta:xarta "$BLUEPRINTS_ASSETS_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $BLUEPRINTS_ASSETS_DIR"
 chown -R xarta:xarta "$DOCS_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $DOCS_DIR"
+chown -R xarta:xarta "$SKILLS_DIR"
+echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $SKILLS_DIR"
 chown -R xarta:xarta "$TTS_VOICES_DIR"
 echo -e "    ${CYAN}ownership${NC}: xarta:xarta → $TTS_VOICES_DIR"
 chown "$BLUEPRINTS_INTERESTS_UID:$BLUEPRINTS_INTERESTS_GID" "$INTERESTS_DIR"
@@ -455,27 +469,29 @@ Args (positional):
     api_key         — Syncthing REST API key
     assets_dir      — shared assets root (e.g. /root/xarta-node/gui-fallback/assets)
     docs_dir        — shared docs root (e.g. /xarta-node/.lone-wolf/docs)
+    skills_dir      — shared skills root (e.g. /xarta-node/.lone-wolf/skills)
     tts_voices_dir  — shared TTS voices root (e.g. /xarta-node/.lone-wolf/syncthing/tts/voices)
     interests_dir   — shared interests root whose category dirs are wiki/vault roots
     interest_categories_json — JSON array of category directory names
     extra_devices_json — JSON array of external/non-fleet Syncthing devices
     extra_folder_device_ids_json — JSON object: folder_id -> [device_id,...]
+    skills_hub_node_id — fleet node ID that is the sole Syncthing hub
 """
 import sys
 import json
 import re
 import xml.etree.ElementTree as ET
 
-if len(sys.argv) != 15:
+if len(sys.argv) != 17:
     print("Usage: syncthing-patch.py <config> <nodes_json> <node_id> "
-          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <tts_voices_dir> <interests_dir> <interest_categories_json> <extra_devices_json> <extra_folder_device_ids_json>",
+          "<own_device_id> <gui_user> <gui_pass_hash> <api_key> <assets_dir> <docs_dir> <skills_dir> <tts_voices_dir> <interests_dir> <interest_categories_json> <extra_devices_json> <extra_folder_device_ids_json> <skills_hub_node_id>",
           file=sys.stderr)
     sys.exit(1)
 
 (config_path, nodes_json_path, node_id, own_device_id,
- gui_user, gui_pass_hash, api_key, assets_dir, docs_dir, tts_voices_dir,
- interests_dir, interest_categories_json,
- extra_devices_json, extra_folder_device_ids_json) = sys.argv[1:]
+ gui_user, gui_pass_hash, api_key, assets_dir, docs_dir, skills_dir, tts_voices_dir,
+ interests_dir, interest_categories_json, extra_devices_json,
+ extra_folder_device_ids_json, skills_hub_node_id) = sys.argv[1:]
 
 with open(nodes_json_path) as nf:
     nodes = json.load(nf)['nodes']
@@ -596,6 +612,7 @@ ET.SubElement(own_dev, 'address').text = 'dynamic'
 peer_device_ids = []
 skipped_peers = []
 device_ids_seen = {own_device_id}
+fleet_device_ids_by_node = {node_id: own_device_id}
 for peer in peers:
     dev_id = peer.get('syncthing_device_id', '').strip()
     if not dev_id:
@@ -614,6 +631,7 @@ for peer in peers:
     )
     peer_device_ids.append(dev_id)
     device_ids_seen.add(dev_id)
+    fleet_device_ids_by_node[peer['node_id']] = dev_id
 
 
 def normalize_addresses(raw):
@@ -691,6 +709,7 @@ managed_folder_ids = [
     'xarta-sounds',
     'xarta-fonts',
     'xarta-node-docs',
+    'xarta-node-skills',
     'xarta-tts-voices',
     'default',
 ]
@@ -732,12 +751,24 @@ def folder_extra_ids(folder_id):
     return out
 
 
-def add_folder(fid, label, path, extra_ids=None):
+def add_folder(
+    fid,
+    label,
+    path,
+    extra_ids=None,
+    explicit_device_ids=None,
+    trashcan_days=None,
+):
     if extra_ids is None:
         extra_ids = []
 
+    base_device_ids = (
+        list(explicit_device_ids)
+        if explicit_device_ids is not None
+        else all_device_ids
+    )
     folder_device_ids = []
-    for did in all_device_ids + list(extra_ids):
+    for did in base_device_ids + list(extra_ids):
         if did not in folder_device_ids:
             folder_device_ids.append(did)
 
@@ -757,6 +788,13 @@ def add_folder(fid, label, path, extra_ids=None):
         d.set('introducedBy', '')
     ET.SubElement(f, 'maxConflicts').text = '10'
     ET.SubElement(f, 'markerName').text = '.stfolder'
+    if trashcan_days is not None:
+        versioning = ET.SubElement(f, 'versioning')
+        versioning.set('type', 'trashcan')
+        param = ET.SubElement(versioning, 'param')
+        param.set('key', 'cleanoutDays')
+        param.set('val', str(trashcan_days))
+        ET.SubElement(versioning, 'cleanupIntervalS').text = '3600'
 
 
 add_folder('xarta-icons', 'Assets - Icons',
@@ -771,6 +809,27 @@ add_folder('xarta-fonts', 'Assets - Fonts',
 add_folder('xarta-node-docs', 'xarta-node-docs',
            docs_dir,
            folder_extra_ids('xarta-node-docs'))
+skills_hub_device_id = fleet_device_ids_by_node.get(skills_hub_node_id, '')
+if not skills_hub_device_id:
+    print(
+        f"ERROR: skills hub '{skills_hub_node_id}' has no configured device ID",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if node_id == skills_hub_node_id:
+    skills_device_ids = [own_device_id] + peer_device_ids
+    skills_extra_ids = folder_extra_ids('xarta-node-skills')
+else:
+    skills_device_ids = [own_device_id, skills_hub_device_id]
+    skills_extra_ids = []
+add_folder(
+    'xarta-node-skills',
+    'xarta-node-skills',
+    skills_dir,
+    skills_extra_ids,
+    explicit_device_ids=skills_device_ids,
+    trashcan_days=100,
+)
 add_folder('xarta-tts-voices', 'tts-voices',
            tts_voices_dir,
            folder_extra_ids('xarta-tts-voices'))
@@ -787,6 +846,12 @@ with open(config_path, 'wb') as fh:
 print(f"    Written: {config_path}")
 print(f"    Own device:       {own_device_id}")
 print(f"    Peers configured: {len(peer_device_ids)} of {len(peers)}")
+print(f"    Skills hub:       {skills_hub_node_id}")
+print(
+    "    Skills role:      "
+    + ("hub" if node_id == skills_hub_node_id else "spoke")
+    + f" ({len(skills_device_ids) + len(skills_extra_ids)} folder members)"
+)
 if skipped_peers:
     print(f"    Skipped (no device ID yet): {', '.join(skipped_peers)}")
 print(f"    External devices added: {len(extra_added)}")
@@ -811,11 +876,13 @@ python3 "$TMPPY" \
     "$SYNCTHING_API_KEY" \
     "$BLUEPRINTS_ASSETS_DIR" \
     "$BLUEPRINTS_DOCS_DIR" \
+    "$BLUEPRINTS_SKILLS_DIR" \
     "$BLUEPRINTS_TTS_VOICES_DIR" \
     "$BLUEPRINTS_INTERESTS_DIR" \
     "$BLUEPRINTS_INTERESTS_CATEGORIES_JSON" \
     "$SYNCTHING_EXTRA_DEVICES_JSON" \
-    "$SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON"
+    "$SYNCTHING_EXTRA_FOLDER_DEVICE_IDS_JSON" \
+    "$SYNCTHING_SKILLS_HUB_NODE_ID"
 echo ""
 
 # ── Step 7 — Enable and restart Syncthing ────────────────────────────────────
