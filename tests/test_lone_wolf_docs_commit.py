@@ -82,12 +82,7 @@ def test_setup_keeps_docs_and_skills_authority_independent():
     assert "/etc/cron.d/lone-wolf-skills" in source
 
 
-def test_non_authority_gitignore_commits_do_not_use_publication_helper():
+def test_gitignore_policy_uses_guarded_scoped_publication():
     source = SETUP_SCRIPT.read_text(encoding="utf-8")
-    assert 'if [[ "$DOCS_BACKUP" == "true" || "$SKILLS_BACKUP" == "true" ]]' in source
-    assert '"$staged_path" != ".gitignore"' in source
-    assert '"$GIT_OWNER_HELPER" -- config user.name xarta-node' in source
-    assert '"$GIT_OWNER_HELPER" -- config user.email xarta-node@localhost' in source
-    assert '"$GIT_OWNER_HELPER" -- add -- .gitignore' in source
-    assert '"$GIT_OWNER_HELPER" -- commit -m "$message"' in source
-    assert "Complete pending lone-wolf Git ignore policy" in source
+    assert '"$PUBLISH_HELPER" publish --message "$message" --path .gitignore' in source
+    assert "GIT_OWNER_HELPER" not in source

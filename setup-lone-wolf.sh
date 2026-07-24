@@ -47,26 +47,10 @@ STACK_RUNTIME_OWNER_CRON_FILE="/etc/cron.d/lone-wolf-stack-runtime-owner"
 STACK_RUNTIME_OWNER_CRON_MARKER="lone-wolf-stack-runtime-fix-owner"
 STACK_RUNTIME_OWNER_CRON_LINE="* * * * * root bash $STACK_RUNTIME_OWNER_FIX_SCRIPT --check"
 PUBLISH_HELPER="/root/xarta-node/.xarta/.agents/bin/xarta-lone-wolf-publish"
-GIT_OWNER_HELPER="/root/xarta-node/.xarta/.agents/bin/xarta-lone-wolf-git-owner"
 
 commit_gitignore_change() {
     local message="$1"
-    if [[ "$DOCS_BACKUP" == "true" || "$SKILLS_BACKUP" == "true" ]]; then
-        "$PUBLISH_HELPER" publish --message "$message" --path .gitignore
-        return
-    fi
-
-    mapfile -t staged_paths < <("$GIT_OWNER_HELPER" -- diff --cached --name-only)
-    for staged_path in "${staged_paths[@]}"; do
-        if [[ "$staged_path" != ".gitignore" ]]; then
-            echo "ERROR: staged p400 changes already exist outside .gitignore; refusing mixed commit" >&2
-            return 1
-        fi
-    done
-    "$GIT_OWNER_HELPER" -- config user.name xarta-node
-    "$GIT_OWNER_HELPER" -- config user.email xarta-node@localhost
-    "$GIT_OWNER_HELPER" -- add -- .gitignore
-    "$GIT_OWNER_HELPER" -- commit -m "$message"
+    "$PUBLISH_HELPER" publish --message "$message" --path .gitignore
 }
 
 ensure_gitignore_line() {
@@ -212,12 +196,6 @@ else
     else
         echo "  skills-cron: not installed — OK (non-skills-backup node)"
     fi
-fi
-
-if [[ "$DOCS_BACKUP" != "true" && "$SKILLS_BACKUP" != "true" ]] &&
-   { ! "$GIT_OWNER_HELPER" -- diff --quiet -- .gitignore ||
-     ! "$GIT_OWNER_HELPER" -- diff --cached --quiet -- .gitignore; }; then
-    commit_gitignore_change "Complete pending lone-wolf Git ignore policy"
 fi
 
 echo "Done."
