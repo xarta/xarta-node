@@ -1,6 +1,6 @@
 ---
 name: syncthing
-description: Syncthing fleet asset distribution — manage binary icon and sound assets across all xarta-node fleet LXCs. Use when adding/checking asset files, monitoring sync health, managing the Syncthing service, onboarding a new node to the mesh, or debugging sync issues. Also use when setup-syncthing.sh is involved.
+description: Manage Syncthing fleet asset distribution and safe external-endpoint enrolment. Use when adding/checking asset files, monitoring sync health, managing the xarta-node Syncthing service, onboarding a node, pairing a desktop endpoint, or debugging setup-syncthing.sh and sync issues.
 ---
 
 # Syncthing — Fleet Asset Distribution
@@ -9,6 +9,10 @@ Syncthing provides peer-to-peer fleet sync for binary assets that are unsuitable
 
 Scope note:
 - This skill covers fleet asset sync (`gui-fallback/assets/*`) and Syncthing service operations.
+- For private Xarta desktop identities, addresses, credential metadata, and
+  Sherlock/Bergerac procedures, use
+  `/root/xarta-node/.xarta/.claude/skills/xarta-syncthing-endpoints/SKILL.md`
+  when it is present. Keep those details out of this public skill.
 - For docs-folder ingestion workflows (including select local Obsidian folders on this LXC), use the node-local Dockge docs as the planning source:
     - `/xarta-node/.lone-wolf/docs/dockge/README.md`
     - `/xarta-node/.lone-wolf/docs/dockge/OPEN-NOTEBOOK.md`
@@ -50,6 +54,20 @@ New nodes require two passes of `setup-syncthing.sh`:
 3. **Pass 2**: Rebuilds `config.xml` with full peer list populated from `.nodes.json`.
 
 When adding a new node to an existing mesh, pass 2 must also be re-run on all existing nodes to inject the new peer.
+
+## External endpoint enrolment
+
+Treat device pairing and folder sharing as separate decisions:
+
+1. Generate a unique device identity on the endpoint; never copy another
+   device's config, certificate, or private key.
+2. Add only the intended peer and explicit static addresses.
+3. Leave the endpoint with zero shared folders until the operator names a
+   folder or accepts a specific offer.
+4. Before sharing, verify the stable folder ID, local path, type, versioning,
+   and exact device membership. Do not copy an existing all-device pattern.
+5. Keep the GUI on loopback and disable discovery, relays, and NAT traversal
+   unless the operator deliberately chooses another security model.
 
 ## Common operations
 
