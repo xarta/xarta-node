@@ -303,6 +303,26 @@ if [[ -n "$MODEL_HOOK_UPSTREAM" ]]; then
     }
 "
 fi
+if [[ "${THIS_NODE_DOCS_BACKUP:-false}" == "true" ]]; then
+    MAIN_SITE_EXTRA_HANDLES="${MAIN_SITE_EXTRA_HANDLES}
+    # Exact, read-only Sherlock security-report page for trusted Xarta networks.
+    # This avoids sending the tray applet through the authenticated code-server UI.
+    @sherlock_security_report_internal {
+        path /sherlock/security-report
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+    handle @sherlock_security_report_internal {
+        rewrite * /.lone-wolf/docs/sherlock/SHERLOCK-SECURITY-REPORT.md
+        root * /xarta-node
+        header Content-Type \"text/plain; charset=utf-8\"
+        header Cache-Control \"no-cache, no-store, must-revalidate\"
+        file_server
+    }
+    handle /sherlock/security-report {
+        respond 403
+    }
+"
+fi
 
 if [[ "$FALLBACK_CACHE_MODE" == "development" ]]; then
     FALLBACK_ASSET_CACHE_HEADERS=$(cat <<'EOF'
