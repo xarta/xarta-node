@@ -312,7 +312,7 @@ if [[ "${THIS_NODE_DOCS_BACKUP:-false}" == "true" ]]; then
         remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
     }
     handle @sherlock_security_report_internal {
-        rewrite * /.lone-wolf/docs/sherlock/SHERLOCK-SECURITY-REPORT.md
+        rewrite * /.lone-wolf/docs/sherlock/SHERLOCK-SECURITY-REPORT.txt
         root * /xarta-node
         header Content-Type \"text/plain; charset=utf-8\"
         header Cache-Control \"no-cache, no-store, must-revalidate\"
