@@ -183,11 +183,18 @@ def _source_signature_sync() -> dict[str, Any]:
             transactional=False,
         ) as kanban_conn:
             append_table_signatures(kanban_conn, KANBAN_SOURCE_TABLES)
-    encoded = json.dumps(tables, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    file_sources = [routes_personal._personal_search_file_source_signature()]
+    encoded = json.dumps(
+        {"tables": tables, "file_sources": file_sources},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return {
         "source_signature": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
-        "source_rows": sum(item["row_count"] for item in tables),
+        "source_rows": sum(item["row_count"] for item in tables)
+        + sum(item["row_count"] for item in file_sources),
         "tables": tables,
+        "file_sources": file_sources,
     }
 
 

@@ -80,6 +80,7 @@ XARTA_AGENT_LIB = Path(os.environ.get("XARTA_AGENT_LIB", "/root/xarta-node/.xart
 LONE_WOLF_ROOT = Path(os.environ.get("BLUEPRINTS_LONE_WOLF_ROOT", "/xarta-node/.lone-wolf"))
 INTERESTS_DASHBOARD_REL = Path("docs/interests/HERMES-INTERESTS-INGESTION-DASHBOARD.md")
 INTERESTS_ROOT_REL = Path("interests")
+INTERESTS_SEARCH_MAX_SOURCE_BYTES = 256 * 1024
 OPENCLAW_BOOKMARK_CANDIDATES_REL = Path(
     "runtime/openclaw-migration/2026-06-12-vm720/derived/bookmark_candidates.jsonl"
 )
@@ -10385,6 +10386,176 @@ def _search_payload(
     }
 
 
+def _interest_search_source_paths() -> list[Path]:
+    root = LONE_WOLF_ROOT / INTERESTS_ROOT_REL
+    if not root.exists():
+        return []
+    paths: list[Path] = []
+    for path in root.glob("*/raw/**/*.json"):
+        try:
+            category = path.relative_to(root).parts[0]
+        except (IndexError, ValueError):
+            continue
+        if category.startswith("testing") or not path.is_file():
+            continue
+        paths.append(path)
+    return sorted(paths)
+
+
+def _personal_search_file_source_signature() -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for path in _interest_search_source_paths():
+        try:
+            stat = path.stat()
+            rel = path.relative_to(LONE_WOLF_ROOT).as_posix()
+        except (OSError, ValueError):
+            continue
+        rows.append({"path": rel, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    return {
+        "name": "interests-intake-files",
+        "row_count": len(rows),
+        "source_signature": _search_hash({"rows": rows}),
+    }
+
+
+def _interest_search_title(
+    *,
+    category: str,
+    text: str,
+    urls: list[str],
+    labels: list[str],
+) -> str:
+    if labels:
+        return _clean_short_text(labels[0].replace("-", " ").title(), "", limit=160)
+    if urls:
+        parsed = urlparse(urls[0])
+        slug = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+        slug = re.sub(r"^\d{8}[-_]", "", slug)
+        title = re.sub(r"[-_]+", " ", slug).strip()
+        if title:
+            return _clean_short_text(title.title(), "", limit=160)
+        if parsed.netloc:
+            return f"{category.title()} URL: {parsed.netloc}"
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return _clean_short_text(first_line, f"{category.title()} interests submission", limit=160)
+
+
+def _interest_search_external_url(urls: list[str]) -> str:
+    for raw_url in urls:
+        value = str(raw_url or "").strip()
+        if not value:
+            continue
+        parsed = urlparse(value)
+        if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+            return value
+    return ""
+
+
+def _collect_interests_search_documents() -> list[dict[str, Any]]:
+    by_identity: dict[str, tuple[tuple[int, str, str], dict[str, Any]]] = {}
+    for path in _interest_search_source_paths():
+        try:
+            raw = path.read_bytes()
+            rel = path.relative_to(LONE_WOLF_ROOT).as_posix()
+        except (OSError, ValueError):
+            continue
+        if len(raw) > INTERESTS_SEARCH_MAX_SOURCE_BYTES:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(payload, dict)
+            or payload.get("record_type") != "xarta_interests_intake_event"
+        ):
+            continue
+        if payload.get("testing_campaign"):
+            continue
+        content = payload.get("content") if isinstance(payload.get("content"), dict) else {}
+        provenance = (
+            payload.get("provenance") if isinstance(payload.get("provenance"), dict) else {}
+        )
+        routing = payload.get("routing") if isinstance(payload.get("routing"), dict) else {}
+        review = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+        processing = (
+            payload.get("processing") if isinstance(payload.get("processing"), dict) else {}
+        )
+        category = str(payload.get("category") or path.relative_to(LONE_WOLF_ROOT).parts[1]).strip()
+        if not category or category.startswith("testing"):
+            continue
+        text = str(content.get("text") or "").strip()
+        urls = [str(item).strip() for item in _as_list(content.get("urls")) if str(item).strip()]
+        labels = [
+            str(item).strip() for item in _as_list(routing.get("labels")) if str(item).strip()
+        ]
+        event_id = str(provenance.get("source_event_id") or "").strip()
+        identity = event_id or rel
+        record_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+        event_timestamp = str(provenance.get("event_timestamp") or payload.get("stored_at") or "")
+        body_parts = [
+            text,
+            *urls,
+            " ".join(labels),
+            str(routing.get("reason") or ""),
+            str(review.get("notes") or ""),
+        ]
+        related_refs = _search_related_refs(
+            [event_id] if event_id else [],
+            [str(provenance.get("source_room_id") or "")],
+            urls,
+            [rel],
+        )
+        doc = _search_payload(
+            record_type="import",
+            record_table="interests_intake_events",
+            record_id=record_id,
+            source_type="interests-ingestion",
+            source_ref=rel,
+            source_hash="sha256:" + hashlib.sha256(raw).hexdigest(),
+            title=_interest_search_title(category=category, text=text, urls=urls, labels=labels),
+            body="\n".join(part for part in body_parts if part),
+            local_date=(
+                event_timestamp[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", event_timestamp) else None
+            ),
+            status="pending_review" if review.get("needs_review") is True else "open",
+            mode="imports",
+            privacy_level="normal",
+            tags=["imports", "interests-ingestion", category, f"category:{category}", *labels],
+            related_refs=related_refs,
+            page_ref={
+                "group": "dave",
+                "tab": "imports",
+                "artifact_path": rel,
+                "external_url": _interest_search_external_url(urls),
+            },
+            source_refs=[f"interests_intake_events:{record_id}", *related_refs],
+            provenance={
+                "schema": "xarta.personal.search.interests-intake.v1",
+                "category": category,
+                "source": provenance.get("source"),
+                "source_event_id": event_id,
+                "source_room_id": provenance.get("source_room_id"),
+                "sender": provenance.get("sender"),
+                "event_timestamp": event_timestamp,
+                "stored_at": payload.get("stored_at"),
+                "router_version": routing.get("router_version"),
+                "routing_confidence": routing.get("confidence"),
+                "processing_stage": processing.get("stage"),
+                "processing_status": processing.get("status"),
+                "artifact_path": rel,
+            },
+            updated_at=str(payload.get("stored_at") or event_timestamp or _utc_now_iso()),
+        )
+        preference = (category != "uncategorized", str(payload.get("stored_at") or ""), rel)
+        existing = by_identity.get(identity)
+        if existing is None or preference > existing[0]:
+            by_identity[identity] = (preference, doc)
+    return [
+        item[1] for item in sorted(by_identity.values(), key=lambda item: item[1]["document_id"])
+    ]
+
+
 def _collect_personal_search_documents(
     conn: Any,
     *,
@@ -10961,6 +11132,7 @@ def _prepare_personal_import_status_batches(now: str) -> list[dict[str, Any]]:
 
 def _sync_personal_search_documents_isolated(now: str) -> dict[str, Any]:
     import_rows = _prepare_personal_import_status_batches(now)
+    interest_docs = _collect_interests_search_documents()
     with _sqlite_get_conn() as sqlite_write_conn:
         import_status = _sync_personal_import_status_batches(
             sqlite_write_conn,
@@ -10988,6 +11160,7 @@ def _sync_personal_search_documents_isolated(now: str) -> dict[str, Any]:
                     include_personal=False,
                 )
             )
+    docs.extend(interest_docs)
 
     with _sqlite_get_conn() as sqlite_write_conn:
         return _reconcile_personal_search_documents(

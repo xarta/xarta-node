@@ -214,6 +214,15 @@ def test_source_signature_covers_imports_and_discussions(monkeypatch):
         "_kanban_active_store_is_postgres",
         lambda: False,
     )
+    monkeypatch.setattr(
+        scheduler.routes_personal,
+        "_personal_search_file_source_signature",
+        lambda: {
+            "name": "interests-intake-files",
+            "row_count": 0,
+            "source_signature": "sha256:empty",
+        },
+    )
     first = scheduler._source_signature_sync()
     second = scheduler._source_signature_sync()
     assert first == second
@@ -279,6 +288,15 @@ def test_source_signature_separates_sqlite_and_nontransactional_postgres(monkeyp
         "_kanban_active_store_is_postgres",
         lambda: True,
     )
+    monkeypatch.setattr(
+        scheduler.routes_personal,
+        "_personal_search_file_source_signature",
+        lambda: {
+            "name": "interests-intake-files",
+            "row_count": 0,
+            "source_signature": "sha256:empty",
+        },
+    )
 
     signature = scheduler._source_signature_sync()
 
@@ -290,6 +308,19 @@ def test_source_signature_separates_sqlite_and_nontransactional_postgres(monkeyp
         "postgres-open",
         "postgres-close",
     ]
+
+
+def test_interests_file_signature_changes_with_new_intake(monkeypatch, tmp_path):
+    monkeypatch.setattr(scheduler.routes_personal, "LONE_WOLF_ROOT", tmp_path)
+    raw = tmp_path / "interests" / "science" / "raw" / "2026-08-15"
+    raw.mkdir(parents=True)
+    first = scheduler.routes_personal._personal_search_file_source_signature()
+    (raw / "matrix-text-example.json").write_text("{}", encoding="utf-8")
+    second = scheduler.routes_personal._personal_search_file_source_signature()
+
+    assert first["row_count"] == 0
+    assert second["row_count"] == 1
+    assert second["source_signature"] != first["source_signature"]
 
 
 @async_test

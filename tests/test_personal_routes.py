@@ -967,6 +967,7 @@ def _disable_import_status_sync(monkeypatch) -> None:
         "_sync_personal_import_status_batches",
         lambda conn, now, *, rows: {"inserted": 0, "updated": 0, "unchanged": 0},
     )
+    monkeypatch.setattr(routes_personal, "_collect_interests_search_documents", lambda: [])
     monkeypatch.setattr(routes_personal, "_kanban_active_store_is_postgres", lambda: False)
 
 
@@ -2679,6 +2680,7 @@ def test_personal_search_sync_projects_import_status_rows(monkeypatch):
     conn = _make_conn()
     _patch_conn(monkeypatch, conn)
     monkeypatch.setattr(routes_personal, "_kanban_active_store_is_postgres", lambda: False)
+    monkeypatch.setattr(routes_personal, "_collect_interests_search_documents", lambda: [])
 
     monkeypatch.setattr(
         routes_personal,
@@ -2876,6 +2878,7 @@ def test_personal_search_isolated_sync_releases_postgres_before_sqlite_reconcile
         return {"document_count": 2}
 
     monkeypatch.setattr(routes_personal, "_collect_personal_search_documents", collect)
+    monkeypatch.setattr(routes_personal, "_collect_interests_search_documents", lambda: [])
     monkeypatch.setattr(routes_personal, "_reconcile_personal_search_documents", reconcile)
 
     result = routes_personal._sync_personal_search_documents_isolated("2026-07-16T15:00:00Z")
@@ -3435,6 +3438,88 @@ def test_personal_search_get_defaults_to_no_sync(monkeypatch):
 
     assert result["subsystems"]["sync"] is None
     assert result["results"][0]["document_id"] == "personal_events:evt-default-nosync"
+
+
+def test_personal_search_indexes_non_test_interests_intake(monkeypatch, tmp_path):
+    conn = _make_conn()
+    _patch_conn(monkeypatch, conn)
+    collect_interests = routes_personal._collect_interests_search_documents
+    _disable_import_status_sync(monkeypatch)
+    monkeypatch.setattr(
+        routes_personal,
+        "_collect_interests_search_documents",
+        collect_interests,
+    )
+    monkeypatch.setattr(routes_personal, "LONE_WOLF_ROOT", tmp_path)
+    payload = {
+        "record_type": "xarta_interests_intake_event",
+        "schema_version": 1,
+        "category": "science",
+        "stored_at": "2026-08-14T22:38:16Z",
+        "content": {
+            "text": "https://www.bbc.co.uk/future/article/20260813-have-the-benefits-of-intermittent-fasting-been-overhyped",
+            "urls": [
+                "https://www.bbc.co.uk/future/article/20260813-have-the-benefits-of-intermittent-fasting-been-overhyped"
+            ],
+            "media_refs": [],
+        },
+        "provenance": {
+            "source": "blueprints_e2ee_text_history",
+            "source_event_id": "$fasting-event",
+            "source_room_id": "!interests:test",
+            "sender": "@operator:test",
+            "event_timestamp": "2026-08-14T22:35:05Z",
+        },
+        "routing": {
+            "labels": ["intermittent fasting", "health research"],
+            "reason": "Nutrition science article.",
+            "confidence": 0.95,
+            "router_version": "test-router",
+        },
+        "review": {"needs_review": True, "notes": "Trusted operator URL."},
+        "processing": {"stage": "raw_capture", "status": "raw_capture_only"},
+    }
+    science_raw = tmp_path / "interests" / "science" / "raw" / "2026-08-14"
+    science_raw.mkdir(parents=True)
+    (science_raw / "matrix-text-fasting.json").write_text(json.dumps(payload), encoding="utf-8")
+    testing_raw = tmp_path / "interests" / "testing" / "raw" / "2026-08-14"
+    testing_raw.mkdir(parents=True)
+    testing_payload = {**payload, "category": "testing", "testing_campaign": {"id": "test"}}
+    (testing_raw / "matrix-text-test.json").write_text(
+        json.dumps(testing_payload), encoding="utf-8"
+    )
+
+    sync = asyncio.run(
+        routes_personal.sync_personal_search(
+            routes_personal.PersonalSearchSyncRequest(include_embeddings=False)
+        )
+    )
+    result = asyncio.run(
+        routes_personal.search_personal_activity(
+            q="intermittent fasting",
+            include_vector=False,
+            rerank_results=False,
+            limit=10,
+        )
+    )
+
+    assert sync["documents"]["document_count"] == 1
+    assert result["count"] == 1
+    assert result["results"][0]["title"] == "Intermittent Fasting"
+    assert result["results"][0]["source"]["type"] == "interests-ingestion"
+    assert result["results"][0]["mode"] == "imports"
+    assert result["results"][0]["provenance"]["source_event_id"] == "$fasting-event"
+    assert result["results"][0]["page_ref"]["external_url"] == payload["content"]["urls"][0]
+
+
+def test_interest_search_external_url_allows_only_http_and_https():
+    assert (
+        routes_personal._interest_search_external_url(
+            ["javascript:alert(1)", "file:///etc/passwd", "https://example.com/article"]
+        )
+        == "https://example.com/article"
+    )
+    assert routes_personal._interest_search_external_url(["data:text/plain,hello"]) == ""
 
 
 def test_personal_search_vector_only_candidate_and_reranker(monkeypatch):
