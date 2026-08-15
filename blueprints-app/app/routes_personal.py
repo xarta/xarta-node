@@ -80,6 +80,13 @@ XARTA_AGENT_LIB = Path(os.environ.get("XARTA_AGENT_LIB", "/root/xarta-node/.xart
 LONE_WOLF_ROOT = Path(os.environ.get("BLUEPRINTS_LONE_WOLF_ROOT", "/xarta-node/.lone-wolf"))
 INTERESTS_DASHBOARD_REL = Path("docs/interests/HERMES-INTERESTS-INGESTION-DASHBOARD.md")
 INTERESTS_ROOT_REL = Path("interests")
+INTERESTS_WIKI_HELPER = Path(
+    os.environ.get(
+        "BLUEPRINTS_INTERESTS_WIKI_HELPER",
+        "/root/xarta-node/.xarta/.agents/bin/xarta-wiki-research",
+    )
+)
+INTERESTS_WIKI_HELPER_TIMEOUT_SECONDS = 150
 INTERESTS_SEARCH_MAX_SOURCE_BYTES = 256 * 1024
 OPENCLAW_BOOKMARK_CANDIDATES_REL = Path(
     "runtime/openclaw-migration/2026-06-12-vm720/derived/bookmark_candidates.jsonl"
@@ -1556,6 +1563,13 @@ class PersonalSearchSyncRequest(BaseModel):
     force_embeddings: bool = False
     include_embeddings: bool = True
     limit: int = 200
+
+
+class PersonalInterestsWikiAskRequest(BaseModel):
+    question: str
+    category: str
+    top_k: int = 8
+    file_answer: bool = True
 
 
 def _json_value(value: str | None, fallback: Any) -> Any:
@@ -10451,8 +10465,32 @@ def _interest_search_external_url(urls: list[str]) -> str:
     return ""
 
 
+def _interest_wiki_entity_lookup() -> dict[str, dict[str, str]]:
+    """Map cited source URLs to generated entity pages without indexing query answers."""
+    root = LONE_WOLF_ROOT / INTERESTS_ROOT_REL
+    lookup: dict[str, dict[str, str]] = {}
+    if not root.exists():
+        return lookup
+    for page in sorted(root.glob("*/entities/*.md")):
+        if not page.is_file():
+            continue
+        try:
+            relative = page.relative_to(LONE_WOLF_ROOT).as_posix()
+            category = page.relative_to(root).parts[0]
+            text = page.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, IndexError):
+            continue
+        page_ref = {"wiki_path": relative, "wiki_category": category}
+        for url in re.findall(r"https?://[^\s\]\[<>\"']+", text):
+            normalized = url.rstrip("),.;'")
+            if normalized:
+                lookup.setdefault(normalized, page_ref)
+    return lookup
+
+
 def _collect_interests_search_documents() -> list[dict[str, Any]]:
     by_identity: dict[str, tuple[tuple[int, str, str], dict[str, Any]]] = {}
+    wiki_lookup = _interest_wiki_entity_lookup()
     for path in _interest_search_source_paths():
         try:
             raw = path.read_bytes()
@@ -10506,6 +10544,7 @@ def _collect_interests_search_documents() -> list[dict[str, Any]]:
             urls,
             [rel],
         )
+        wiki_ref = next((wiki_lookup[url] for url in urls if url in wiki_lookup), {})
         doc = _search_payload(
             record_type="import",
             record_table="interests_intake_events",
@@ -10528,6 +10567,7 @@ def _collect_interests_search_documents() -> list[dict[str, Any]]:
                 "tab": "imports",
                 "artifact_path": rel,
                 "external_url": _interest_search_external_url(urls),
+                **wiki_ref,
             },
             source_refs=[f"interests_intake_events:{record_id}", *related_refs],
             provenance={
@@ -33095,6 +33135,135 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _run_interests_wiki_helper_sync(
+    args: list[str],
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    if not INTERESTS_WIKI_HELPER.is_file():
+        raise HTTPException(503, "Interests wiki helper is unavailable")
+    try:
+        completed = subprocess.run(
+            [str(INTERESTS_WIKI_HELPER), *args, "--json"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(1, min(timeout_seconds, INTERESTS_WIKI_HELPER_TIMEOUT_SECONDS)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, "Local wiki question timed out") from exc
+    except OSError as exc:
+        raise HTTPException(503, "Interests wiki helper could not start") from exc
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "Interests wiki helper returned invalid JSON (exit=%s stderr=%s)",
+            completed.returncode,
+            completed.stderr.strip()[:300],
+        )
+        raise HTTPException(502, "Interests wiki helper returned an invalid response") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(502, "Interests wiki helper returned an invalid response")
+    if completed.returncode == 0 and payload.get("ok") is not False:
+        return payload
+    error_code = str(payload.get("error_code") or "helper_failed")
+    status = {
+        "invalid_category": 400,
+        "invalid_path": 400,
+        "missing_evidence": 404,
+        "missing_evidence_citations": 422,
+        "invalid_citations": 502,
+        "model_timeout": 504,
+        "model_failed": 503,
+    }.get(error_code, 502)
+    detail = str(payload.get("error") or error_code).replace("_", " ")[:300]
+    raise HTTPException(status, detail)
+
+
+def _read_interests_wiki_page_sync(path: str) -> dict[str, Any]:
+    artifact_path, rel = _resolve_import_artifact_path(path)
+    parts = Path(rel).parts
+    if (
+        len(parts) < 4
+        or parts[0] != "interests"
+        or parts[2] not in {"entities", "queries"}
+        or artifact_path.suffix.lower() != ".md"
+    ):
+        raise HTTPException(403, "path is not a generated Interests wiki page")
+    stat = artifact_path.stat()
+    if stat.st_size > IMPORT_ARTIFACT_PREVIEW_BYTES:
+        raise HTTPException(413, "wiki page exceeds the preview limit")
+    return {
+        "ok": True,
+        "schema": "xarta.personal.interests.wiki.page.v1",
+        "path": rel,
+        "category": parts[1],
+        "kind": "entity" if parts[2] == "entities" else "query",
+        "title": artifact_path.stem.replace("-", " ").strip().title(),
+        "sha256": _sha256_file(artifact_path),
+        "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "markdown": artifact_path.read_text(encoding="utf-8", errors="replace"),
+    }
+
+
+@router.get("/interests-wiki/catalog")
+async def get_interests_wiki_catalog(
+    category: str | None = Query(default=None, max_length=80),
+    q: str | None = Query(default=None, max_length=240),
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    args = ["catalog", "--limit", str(limit)]
+    if category:
+        args.extend(["--category", category.strip()])
+    if q:
+        args.extend(["--query", q.strip()])
+    return await _run_personal_sync_work(
+        _run_interests_wiki_helper_sync,
+        args,
+        timeout_seconds=20,
+    )
+
+
+@router.get("/interests-wiki/page")
+async def get_interests_wiki_page(
+    path: str = Query(..., min_length=1, max_length=500),
+) -> dict[str, Any]:
+    return await _run_personal_sync_work(_read_interests_wiki_page_sync, path)
+
+
+@router.post("/interests-wiki/ask")
+async def ask_interests_wiki(body: PersonalInterestsWikiAskRequest) -> dict[str, Any]:
+    question = body.question.strip()
+    category = body.category.strip()
+    if not 3 <= len(question) <= 2000:
+        raise HTTPException(400, "question must contain between 3 and 2000 characters")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,79}", category):
+        raise HTTPException(400, "category is invalid")
+    if not 1 <= body.top_k <= 12:
+        raise HTTPException(400, "top_k must be between 1 and 12")
+    args = [
+        "ask",
+        question,
+        "--category",
+        category,
+        "--top-k",
+        str(body.top_k),
+        "--mode",
+        "hybrid",
+    ]
+    if body.file_answer:
+        args.append("--file-answer")
+    return await _run_personal_sync_work(
+        _run_interests_wiki_helper_sync,
+        args,
+        timeout_seconds=INTERESTS_WIKI_HELPER_TIMEOUT_SECONDS,
+    )
 
 
 @router.get("/imports-artifact")

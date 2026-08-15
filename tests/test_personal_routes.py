@@ -3482,6 +3482,12 @@ def test_personal_search_indexes_non_test_interests_intake(monkeypatch, tmp_path
     science_raw = tmp_path / "interests" / "science" / "raw" / "2026-08-14"
     science_raw.mkdir(parents=True)
     (science_raw / "matrix-text-fasting.json").write_text(json.dumps(payload), encoding="utf-8")
+    science_entities = tmp_path / "interests" / "science" / "entities"
+    science_entities.mkdir(parents=True)
+    (science_entities / "intermittent-fasting-benefits-overhyped.md").write_text(
+        "# Intermittent fasting\n\nOriginal URL: " + payload["content"]["urls"][0],
+        encoding="utf-8",
+    )
     testing_raw = tmp_path / "interests" / "testing" / "raw" / "2026-08-14"
     testing_raw.mkdir(parents=True)
     testing_payload = {**payload, "category": "testing", "testing_campaign": {"id": "test"}}
@@ -3510,6 +3516,10 @@ def test_personal_search_indexes_non_test_interests_intake(monkeypatch, tmp_path
     assert result["results"][0]["mode"] == "imports"
     assert result["results"][0]["provenance"]["source_event_id"] == "$fasting-event"
     assert result["results"][0]["page_ref"]["external_url"] == payload["content"]["urls"][0]
+    assert result["results"][0]["page_ref"]["wiki_path"] == (
+        "interests/science/entities/intermittent-fasting-benefits-overhyped.md"
+    )
+    assert result["results"][0]["page_ref"]["wiki_category"] == "science"
 
 
 def test_interest_search_external_url_allows_only_http_and_https():
@@ -3519,6 +3529,119 @@ def test_interest_search_external_url_allows_only_http_and_https():
         )
         == "https://example.com/article"
     )
+
+
+def test_interests_wiki_helper_uses_fixed_executable_and_json(monkeypatch, tmp_path):
+    helper = tmp_path / "xarta-wiki-research"
+    helper.write_text("fixture", encoding="utf-8")
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"ok": True, "schema": "xarta.interests.wiki.catalog.v1"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(routes_personal, "INTERESTS_WIKI_HELPER", helper)
+    monkeypatch.setattr(routes_personal.subprocess, "run", fake_run)
+
+    result = routes_personal._run_interests_wiki_helper_sync(
+        ["catalog", "--category", "science"], timeout_seconds=20
+    )
+
+    assert result["ok"] is True
+    assert seen["command"] == [str(helper), "catalog", "--category", "science", "--json"]
+    assert "shell" not in seen["kwargs"]
+    assert seen["kwargs"]["timeout"] == 20
+
+
+def test_interests_wiki_helper_maps_timeout_and_evidence_errors(monkeypatch, tmp_path):
+    helper = tmp_path / "xarta-wiki-research"
+    helper.write_text("fixture", encoding="utf-8")
+    monkeypatch.setattr(routes_personal, "INTERESTS_WIKI_HELPER", helper)
+
+    def timeout_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("wiki", 1)
+
+    monkeypatch.setattr(routes_personal.subprocess, "run", timeout_run)
+    with pytest.raises(routes_personal.HTTPException) as timeout_error:
+        routes_personal._run_interests_wiki_helper_sync(["catalog"], timeout_seconds=1)
+    assert timeout_error.value.status_code == 504
+
+    def evidence_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            3,
+            stdout=json.dumps({"ok": False, "error_code": "missing_evidence"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(routes_personal.subprocess, "run", evidence_run)
+    with pytest.raises(routes_personal.HTTPException) as evidence_error:
+        routes_personal._run_interests_wiki_helper_sync(["ask"], timeout_seconds=20)
+    assert evidence_error.value.status_code == 404
+
+
+def test_interests_wiki_page_is_bounded_to_generated_markdown(monkeypatch, tmp_path):
+    monkeypatch.setattr(routes_personal, "LONE_WOLF_ROOT", tmp_path)
+    entity = tmp_path / "interests" / "science" / "entities" / "fasting.md"
+    entity.parent.mkdir(parents=True)
+    entity.write_text("# Fasting\n\nGrounded page.", encoding="utf-8")
+    raw = tmp_path / "interests" / "science" / "raw" / "source.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_text("{}", encoding="utf-8")
+
+    result = routes_personal._read_interests_wiki_page_sync("interests/science/entities/fasting.md")
+    assert result["schema"] == "xarta.personal.interests.wiki.page.v1"
+    assert result["markdown"].startswith("# Fasting")
+
+    with pytest.raises(routes_personal.HTTPException) as raw_error:
+        routes_personal._read_interests_wiki_page_sync("interests/science/raw/source.json")
+    assert raw_error.value.status_code == 403
+
+
+def test_interests_wiki_ask_keeps_model_authority_server_side(monkeypatch):
+    captured = {}
+
+    def fake_helper(args, *, timeout_seconds):
+        captured["args"] = args
+        captured["timeout_seconds"] = timeout_seconds
+        return {
+            "ok": True,
+            "schema": "xarta.interests.wiki.answer.v1",
+            "model": "local-model-fixture",
+            "answer_markdown": "Answer [1]",
+            "evidence": [{"relative_path": "entities/fasting.md"}],
+        }
+
+    monkeypatch.setattr(routes_personal, "_run_interests_wiki_helper_sync", fake_helper)
+    result = asyncio.run(
+        routes_personal.ask_interests_wiki(
+            routes_personal.PersonalInterestsWikiAskRequest(
+                question="What does the evidence say?",
+                category="science",
+                top_k=5,
+            )
+        )
+    )
+
+    assert result["model"] == "local-model-fixture"
+    assert captured["args"] == [
+        "ask",
+        "What does the evidence say?",
+        "--category",
+        "science",
+        "--top-k",
+        "5",
+        "--mode",
+        "hybrid",
+        "--file-answer",
+    ]
+    assert "--model" not in captured["args"]
     assert routes_personal._interest_search_external_url(["data:text/plain,hello"]) == ""
 
 
