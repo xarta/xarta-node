@@ -541,9 +541,57 @@ model_list:
     assert facts.max_output_tokens == 65536
     assert facts.total_context_tokens == 204800
     assert facts.context_buffer_tokens == 256
+    assert facts.requested_max_tokens == 9000
     assert facts.request_max_tokens == 9000
+    assert facts.request_max_tokens_clamped is False
     prompt = wake_stt_direct._budget_context_for_prompt(facts)
     assert "2000-word essay request is normally well within" in prompt
+
+
+def test_hermes_stt_budget_facts_clamp_request_to_selected_alias(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    profile_env = profile / ".env"
+    profile_env.write_text("API_SERVER_KEY=test-only\n", encoding="utf-8")
+    (profile / "config.yaml").write_text(
+        """
+model:
+  default: TEST-LOCAL
+custom_providers:
+  - name: test
+    models:
+      TEST-LOCAL:
+        context_length: 98304
+""",
+        encoding="utf-8",
+    )
+    litellm_config = tmp_path / "litellm.yaml"
+    litellm_config.write_text(
+        """
+model_list:
+  - model_name: TEST-LOCAL
+    model_info:
+      max_input_tokens: 61440
+      max_output_tokens: 4096
+      xarta_total_context_tokens: 98304
+      xarta_context_window_buffer_tokens: 256
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOC_SPEECH_LITELLM_CONFIG_PATH", str(litellm_config))
+
+    facts = wake_stt_direct.hermes_stt_budget_facts(
+        wake_stt_direct.HermesSttConfig(
+            api_base="http://127.0.0.1:8643",
+            api_key="test-only",
+            profile_env_path=profile_env,
+            max_tokens=8192,
+        )
+    )
+
+    assert facts.requested_max_tokens == 8192
+    assert facts.request_max_tokens == 4096
+    assert facts.request_max_tokens_clamped is True
 
 
 def test_hermes_stt_session_phrase_scanner_reports_counts_without_context(tmp_path):

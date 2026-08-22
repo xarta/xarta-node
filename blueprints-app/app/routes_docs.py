@@ -33,6 +33,7 @@ from . import config as cfg
 from .db import get_conn, increment_gen
 from .doc_speech_budget import (
     approx_output_tokens_for_words,
+    clamp_output_tokens,
     count_text_tokens,
     doc_speech_budget_threshold_ratio,
     doc_speech_max_source_bytes,
@@ -439,10 +440,12 @@ async def _complete_doc_speech_local(
     requested_max_tokens = (
         _doc_speech_max_tokens() if max_tokens is None else max(256, int(max_tokens))
     )
+    model_budget = read_model_budget(model)
+    effective_max_tokens = clamp_output_tokens(requested_max_tokens, model_budget)
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": requested_max_tokens,
+        "max_tokens": effective_max_tokens,
     }
     headers = {"Authorization": f"Bearer {api_key}"}
     timeout = float(os.environ.get("DOC_SPEECH_LLM_TIMEOUT", "300"))
@@ -490,7 +493,12 @@ async def _complete_doc_speech_local(
         raise HTTPException(502, "Local LLM returned an invalid narration response") from exc
     meta = {
         "llm_model": data.get("model") or model,
-        "max_tokens": requested_max_tokens,
+        "requested_max_tokens": requested_max_tokens,
+        "max_tokens": effective_max_tokens,
+        "max_tokens_clamped": effective_max_tokens != requested_max_tokens,
+        "model_max_output_tokens": model_budget.max_output_tokens,
+        "model_budget_source": model_budget.source,
+        "model_budget_warning": model_budget.warning,
         "finish_reason": choice.get("finish_reason"),
         "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
     }
@@ -549,7 +557,12 @@ def _doc_speech_call_meta(operation: str, meta: dict[str, Any]) -> dict[str, Any
     return {
         "operation": operation,
         "llm_model": meta.get("llm_model"),
+        "requested_max_tokens": meta.get("requested_max_tokens"),
         "max_tokens": meta.get("max_tokens"),
+        "max_tokens_clamped": meta.get("max_tokens_clamped"),
+        "model_max_output_tokens": meta.get("model_max_output_tokens"),
+        "model_budget_source": meta.get("model_budget_source"),
+        "model_budget_warning": meta.get("model_budget_warning"),
         "finish_reason": meta.get("finish_reason"),
         "usage": meta.get("usage"),
     }
@@ -1106,8 +1119,11 @@ async def _generate_doc_speech_markdown(
     max_words = doc_speech_max_words()
     threshold_ratio = doc_speech_budget_threshold_ratio()
     direct_requested_output_tokens = _doc_speech_max_tokens()
+    direct_effective_output_tokens = clamp_output_tokens(
+        direct_requested_output_tokens, model_budget
+    )
     effective_input_budget = _doc_speech_effective_input_budget(
-        model_budget, direct_requested_output_tokens
+        model_budget, direct_effective_output_tokens
     )
 
     if max_source_bytes > 0 and source_bytes > max_source_bytes:

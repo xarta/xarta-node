@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from .db import get_conn
+from .doc_speech_budget import clamp_output_tokens, read_model_budget
 from .local_llm_events import (
     publish_local_llm_offline_event,
     publish_local_llm_recovered_event,
@@ -919,7 +920,9 @@ async def _complete_web_research_speech_local(
             503, "WEB_RESEARCH_SPEECH_LLM_MODEL or DOC_SPEECH_LLM_MODEL is not configured"
         )
 
-    max_tokens = _web_research_speech_max_tokens()
+    requested_max_tokens = _web_research_speech_max_tokens()
+    model_budget = read_model_budget(model)
+    max_tokens = clamp_output_tokens(requested_max_tokens, model_budget)
     payload = {
         "model": model,
         "messages": messages,
@@ -978,7 +981,12 @@ async def _complete_web_research_speech_local(
         ) from exc
     meta = {
         "llm_model": data.get("model") or model,
+        "requested_max_tokens": requested_max_tokens,
         "max_tokens": max_tokens,
+        "max_tokens_clamped": max_tokens != requested_max_tokens,
+        "model_max_output_tokens": model_budget.max_output_tokens,
+        "model_budget_source": model_budget.source,
+        "model_budget_warning": model_budget.warning,
         "finish_reason": choice.get("finish_reason"),
         "usage": data.get("usage") if isinstance(data.get("usage"), dict) else None,
     }

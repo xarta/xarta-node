@@ -36,7 +36,12 @@ os.environ.setdefault("SEEKDB_USER", "blueprints_test")
 os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 
 from app import routes_docs  # noqa: E402
-from app.doc_speech_budget import ModelBudget, TokenCount, read_model_budget  # noqa: E402
+from app.doc_speech_budget import (  # noqa: E402
+    ModelBudget,
+    TokenCount,
+    clamp_output_tokens,
+    read_model_budget,
+)
 from app.doc_speech_long import allocate_word_targets, split_sections  # noqa: E402
 from app.routes_docs import _assert_complete_doc_speech, _strip_frontmatter  # noqa: E402
 
@@ -101,6 +106,84 @@ model_list:
     assert budget.max_output_tokens == 65536
     assert budget.total_context_tokens == 204800
     assert budget.context_buffer_tokens == 256
+
+
+def test_output_preference_is_clamped_to_selected_alias_budget():
+    budget = ModelBudget(
+        model="PRIMARY-LOCAL-PRIVATE-NO-PROTECTION",
+        source="test",
+        max_input_tokens=61440,
+        max_output_tokens=32768,
+        total_context_tokens=98304,
+        context_buffer_tokens=256,
+        metadata={},
+    )
+
+    assert clamp_output_tokens(48000, budget) == 32768
+    assert clamp_output_tokens(1200, budget) == 1200
+
+
+@pytest.mark.asyncio
+async def test_doc_speech_completion_sends_mode_derived_output_ceiling(monkeypatch):
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm.test")
+    monkeypatch.setenv("LITELLM_API_KEY", "test-only")
+    monkeypatch.setenv("DOC_SPEECH_LLM_MODEL", "PRIMARY-LOCAL-PRIVATE-NO-PROTECTION")
+    monkeypatch.setenv("DOC_SPEECH_LLM_MAX_TOKENS", "48000")
+    budget = ModelBudget(
+        model="PRIMARY-LOCAL-PRIVATE-NO-PROTECTION",
+        source="test-mode-contract",
+        max_input_tokens=61440,
+        max_output_tokens=32768,
+        total_context_tokens=98304,
+        context_buffer_tokens=256,
+        metadata={},
+    )
+    observed = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "model": "qwen3.8-test",
+                "choices": [{"message": {"content": "Narration."}, "finish_reason": "stop"}],
+                "usage": {},
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            assert headers["Authorization"].startswith("Bearer ")
+            observed.update(json)
+            return FakeResponse()
+
+    async def no_event(**_kwargs):
+        return None
+
+    monkeypatch.setattr(routes_docs, "read_model_budget", lambda _model: budget)
+    monkeypatch.setattr(routes_docs.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(routes_docs, "publish_local_llm_recovered_event", no_event)
+
+    answer, meta = await routes_docs._complete_doc_speech_local(
+        [{"role": "user", "content": "Narrate this."}]
+    )
+
+    assert answer == "Narration."
+    assert observed["max_tokens"] == 32768
+    assert meta["requested_max_tokens"] == 48000
+    assert meta["max_tokens"] == 32768
+    assert meta["max_tokens_clamped"] is True
+    assert meta["model_budget_source"] == "test-mode-contract"
 
 
 @pytest.mark.asyncio

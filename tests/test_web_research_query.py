@@ -39,12 +39,78 @@ os.environ.setdefault("SEEKDB_PASSWORD", "blueprints_test")
 os.environ.setdefault("DOC_SPEECH_LLM_MODEL", "TEST-QUERY-NORMALIZER-MODEL")
 
 from app import routes_web_research  # noqa: E402
+from app.doc_speech_budget import ModelBudget  # noqa: E402
 from app.routes_web_research import (  # noqa: E402
     _fallback_normalize_web_research_query,
     _normalize_web_research_query,
     _validate_public_query,
     _web_research_query_normalizer_model,
 )
+
+
+@pytest.mark.asyncio
+async def test_web_research_speech_sends_mode_derived_output_ceiling(monkeypatch):
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://litellm.test")
+    monkeypatch.setenv("LITELLM_API_KEY", "test-only")
+    monkeypatch.setenv("WEB_RESEARCH_SPEECH_LLM_MODEL", "PRIMARY-LOCAL-PRIVATE-NO-PROTECTION")
+    monkeypatch.setenv("WEB_RESEARCH_SPEECH_LLM_MAX_TOKENS", "48000")
+    budget = ModelBudget(
+        model="PRIMARY-LOCAL-PRIVATE-NO-PROTECTION",
+        source="test-mode-contract",
+        max_input_tokens=61440,
+        max_output_tokens=32768,
+        total_context_tokens=98304,
+        context_buffer_tokens=256,
+        metadata={},
+    )
+    observed = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "model": "qwen3.8-test",
+                "choices": [
+                    {"message": {"content": "Research narration."}, "finish_reason": "stop"}
+                ],
+                "usage": {},
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            assert headers["Authorization"].startswith("Bearer ")
+            observed.update(json)
+            return FakeResponse()
+
+    async def no_event(**_kwargs):
+        return None
+
+    monkeypatch.setattr(routes_web_research, "read_model_budget", lambda _model: budget)
+    monkeypatch.setattr(routes_web_research.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(routes_web_research, "publish_local_llm_recovered_event", no_event)
+
+    answer, meta = await routes_web_research._complete_web_research_speech_local(
+        [{"role": "user", "content": "Narrate this research."}]
+    )
+
+    assert answer == "Research narration."
+    assert observed["max_tokens"] == 32768
+    assert meta["requested_max_tokens"] == 48000
+    assert meta["max_tokens"] == 32768
+    assert meta["max_tokens_clamped"] is True
+    assert meta["model_budget_source"] == "test-mode-contract"
 
 
 @pytest.mark.asyncio

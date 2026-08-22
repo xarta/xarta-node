@@ -78,12 +78,16 @@ def doc_speech_budget_threshold_ratio() -> float:
 
 
 def doc_speech_target_words() -> int:
-    return env_int("DOC_SPEECH_TARGET_SPOKEN_WORDS", DEFAULT_TARGET_SPOKEN_WORDS, minimum=100, maximum=5000)
+    return env_int(
+        "DOC_SPEECH_TARGET_SPOKEN_WORDS", DEFAULT_TARGET_SPOKEN_WORDS, minimum=100, maximum=5000
+    )
 
 
 def doc_speech_max_words() -> int:
     target = doc_speech_target_words()
-    return env_int("DOC_SPEECH_MAX_SPOKEN_WORDS", DEFAULT_MAX_SPOKEN_WORDS, minimum=target, maximum=6000)
+    return env_int(
+        "DOC_SPEECH_MAX_SPOKEN_WORDS", DEFAULT_MAX_SPOKEN_WORDS, minimum=target, maximum=6000
+    )
 
 
 def approx_output_tokens_for_words(words: int) -> int:
@@ -99,17 +103,25 @@ def _load_qwen_tokenizer(model: str, local_files_only: bool) -> Any:
     from huggingface_hub import hf_hub_download
     from tokenizers import Tokenizer
 
-    local_path = hf_hub_download(repo_id=model, filename="tokenizer.json", local_files_only=local_files_only)
+    local_path = hf_hub_download(
+        repo_id=model, filename="tokenizer.json", local_files_only=local_files_only
+    )
     return Tokenizer.from_file(local_path)
 
 
 def count_text_tokens(text: str) -> TokenCount:
-    tokenizer_model = (os.environ.get("QWEN_TOKENIZER_MODEL") or DEFAULT_QWEN_TOKENIZER_MODEL).strip()
-    local_only_raw = (os.environ.get("DOC_SPEECH_TOKENIZER_LOCAL_FILES_ONLY") or "1").strip().lower()
+    tokenizer_model = (
+        os.environ.get("QWEN_TOKENIZER_MODEL") or DEFAULT_QWEN_TOKENIZER_MODEL
+    ).strip()
+    local_only_raw = (
+        (os.environ.get("DOC_SPEECH_TOKENIZER_LOCAL_FILES_ONLY") or "1").strip().lower()
+    )
     local_files_only = local_only_raw not in {"0", "false", "no"}
     try:
         tokenizer = _load_qwen_tokenizer(tokenizer_model, local_files_only)
-        return TokenCount(tokens=len(tokenizer.encode(str(text or "")).ids), method="qwen-tokenizer")
+        return TokenCount(
+            tokens=len(tokenizer.encode(str(text or "")).ids), method="qwen-tokenizer"
+        )
     except Exception as exc:
         return TokenCount(
             tokens=heuristic_token_count(text),
@@ -128,7 +140,9 @@ def _coerce_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
-def _extract_model_info_from_yaml(config_path: Path, model: str) -> tuple[dict[str, Any] | None, str | None]:
+def _extract_model_info_from_yaml(
+    config_path: Path, model: str
+) -> tuple[dict[str, Any] | None, str | None]:
     try:
         import yaml
     except Exception as exc:
@@ -170,9 +184,13 @@ def read_model_budget(model: str) -> ModelBudget:
             max_input_tokens=max_input or DEFAULT_SAFE_INPUT_TOKENS,
             max_output_tokens=max_output or DEFAULT_OUTPUT_TOKENS,
             total_context_tokens=total_context or max(max_input or 0, DEFAULT_TOTAL_CONTEXT_TOKENS),
-            context_buffer_tokens=buffer_tokens if buffer_tokens is not None else DEFAULT_CONTEXT_BUFFER_TOKENS,
+            context_buffer_tokens=buffer_tokens
+            if buffer_tokens is not None
+            else DEFAULT_CONTEXT_BUFFER_TOKENS,
             metadata=metadata,
-            warning=None if max_input else "model_info missing max_input_tokens; used conservative fallback",
+            warning=None
+            if max_input
+            else "model_info missing max_input_tokens; used conservative fallback",
         )
 
     return ModelBudget(
@@ -185,3 +203,11 @@ def read_model_budget(model: str) -> ModelBudget:
         metadata={},
         warning=warning or "model metadata unavailable; used conservative fallback",
     )
+
+
+def clamp_output_tokens(requested_tokens: int, model_budget: ModelBudget) -> int:
+    """Clamp a client preference to the selected alias's advertised output ceiling."""
+
+    requested = max(1, int(requested_tokens))
+    advertised_max = max(1, int(model_budget.max_output_tokens))
+    return min(requested, advertised_max)

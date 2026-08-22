@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 import httpx
 
 from . import hermes_minutes
-from .doc_speech_budget import read_model_budget
+from .doc_speech_budget import clamp_output_tokens, read_model_budget
 
 AUTHORISED_PHRASE = "This command is authorised"
 DEFAULT_HERMES_STT_PROFILE_ENV_PATH = Path(
@@ -564,7 +564,9 @@ class HermesSttBudgetFacts:
     max_output_tokens: int = 0
     total_context_tokens: int = 0
     context_buffer_tokens: int = 0
+    requested_max_tokens: int = DEFAULT_HERMES_STT_MAX_TOKENS
     request_max_tokens: int = DEFAULT_HERMES_STT_MAX_TOKENS
+    request_max_tokens_clamped: bool = False
     source: str = ""
     warning: str = ""
 
@@ -576,7 +578,9 @@ class HermesSttBudgetFacts:
             "max_output_tokens": self.max_output_tokens,
             "total_context_tokens": self.total_context_tokens,
             "context_buffer_tokens": self.context_buffer_tokens,
+            "requested_max_tokens": self.requested_max_tokens,
             "request_max_tokens": self.request_max_tokens,
+            "request_max_tokens_clamped": self.request_max_tokens_clamped,
             "source": self.source,
             "warning": self.warning,
         }
@@ -1520,6 +1524,10 @@ def hermes_stt_budget_facts(config: HermesSttConfig) -> HermesSttBudgetFacts:
     warning = profile_warning
     if budget and budget.warning:
         warning = "; ".join(part for part in (warning, budget.warning) if part)
+    requested_max_tokens = int(config.max_tokens)
+    request_max_tokens = (
+        clamp_output_tokens(requested_max_tokens, budget) if budget else requested_max_tokens
+    )
     return HermesSttBudgetFacts(
         model_alias=model_alias,
         profile_context_tokens=profile_context,
@@ -1527,7 +1535,9 @@ def hermes_stt_budget_facts(config: HermesSttConfig) -> HermesSttBudgetFacts:
         max_output_tokens=int(budget.max_output_tokens) if budget else 0,
         total_context_tokens=int(budget.total_context_tokens) if budget else 0,
         context_buffer_tokens=int(budget.context_buffer_tokens) if budget else 0,
-        request_max_tokens=config.max_tokens,
+        requested_max_tokens=requested_max_tokens,
+        request_max_tokens=request_max_tokens,
+        request_max_tokens_clamped=request_max_tokens != requested_max_tokens,
         source=str(budget.source) if budget else "",
         warning=warning,
     )
@@ -1542,7 +1552,8 @@ def _budget_context_for_prompt(budget: HermesSttBudgetFacts) -> str:
         f"- LiteLLM safe prompt budget max_input_tokens: {facts['max_input_tokens'] or 'unknown'} tokens\n"
         f"- LiteLLM output budget max_output_tokens: {facts['max_output_tokens'] or 'unknown'} tokens\n"
         f"- LiteLLM total prompt-plus-output context: {facts['total_context_tokens'] or 'unknown'} tokens\n"
-        f"- Blueprints request max_tokens for this response: {facts['request_max_tokens']} tokens\n"
+        f"- Blueprints configured max_tokens preference: {facts['requested_max_tokens']} tokens\n"
+        f"- Effective request max_tokens after model-budget clamp: {facts['request_max_tokens']} tokens\n"
         "A 2000-word essay request is normally well within the configured input/context "
         "window here. If you cannot produce a requested long spoken answer, explain the "
         "actual output-budget, speech-duration, action-authorisation, or policy reason."
@@ -5077,7 +5088,7 @@ async def submit_wake_stt_to_hermes(
         gate,
         config.model,
         budget=budget,
-        max_tokens=config.max_tokens,
+        max_tokens=budget.request_max_tokens,
         minutes_context=minutes_context,
         followup_context=followup_context,
     )
@@ -5094,7 +5105,7 @@ async def submit_wake_stt_to_hermes(
                 session_id=config.session_id or DEFAULT_HERMES_STT_SESSION_ID,
                 authorised=gate.authorised,
                 request_chars=len(gate.meat),
-                max_tokens=config.max_tokens,
+                max_tokens=budget.request_max_tokens,
             )
         first_delta_seen = False
         external_delta_callback = None if gate.authorised else assistant_delta_callback
