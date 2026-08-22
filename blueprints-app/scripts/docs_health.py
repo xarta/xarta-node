@@ -162,6 +162,8 @@ def main() -> int:
                 sys.executable,
                 str(docs_scripts / "docs-sync-to-db.py"),
                 "--dry-run",
+                "--ai-model",
+                "PRIMARY-LOCAL-NO-THINK-NO-PROTECTION",
             ],
         ),
         (
