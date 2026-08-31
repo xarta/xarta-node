@@ -2148,6 +2148,54 @@ def _clean_active_browser_imports_dashboard(raw: Any) -> dict[str, Any]:
     }
 
 
+def _clean_active_browser_email(raw: Any) -> dict[str, Any]:
+    email = raw if isinstance(raw, dict) else {}
+    return {
+        "loaded": bool(email.get("loaded")),
+        "loading": bool(email.get("loading")),
+        "folder_loading": bool(email.get("folder_loading")),
+        "status": _clean_string(email.get("status"), "", 40),
+        "mailbox": _clean_string(email.get("mailbox"), "", 240),
+        "folder_count": _clean_browser_page_int(email.get("folder_count"), maximum=10000),
+        "message_count": _clean_browser_page_int(email.get("message_count"), maximum=1000000),
+        "selected_folder": _clean_string(email.get("selected_folder"), "", 240),
+        "selected_uid": _clean_string(email.get("selected_uid"), "", 180),
+        "message_list_offset": _clean_browser_page_int(
+            email.get("message_list_offset"), maximum=1000000
+        ),
+        "message_list_total": _clean_browser_page_int(
+            email.get("message_list_total"), maximum=1000000
+        ),
+        "message_list_has_more": bool(email.get("message_list_has_more")),
+        "message_prefetch_ready": bool(email.get("message_prefetch_ready")),
+        "message_prefetch_loading": bool(email.get("message_prefetch_loading")),
+        "message_prefetch_error": _clean_string(email.get("message_prefetch_error"), "", 180),
+        "message_open_cache_size": _clean_browser_page_int(
+            email.get("message_open_cache_size"), maximum=10000
+        ),
+        "message_open_prefetch_queue": _clean_browser_page_int(
+            email.get("message_open_prefetch_queue"), maximum=10000
+        ),
+        "message_open_prefetch_in_flight": _clean_browser_page_int(
+            email.get("message_open_prefetch_in_flight"), maximum=10000
+        ),
+        "message_open_prefetch_completed": _clean_browser_page_int(
+            email.get("message_open_prefetch_completed"), maximum=1000000
+        ),
+        "message_open_prefetch_failed": _clean_browser_page_int(
+            email.get("message_open_prefetch_failed"), maximum=1000000
+        ),
+        "message_open_prefetch_last_error": _clean_string(
+            email.get("message_open_prefetch_last_error"), "", 180
+        ),
+        "message_context_menu_open": bool(email.get("message_context_menu_open")),
+        "view": _clean_string(email.get("view"), "", 40),
+        "list_collapsed": bool(email.get("list_collapsed")),
+        "activity_heartbeat_active": bool(email.get("activity_heartbeat_active")),
+        "error": _clean_string(email.get("error"), "", 180),
+    }
+
+
 def _clean_active_browser_diary_day(raw: Any) -> dict[str, Any]:
     diary = raw if isinstance(raw, dict) else {}
     return {
@@ -2628,6 +2676,7 @@ def _clean_active_browser_automation_report(
         "selector_actions": selector_actions,
         "last_command": last_command,
         "surfaces": {
+            "email": _clean_active_browser_email(surfaces.get("email")),
             "diary_day": _clean_active_browser_diary_day(surfaces.get("diary_day")),
             "calendar": _clean_active_browser_calendar(surfaces.get("calendar")),
             "todo": _clean_active_browser_todo(surfaces.get("todo")),

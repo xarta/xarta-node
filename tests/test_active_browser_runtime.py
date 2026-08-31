@@ -648,6 +648,40 @@ def test_active_browser_automation_preserves_personal_search_graph_surfaces():
     assert report["surfaces"]["personal_graph"]["first_link"] == "git_commit:abc123"
 
 
+def test_active_browser_automation_preserves_sanitized_email_surface():
+    report = active_browser_runtime._clean_active_browser_automation_report(
+        {
+            "surfaces": {
+                "email": {
+                    "loaded": True,
+                    "loading": False,
+                    "folder_loading": False,
+                    "status": "ready",
+                    "mailbox": "operator@example.test",
+                    "message_count": 100,
+                    "selected_folder": "INBOX",
+                    "selected_uid": "20260831-proof",
+                    "message_list_total": 18674,
+                    "message_list_has_more": True,
+                    "message_open_cache_size": 8,
+                    "message_open_prefetch_failed": 2,
+                    "message_open_prefetch_last_error": "temporary failure",
+                    "error": "",
+                    "body": "must not cross the automation boundary",
+                }
+            }
+        }
+    )
+
+    email = report["surfaces"]["email"]
+    assert email["loaded"] is True
+    assert email["selected_folder"] == "INBOX"
+    assert email["selected_uid"] == "20260831-proof"
+    assert email["message_list_total"] == 18674
+    assert email["message_open_prefetch_failed"] == 2
+    assert "body" not in email
+
+
 def test_active_browser_automation_compacts_menu_lists_and_preserves_matrix_metrics():
     report = active_browser_runtime._clean_active_browser_automation_report(
         {
