@@ -222,6 +222,8 @@ def test_work_arriving_during_admission_prevents_git_mutation(monkeypatch):
     )
     assert result["code"] == "blueprints_provider_not_quiescent"
     assert events == ["claims-fenced", "inflight-claim-registered"]
+    assert routes_sync._RESTART_PENDING is False
+    assert routes_sync._PUBLIC_RECOVERY_HELD is False
 
 
 def test_recovery_receipt_request_binds_recovery_authority():

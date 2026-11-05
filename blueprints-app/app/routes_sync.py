@@ -946,8 +946,8 @@ async def _git_pull_scopes_and_maybe_restart(
             )
             return {"ok": True, "status": "completed", **result}
         except SchedulerRestartRefused as exc:
-            _RESTART_PENDING = recovery is not None
-            _PUBLIC_RECOVERY_HELD = recovery is not None
+            _RESTART_PENDING = recovery is not None and claims_paused
+            _PUBLIC_RECOVERY_HELD = recovery is not None and claims_paused
             if claims_paused and recovery is None:
                 await _resume_blueprints_provider_claims()
             await _update_git_pull_operation(
@@ -959,8 +959,8 @@ async def _git_pull_scopes_and_maybe_restart(
             log.warning("git pull batch%s restart refused: %s", source_label, exc.code)
             return {"ok": False, "code": exc.code, "detail": exc.detail}
         except Exception as exc:
-            _RESTART_PENDING = recovery is not None
-            _PUBLIC_RECOVERY_HELD = recovery is not None
+            _RESTART_PENDING = recovery is not None and claims_paused
+            _PUBLIC_RECOVERY_HELD = recovery is not None and claims_paused
             if claims_paused and recovery is None:
                 await _resume_blueprints_provider_claims()
             code = str(exc).split(":", 1)[0] if str(exc) else type(exc).__name__
