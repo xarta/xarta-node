@@ -33,8 +33,16 @@ def histories(tmp_path):
     (writer / ".gitignore").write_text(".env\n.nodes.json\n.xarta/\n.lone-wolf/\n")
     (writer / "blueprints-app/app").mkdir(parents=True)
     (writer / recovery.BOOTSTRAP_PATHS[0]).write_text("old protocol")
+    (writer / "blueprints-app/app/db.py").write_text("old source")
     (writer / "source").write_text("base")
-    git(writer, "add", ".gitignore", "source", recovery.BOOTSTRAP_PATHS[0])
+    git(
+        writer,
+        "add",
+        ".gitignore",
+        "source",
+        recovery.BOOTSTRAP_PATHS[0],
+        "blueprints-app/app/db.py",
+    )
     git(writer, "commit", "-m", "base")
     git(writer, "remote", "add", "origin", str(origin))
     git(writer, "push", "-u", "origin", "main")
@@ -48,9 +56,10 @@ def histories(tmp_path):
     old = git(peer, "rev-parse", "HEAD")
     (writer / "source").write_text("reviewed canonical version")
     (writer / "new.txt").write_text("new tracked path")
+    (writer / "blueprints-app/app/db.py").write_text("reviewed dirty fix")
     for path in recovery.BOOTSTRAP_PATHS:
         (writer / path).write_text("published protocol: " + path)
-    git(writer, "add", "source", "new.txt", *recovery.BOOTSTRAP_PATHS)
+    git(writer, "add", "source", "new.txt", *recovery.BOOTSTRAP_PATHS, "blueprints-app/app/db.py")
     git(writer, "commit", "-m", "canonical lineage")
     git(writer, "push", "origin", "main")
     target = git(writer, "rev-parse", "HEAD")
@@ -83,7 +92,7 @@ def test_recovery_preserves_history_and_private_state(histories):
         "0",
     ]
     assert recovery.protected_snapshot(peer) == before
-    assert result["changed_paths"] == 4
+    assert result["changed_paths"] == 5
     rollback = dict(
         request,
         mode="rollback",
@@ -239,3 +248,37 @@ def test_only_exact_published_bootstrap_is_admitted(histories):
     recovery.execute(peer, request)
     assert git(peer, "status", "--porcelain=v1") == ""
     assert git(peer, "rev-parse", request["recovery_branch"]) == request["expected_old_head"]
+
+
+@pytest.mark.parametrize("archive_valid", [True, False])
+def test_dirty_cleanup_requires_verified_archive_inside_fence(
+    histories, tmp_path, monkeypatch, archive_valid
+):
+    import hashlib
+
+    peer, request = histories
+    dirty = peer / "blueprints-app/app/db.py"
+    dirty.write_text("wanted uncommitted source")
+    manifest = tmp_path / "preimage.json"
+    manifest.write_text("verified manifest")
+    verifier = tmp_path / "backup-verifier.py"
+    verifier.write_text("raise SystemExit(" + ("0" if archive_valid else "1") + ")")
+    monkeypatch.setattr(recovery, "BACKUP_MANIFEST_ROOT", tmp_path)
+    monkeypatch.setattr(recovery, "BACKUP_TOOL", verifier)
+    request["dirty_preimages"] = [
+        dict(
+            path="blueprints-app/app/db.py",
+            sha256=hashlib.sha256(dirty.read_bytes()).hexdigest(),
+            manifest=str(manifest),
+            manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        )
+    ]
+    if archive_valid:
+        recovery.execute(peer, request)
+        assert dirty.read_text() == "reviewed dirty fix"
+        assert git(peer, "rev-parse", request["recovery_branch"]) == request["expected_old_head"]
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            recovery.execute(peer, request)
+        assert dirty.read_text() == "wanted uncommitted source"
+        assert git(peer, "rev-parse", "HEAD") == request["expected_old_head"]
