@@ -2030,6 +2030,8 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
         ("manual_link_categories", "is_page", "INTEGER DEFAULT 0"),
         ("manual_link_categories", "page_label", "TEXT"),
         ("manual_link_categories", "page_sort_order", "INTEGER DEFAULT 0"),
+        # nodes: per-VLAN source IPs from .nodes.json (2026-11-05)
+        ("nodes", "vlan_ips", "TEXT"),
     ]
     existing_cols: dict[str, set[str]] = {}
     for table, column, col_type in migrations:

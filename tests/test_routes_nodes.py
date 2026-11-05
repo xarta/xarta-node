@@ -147,3 +147,43 @@ def test_fleet_health_clear_hides_only_exact_issue_fingerprint(monkeypatch, tmp_
     assert changed["summary"]["acknowledged_problems_hidden"] == 0
     assert changed["fleet_health_issues"][0]["fingerprint"] != issue["fingerprint"]
     assert "WARN seekdb_systemd" in changed["text_report"]
+
+
+def test_vlan_source_schema_import_and_local_selection(tmp_path, monkeypatch):
+    from app import db, ssh
+
+    monkeypatch.setattr(db.cfg, "DB_DIR", str(tmp_path))
+    monkeypatch.setattr(db.cfg, "DB_PATH", str(tmp_path / "fixture.db"))
+    monkeypatch.setattr(db.cfg, "NODE_ID", "fixture-a")
+
+    def node(identity, source):
+        return dict(
+            node_id=identity,
+            display_name=identity,
+            host_machine=identity,
+            primary_ip="127.0.0.1",
+            primary_hostname=identity + ".example.test",
+            tailnet_ip="127.0.0.2",
+            sync_port=8443,
+            active=True,
+            vlan_ips={"10.10.10": source},
+        )
+
+    monkeypatch.setattr(
+        routes_nodes.cfg,
+        "NODES_DATA",
+        [node("fixture-a", "10.10.10.5"), node("fixture-b", "10.10.10.6")],
+    )
+    db.init_db()
+    assert routes_nodes._upsert_nodes_from_config() == 2
+    monkeypatch.setenv("VLAN_SOURCE_MAP", "10.10.10:10.10.10.99,10.10.20:10.10.20.5")
+    assert ssh._resolve_source_ip("10.10.10.100") == "10.10.10.5"
+    assert ssh._resolve_source_ip("10.10.20.100") == "10.10.20.5"
+    assert ssh._resolve_source_ip("10.10.30.100") is None
+    routes_nodes.cfg.NODES_DATA[0]["vlan_ips"] = {"10.10.10": "10.10.10.7"}
+    assert routes_nodes._upsert_nodes_from_config() == 2
+    db.init_db()
+    assert ssh._resolve_source_ip("10.10.10.100") == "10.10.10.7"
+    with db.get_conn() as conn:
+        conn.execute("UPDATE nodes SET vlan_ips='invalid-json' WHERE node_id='fixture-a'")
+    assert ssh._resolve_source_ip("10.10.10.100") == "10.10.10.99"

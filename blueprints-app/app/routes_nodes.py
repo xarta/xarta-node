@@ -149,21 +149,22 @@ def _upsert_nodes_from_config() -> int:
                 ]
             )
             ui_url = f"https://{ph}"
+            vlan_ips = json.dumps(node.get("vlan_ips", {}))
 
             existing = conn.execute("SELECT node_id FROM nodes WHERE node_id=?", (nid,)).fetchone()
             if existing:
                 conn.execute(
                     "UPDATE nodes SET display_name=?, display_order=?, host_machine=?, tailnet=?, "
                     "primary_hostname=?, tailnet_hostname=?, "
-                    "addresses=?, ui_url=?, last_seen=datetime('now') WHERE node_id=?",
-                    (name, order, host, tailnet, ph, th, addresses, ui_url, nid),
+                    "addresses=?, ui_url=?, vlan_ips=?, last_seen=datetime('now') WHERE node_id=?",
+                    (name, order, host, tailnet, ph, th, addresses, ui_url, vlan_ips, nid),
                 )
             else:
                 conn.execute(
                     "INSERT INTO nodes (node_id, display_name, display_order, host_machine, tailnet, "
-                    "primary_hostname, tailnet_hostname, addresses, ui_url, last_seen) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-                    (nid, name, order, host, tailnet, ph, th, addresses, ui_url),
+                    "primary_hostname, tailnet_hostname, addresses, ui_url, vlan_ips, last_seen) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+                    (nid, name, order, host, tailnet, ph, th, addresses, ui_url, vlan_ips),
                 )
             count += 1
     return count

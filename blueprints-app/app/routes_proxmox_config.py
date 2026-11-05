@@ -15,13 +15,19 @@ from .sync.queue import enqueue_for_all_peers
 router = APIRouter(prefix="/proxmox-config", tags=["proxmox-config"])
 
 _PROBE_SCRIPT = os.path.join(
-    os.path.dirname(__file__), "..", "..",
-    ".claude", "skills", "blueprints-proxmox-discovery", "scripts",
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    ".claude",
+    "skills",
+    "blueprints-proxmox-discovery",
+    "scripts",
     "bp-proxmox-config-probe.sh",
 )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _int(val) -> int | None:
     """Coerce a DB value (int, numeric string, or empty string) to int or None."""
@@ -71,12 +77,11 @@ def _row_to_out(row) -> ProxmoxConfigOut:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+
 @router.get("", response_model=list[ProxmoxConfigOut])
 async def list_proxmox_config() -> list[ProxmoxConfigOut]:
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM proxmox_config ORDER BY pve_host, vmid"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM proxmox_config ORDER BY pve_host, vmid").fetchall()
     return [_row_to_out(r) for r in rows]
 
 
@@ -100,14 +105,37 @@ async def create_proxmox_config(body: ProxmoxConfigCreate) -> ProxmoxConfigOut:
                  dockge_json, portainer_json, caddy_json, last_probed)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (body.config_id, body.pve_host, body.pve_name, body.vmid, body.vm_type,
-             body.name, body.status, body.cores, body.memory_mb, body.rootfs,
-             body.ip_config, body.ip_address, body.gateway, body.mac_address,
-             body.vlan_tag, body.tags, body.mountpoints_json, body.raw_conf,
-             body.vlans_json, body.has_docker, body.dockge_stacks_dir,
-             body.has_portainer, body.portainer_method, body.has_caddy,
-             body.caddy_conf_path, body.dockge_json, body.portainer_json,
-             body.caddy_json, body.last_probed),
+            (
+                body.config_id,
+                body.pve_host,
+                body.pve_name,
+                body.vmid,
+                body.vm_type,
+                body.name,
+                body.status,
+                body.cores,
+                body.memory_mb,
+                body.rootfs,
+                body.ip_config,
+                body.ip_address,
+                body.gateway,
+                body.mac_address,
+                body.vlan_tag,
+                body.tags,
+                body.mountpoints_json,
+                body.raw_conf,
+                body.vlans_json,
+                body.has_docker,
+                body.dockge_stacks_dir,
+                body.has_portainer,
+                body.portainer_method,
+                body.has_caddy,
+                body.caddy_conf_path,
+                body.dockge_json,
+                body.portainer_json,
+                body.caddy_json,
+                body.last_probed,
+            ),
         )
         row = conn.execute(
             "SELECT * FROM proxmox_config WHERE config_id=?", (body.config_id,)
@@ -142,16 +170,37 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
                         last_probed=?, updated_at=datetime('now')
                     WHERE config_id=?
                     """,
-                    (body.pve_host, body.pve_name, body.vmid, body.vm_type,
-                     body.name, body.status, body.cores, body.memory_mb,
-                     body.rootfs, body.ip_config, body.ip_address, body.gateway,
-                     body.mac_address, body.vlan_tag, body.tags,
-                     body.mountpoints_json, body.raw_conf,
-                     body.vlans_json, body.has_docker, body.dockge_stacks_dir,
-                     body.has_portainer, body.portainer_method,
-                     body.has_caddy, body.caddy_conf_path,
-                     body.dockge_json, body.portainer_json, body.caddy_json,
-                     body.last_probed, body.config_id),
+                    (
+                        body.pve_host,
+                        body.pve_name,
+                        body.vmid,
+                        body.vm_type,
+                        body.name,
+                        body.status,
+                        body.cores,
+                        body.memory_mb,
+                        body.rootfs,
+                        body.ip_config,
+                        body.ip_address,
+                        body.gateway,
+                        body.mac_address,
+                        body.vlan_tag,
+                        body.tags,
+                        body.mountpoints_json,
+                        body.raw_conf,
+                        body.vlans_json,
+                        body.has_docker,
+                        body.dockge_stacks_dir,
+                        body.has_portainer,
+                        body.portainer_method,
+                        body.has_caddy,
+                        body.caddy_conf_path,
+                        body.dockge_json,
+                        body.portainer_json,
+                        body.caddy_json,
+                        body.last_probed,
+                        body.config_id,
+                    ),
                 )
                 updated += 1
             else:
@@ -166,16 +215,37 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
                          dockge_json, portainer_json, caddy_json, last_probed)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (body.config_id, body.pve_host, body.pve_name, body.vmid,
-                     body.vm_type, body.name, body.status, body.cores,
-                     body.memory_mb, body.rootfs, body.ip_config, body.ip_address,
-                     body.gateway, body.mac_address, body.vlan_tag, body.tags,
-                     body.mountpoints_json, body.raw_conf,
-                     body.vlans_json, body.has_docker, body.dockge_stacks_dir,
-                     body.has_portainer, body.portainer_method,
-                     body.has_caddy, body.caddy_conf_path,
-                     body.dockge_json, body.portainer_json, body.caddy_json,
-                     body.last_probed),
+                    (
+                        body.config_id,
+                        body.pve_host,
+                        body.pve_name,
+                        body.vmid,
+                        body.vm_type,
+                        body.name,
+                        body.status,
+                        body.cores,
+                        body.memory_mb,
+                        body.rootfs,
+                        body.ip_config,
+                        body.ip_address,
+                        body.gateway,
+                        body.mac_address,
+                        body.vlan_tag,
+                        body.tags,
+                        body.mountpoints_json,
+                        body.raw_conf,
+                        body.vlans_json,
+                        body.has_docker,
+                        body.dockge_stacks_dir,
+                        body.has_portainer,
+                        body.portainer_method,
+                        body.has_caddy,
+                        body.caddy_conf_path,
+                        body.dockge_json,
+                        body.portainer_json,
+                        body.caddy_json,
+                        body.last_probed,
+                    ),
                 )
                 created += 1
             row = conn.execute(
@@ -184,17 +254,22 @@ async def bulk_upsert_proxmox_config(entries: list[ProxmoxConfigCreate]) -> dict
             enqueue_for_all_peers(
                 conn,
                 "UPDATE" if existing else "INSERT",
-                "proxmox_config", body.config_id, dict(row), gen,
+                "proxmox_config",
+                body.config_id,
+                dict(row),
+                gen,
             )
     return {"created": created, "updated": updated, "total": created + updated}
 
 
 # ── Probe ─────────────────────────────────────────────────────────────────────
 
+
 @router.get("/probe/status", response_model=dict)
 async def probe_status() -> dict:
     """Return whether the Proxmox probe key is configured on this node."""
     from .ssh import probe_status_for_host_type
+
     return probe_status_for_host_type("pve")
 
 
@@ -209,6 +284,7 @@ async def probe_proxmox_config() -> dict:
         raise HTTPException(500, f"Probe script not found: {script}")
 
     from .ssh import SshKeyMissing, probe_status_for_host_type, resolve_env_key
+
     status = probe_status_for_host_type("pve")
     if not status["configured"]:
         raise HTTPException(503, status["reason"])
@@ -221,7 +297,8 @@ async def probe_proxmox_config() -> dict:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "bash", script,
+            "bash",
+            script,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
@@ -241,17 +318,17 @@ async def probe_proxmox_config() -> dict:
     for line in text.splitlines():
         if line.startswith("##ENTRIES##"):
             try:
-                entries_raw = json.loads(line[len("##ENTRIES##"):].strip())
+                entries_raw = json.loads(line[len("##ENTRIES##") :].strip())
             except json.JSONDecodeError:
                 pass
         elif line.startswith("##NETS##"):
             try:
-                nets_raw = json.loads(line[len("##NETS##"):].strip())
+                nets_raw = json.loads(line[len("##NETS##") :].strip())
             except json.JSONDecodeError:
                 pass
         elif line.startswith("##STATS##"):
             try:
-                stats_raw = json.loads(line[len("##STATS##"):].strip())
+                stats_raw = json.loads(line[len("##STATS##") :].strip())
             except json.JSONDecodeError:
                 pass
 
@@ -303,18 +380,37 @@ async def probe_proxmox_config() -> dict:
                         last_probed=?, updated_at=datetime('now')
                     WHERE config_id=?
                     """,
-                    (entry.get("pve_host"), entry.get("pve_name"), entry.get("vmid"),
-                     entry.get("vm_type"), entry.get("name"), entry.get("status"),
-                     entry.get("cores"), entry.get("memory_mb"), entry.get("rootfs"),
-                     entry.get("ip_config"), entry.get("ip_address"), entry.get("gateway"),
-                     entry.get("mac_address"), entry.get("vlan_tag"), entry.get("tags"),
-                     entry.get("mountpoints_json"), entry.get("raw_conf"),
-                     entry.get("vlans_json"), entry.get("has_docker"),
-                     entry.get("dockge_stacks_dir"), entry.get("has_portainer"),
-                     entry.get("portainer_method"), entry.get("has_caddy"),
-                     entry.get("caddy_conf_path"),
-                     entry.get("dockge_json"), entry.get("portainer_json"),
-                     entry.get("caddy_json"), entry.get("last_probed"), cid),
+                    (
+                        entry.get("pve_host"),
+                        entry.get("pve_name"),
+                        entry.get("vmid"),
+                        entry.get("vm_type"),
+                        entry.get("name"),
+                        entry.get("status"),
+                        entry.get("cores"),
+                        entry.get("memory_mb"),
+                        entry.get("rootfs"),
+                        entry.get("ip_config"),
+                        entry.get("ip_address"),
+                        entry.get("gateway"),
+                        entry.get("mac_address"),
+                        entry.get("vlan_tag"),
+                        entry.get("tags"),
+                        entry.get("mountpoints_json"),
+                        entry.get("raw_conf"),
+                        entry.get("vlans_json"),
+                        entry.get("has_docker"),
+                        entry.get("dockge_stacks_dir"),
+                        entry.get("has_portainer"),
+                        entry.get("portainer_method"),
+                        entry.get("has_caddy"),
+                        entry.get("caddy_conf_path"),
+                        entry.get("dockge_json"),
+                        entry.get("portainer_json"),
+                        entry.get("caddy_json"),
+                        entry.get("last_probed"),
+                        cid,
+                    ),
                 )
                 updated += 1
             else:
@@ -329,27 +425,47 @@ async def probe_proxmox_config() -> dict:
                          dockge_json, portainer_json, caddy_json, last_probed)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (cid, entry.get("pve_host"), entry.get("pve_name"), entry.get("vmid"),
-                     entry.get("vm_type"), entry.get("name"), entry.get("status"),
-                     entry.get("cores"), entry.get("memory_mb"), entry.get("rootfs"),
-                     entry.get("ip_config"), entry.get("ip_address"), entry.get("gateway"),
-                     entry.get("mac_address"), entry.get("vlan_tag"), entry.get("tags"),
-                     entry.get("mountpoints_json"), entry.get("raw_conf"),
-                     entry.get("vlans_json"), entry.get("has_docker"),
-                     entry.get("dockge_stacks_dir"), entry.get("has_portainer"),
-                     entry.get("portainer_method"), entry.get("has_caddy"),
-                     entry.get("caddy_conf_path"),
-                     entry.get("dockge_json"), entry.get("portainer_json"),
-                     entry.get("caddy_json"), entry.get("last_probed")),
+                    (
+                        cid,
+                        entry.get("pve_host"),
+                        entry.get("pve_name"),
+                        entry.get("vmid"),
+                        entry.get("vm_type"),
+                        entry.get("name"),
+                        entry.get("status"),
+                        entry.get("cores"),
+                        entry.get("memory_mb"),
+                        entry.get("rootfs"),
+                        entry.get("ip_config"),
+                        entry.get("ip_address"),
+                        entry.get("gateway"),
+                        entry.get("mac_address"),
+                        entry.get("vlan_tag"),
+                        entry.get("tags"),
+                        entry.get("mountpoints_json"),
+                        entry.get("raw_conf"),
+                        entry.get("vlans_json"),
+                        entry.get("has_docker"),
+                        entry.get("dockge_stacks_dir"),
+                        entry.get("has_portainer"),
+                        entry.get("portainer_method"),
+                        entry.get("has_caddy"),
+                        entry.get("caddy_conf_path"),
+                        entry.get("dockge_json"),
+                        entry.get("portainer_json"),
+                        entry.get("caddy_json"),
+                        entry.get("last_probed"),
+                    ),
                 )
                 created += 1
-            row = conn.execute(
-                "SELECT * FROM proxmox_config WHERE config_id=?", (cid,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM proxmox_config WHERE config_id=?", (cid,)).fetchone()
             enqueue_for_all_peers(
                 conn,
                 "UPDATE" if existing else "INSERT",
-                "proxmox_config", cid, dict(row), gen,
+                "proxmox_config",
+                cid,
+                dict(row),
+                gen,
             )
 
         # ── Upsert proxmox_nets ────────────────────────────────────────────
@@ -375,11 +491,22 @@ async def probe_proxmox_config() -> dict:
                         updated_at = datetime('now')
                     WHERE net_id=?
                     """,
-                    (net.get("config_id"), net.get("pve_host"), net.get("vmid"),
-                     net.get("net_key"), net.get("mac_address"),
-                     net.get("ip_address"), net.get("ip_cidr"), net.get("gateway"),
-                     net.get("vlan_tag"), net.get("bridge"), net.get("model"), net.get("raw_str"),
-                     net.get("ip_source", "conf"), nid),
+                    (
+                        net.get("config_id"),
+                        net.get("pve_host"),
+                        net.get("vmid"),
+                        net.get("net_key"),
+                        net.get("mac_address"),
+                        net.get("ip_address"),
+                        net.get("ip_cidr"),
+                        net.get("gateway"),
+                        net.get("vlan_tag"),
+                        net.get("bridge"),
+                        net.get("model"),
+                        net.get("raw_str"),
+                        net.get("ip_source", "conf"),
+                        nid,
+                    ),
                 )
                 nets_updated += 1
             else:
@@ -391,20 +518,32 @@ async def probe_proxmox_config() -> dict:
                          vlan_tag, bridge, model, raw_str, ip_source)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (nid, net.get("config_id"), net.get("pve_host"), net.get("vmid"),
-                     net.get("net_key"), net.get("mac_address"), net.get("ip_address"),
-                     net.get("ip_cidr"), net.get("gateway"), net.get("vlan_tag"),
-                     net.get("bridge"), net.get("model"), net.get("raw_str"),
-                     net.get("ip_source", "conf")),
+                    (
+                        nid,
+                        net.get("config_id"),
+                        net.get("pve_host"),
+                        net.get("vmid"),
+                        net.get("net_key"),
+                        net.get("mac_address"),
+                        net.get("ip_address"),
+                        net.get("ip_cidr"),
+                        net.get("gateway"),
+                        net.get("vlan_tag"),
+                        net.get("bridge"),
+                        net.get("model"),
+                        net.get("raw_str"),
+                        net.get("ip_source", "conf"),
+                    ),
                 )
                 nets_created += 1
-            net_row = conn.execute(
-                "SELECT * FROM proxmox_nets WHERE net_id=?", (nid,)
-            ).fetchone()
+            net_row = conn.execute("SELECT * FROM proxmox_nets WHERE net_id=?", (nid,)).fetchone()
             enqueue_for_all_peers(
                 conn,
                 "UPDATE" if net_existing else "INSERT",
-                "proxmox_nets", nid, dict(net_row), gen,
+                "proxmox_nets",
+                nid,
+                dict(net_row),
+                gen,
             )
 
         # ── Auto-populate vlans from inferred CIDRs ──────────────────────────
@@ -431,9 +570,7 @@ async def probe_proxmox_config() -> dict:
                 "UPDATE vlans SET cidr=?, cidr_inferred=1 WHERE vlan_id=? AND (cidr IS NULL OR cidr='')",
                 (inferred, vt),
             )
-            vlan_row = conn.execute(
-                "SELECT * FROM vlans WHERE vlan_id=?", (vt,)
-            ).fetchone()
+            vlan_row = conn.execute("SELECT * FROM vlans WHERE vlan_id=?", (vt,)).fetchone()
             if vlan_row:
                 enqueue_for_all_peers(conn, "UPDATE", "vlans", vt, dict(vlan_row), gen)
 
@@ -536,6 +673,7 @@ printf 'PROBE_RESULT:{"has_docker":%s,"dockge_json":%s,"portainer_json":%s,"cadd
 # Infrastructure details (VLAN source IPs, citadel identity) are kept in .env —
 # nothing site-specific belongs in this public file.
 
+
 def _load_vlan_source_map() -> dict[str, str]:
     """Parse VLAN_SOURCE_MAP env var: 'prefix:src_ip,prefix:src_ip,...'"""
     raw = os.environ.get("VLAN_SOURCE_MAP", "")
@@ -549,15 +687,21 @@ def _load_vlan_source_map() -> dict[str, str]:
 
 
 def _pick_source_ip(target_ip: str) -> str | None:
-    """Return the local source interface IP on the same /24 as target_ip, or None."""
-    prefix = ".".join(target_ip.split(".")[:3])
-    return _load_vlan_source_map().get(prefix)
+    """Return the local source interface IP on the same /24 as target_ip, or None.
+
+    Delegates to ssh._resolve_source_ip() which reads from the local node's
+    vlan_ips (nodes table, populated from .nodes.json) with VLAN_SOURCE_MAP
+    env as a defensive fallback.
+    """
+    from .ssh import _resolve_source_ip
+
+    return _resolve_source_ip(target_ip)
 
 
 def _is_citadel(vmid, pve_host: str) -> bool:
     """True if vmid+pve_host matches the citadel identity defined in .env."""
     cid_vmid = os.environ.get("CITADEL_VMID", "")
-    cid_pve  = os.environ.get("CITADEL_PVE_HOST", "")
+    cid_pve = os.environ.get("CITADEL_PVE_HOST", "")
     if not cid_vmid or not cid_pve:
         return False
     try:
@@ -578,18 +722,16 @@ async def probe_vm_services() -> dict:
     the table from proxmox_config + pve_hosts + pfSense env vars.
     """
     # Load all ssh_targets into memory once for fast lookup
+    # (source_ip is no longer read from ssh_targets; it is resolved
+    #  per-target from the local node's vlan_ips via _resolve_source_ip)
     with get_conn() as conn:
-        _ssh_rows = conn.execute(
-            "SELECT ip_address, key_env_var, source_ip FROM ssh_targets"
-        ).fetchall()
+        _ssh_rows = conn.execute("SELECT ip_address, key_env_var FROM ssh_targets").fetchall()
     ssh_lookup: dict[str, dict] = {
-        r["ip_address"]: {"key_env_var": r["key_env_var"], "source_ip": r["source_ip"]}
-        for r in _ssh_rows
+        r["ip_address"]: {"key_env_var": r["key_env_var"]} for r in _ssh_rows
     }
     if not ssh_lookup:
         raise HTTPException(
-            503,
-            "ssh_targets table is empty — run POST /api/v1/ssh-targets/rebuild first"
+            503, "ssh_targets table is empty — run POST /api/v1/ssh-targets/rebuild first"
         )
 
     with get_conn() as conn:
@@ -622,8 +764,12 @@ async def probe_vm_services() -> dict:
         ).fetchall()
 
     if not targets:
-        return {"checked": 0, "updated": 0, "skipped": 0,
-                "message": "No running VMs with known IPs found"}
+        return {
+            "checked": 0,
+            "updated": 0,
+            "skipped": 0,
+            "message": "No running VMs with known IPs found",
+        }
 
     sem = asyncio.Semaphore(10)
     results: list[dict] = []
@@ -631,23 +777,47 @@ async def probe_vm_services() -> dict:
     async def _probe(config_id: str, name: str, ip: str, vmid, pve_host: str) -> None:
         target = ssh_lookup.get(ip)
         if not target:
-            results.append({"config_id": config_id, "name": name, "ip": ip,
-                             "ok": False,
-                             "error": f"no ssh_targets entry for {ip} — run /api/v1/ssh-targets/rebuild"})
+            results.append(
+                {
+                    "config_id": config_id,
+                    "name": name,
+                    "ip": ip,
+                    "ok": False,
+                    "error": f"no ssh_targets entry for {ip} — run /api/v1/ssh-targets/rebuild",
+                }
+            )
             return
-        key_env  = target["key_env_var"]
+        key_env = target["key_env_var"]
         key_path = os.environ.get(key_env, "")
         if not key_path or not os.path.isfile(key_path):
-            results.append({"config_id": config_id, "name": name, "ip": ip,
-                             "ok": False,
-                             "error": f"key file missing for {key_env}"})
+            results.append(
+                {
+                    "config_id": config_id,
+                    "name": name,
+                    "ip": ip,
+                    "ok": False,
+                    "error": f"key file missing for {key_env}",
+                }
+            )
             return
-        src = target["source_ip"]
-        ssh_cmd = ["ssh", "-i", key_path,
-                   "-o", "StrictHostKeyChecking=no",
-                   "-o", "ConnectTimeout=8",
-                   "-o", "BatchMode=yes",
-                   "-o", "LogLevel=ERROR"]
+        # source_ip is resolved from the local node's vlan_ips (nodes table,
+        # populated from .nodes.json) with VLAN_SOURCE_MAP env as fallback.
+        from .ssh import _resolve_source_ip
+
+        src = _resolve_source_ip(ip)
+        ssh_cmd = [
+            "ssh",
+            "-i",
+            key_path,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=8",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "LogLevel=ERROR",
+        ]
         if src:
             ssh_cmd += ["-b", src]
         ssh_cmd += [f"root@{ip}", _PROBE_SERVICES_CMD.strip()]
@@ -661,42 +831,64 @@ async def probe_vm_services() -> dict:
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
             except Exception as exc:
-                results.append({"config_id": config_id, "name": name, "ip": ip,
-                                 "ok": False, "error": str(exc)})
+                results.append(
+                    {"config_id": config_id, "name": name, "ip": ip, "ok": False, "error": str(exc)}
+                )
                 return
 
             out = stdout.decode(errors="replace")
             line = next(
-                (probe_line for probe_line in out.splitlines() if probe_line.startswith("PROBE_RESULT:")),
+                (
+                    probe_line
+                    for probe_line in out.splitlines()
+                    if probe_line.startswith("PROBE_RESULT:")
+                ),
                 None,
             )
             if not line:
-                results.append({"config_id": config_id, "name": name, "ip": ip,
-                                 "ok": False, "error": "no probe result"})
+                results.append(
+                    {
+                        "config_id": config_id,
+                        "name": name,
+                        "ip": ip,
+                        "ok": False,
+                        "error": "no probe result",
+                    }
+                )
                 return
 
             try:
-                payload = json.loads(line[len("PROBE_RESULT:"):])
+                payload = json.loads(line[len("PROBE_RESULT:") :])
             except Exception:
-                results.append({"config_id": config_id, "name": name, "ip": ip,
-                                 "ok": False, "error": "malformed probe result"})
+                results.append(
+                    {
+                        "config_id": config_id,
+                        "name": name,
+                        "ip": ip,
+                        "ok": False,
+                        "error": "malformed probe result",
+                    }
+                )
                 return
-            results.append({
-                "config_id":      config_id,
-                "name":           name,
-                "ip":             ip,
-                "ok":             True,
-                "has_docker":     1 if payload.get("has_docker") == 1 else 0,
-                "dockge_json":    json.dumps(payload.get("dockge_json", [])),
-                "portainer_json": json.dumps(payload.get("portainer_json", [])),
-                "caddy_json":     json.dumps(payload.get("caddy_json", [])),
-            })
+            results.append(
+                {
+                    "config_id": config_id,
+                    "name": name,
+                    "ip": ip,
+                    "ok": True,
+                    "has_docker": 1 if payload.get("has_docker") == 1 else 0,
+                    "dockge_json": json.dumps(payload.get("dockge_json", [])),
+                    "portainer_json": json.dumps(payload.get("portainer_json", [])),
+                    "caddy_json": json.dumps(payload.get("caddy_json", [])),
+                }
+            )
 
-    await asyncio.gather(*[
-        _probe(t["config_id"], t["name"] or t["config_id"], t["ip"],
-               t["vmid"], t["pve_host"])
-        for t in targets
-    ])
+    await asyncio.gather(
+        *[
+            _probe(t["config_id"], t["name"] or t["config_id"], t["ip"], t["vmid"], t["pve_host"])
+            for t in targets
+        ]
+    )
 
     updated = 0
     with get_conn() as conn:
@@ -709,40 +901,54 @@ async def probe_vm_services() -> dict:
                        has_docker=?, dockge_json=?, portainer_json=?, caddy_json=?,
                        last_probed=datetime('now'), updated_at=datetime('now')
                    WHERE config_id=?""",
-                (r["has_docker"], r["dockge_json"], r["portainer_json"],
-                 r["caddy_json"], r["config_id"]),
+                (
+                    r["has_docker"],
+                    r["dockge_json"],
+                    r["portainer_json"],
+                    r["caddy_json"],
+                    r["config_id"],
+                ),
             )
             row = conn.execute(
                 "SELECT * FROM proxmox_config WHERE config_id=?", (r["config_id"],)
             ).fetchone()
-            enqueue_for_all_peers(conn, "UPDATE", "proxmox_config",
-                                  r["config_id"], dict(row), gen)
+            enqueue_for_all_peers(conn, "UPDATE", "proxmox_config", r["config_id"], dict(row), gen)
             updated += 1
 
     skipped = sum(1 for r in results if not r["ok"])
     checked = len(results)
-    msg = (f"Checked {checked} VM{'s' if checked != 1 else ''} — "
-           f"{updated} updated, {skipped} unreachable/failed")
+    msg = (
+        f"Checked {checked} VM{'s' if checked != 1 else ''} — "
+        f"{updated} updated, {skipped} unreachable/failed"
+    )
     return {
         "checked": checked,
         "updated": updated,
         "skipped": skipped,
         "message": msg,
         "details": [
-            {"name": r["name"], "ip": r["ip"],
-             "status": "ok" if r["ok"] else r.get("error", "?"),
-             "detected": (
-                 (["docker"] if r.get("has_docker") else [])
-                 + (["portainer"] if r.get("portainer_json", "[]") not in ("[]", None, "") else [])
-                 + (["dockge"]    if r.get("dockge_json",    "[]") not in ("[]", None, "") else [])
-                 + (["caddy"]     if r.get("caddy_json",     "[]") not in ("[]", None, "") else [])
-             )}
+            {
+                "name": r["name"],
+                "ip": r["ip"],
+                "status": "ok" if r["ok"] else r.get("error", "?"),
+                "detected": (
+                    (["docker"] if r.get("has_docker") else [])
+                    + (
+                        ["portainer"]
+                        if r.get("portainer_json", "[]") not in ("[]", None, "")
+                        else []
+                    )
+                    + (["dockge"] if r.get("dockge_json", "[]") not in ("[]", None, "") else [])
+                    + (["caddy"] if r.get("caddy_json", "[]") not in ("[]", None, "") else [])
+                ),
+            }
             for r in results
         ],
     }
 
 
 # ── Single-record CRUD ────────────────────────────────────────────────────────
+
 
 @router.get("/{config_id}", response_model=ProxmoxConfigOut)
 async def get_proxmox_config(config_id: str) -> ProxmoxConfigOut:
@@ -780,9 +986,7 @@ async def update_proxmox_config(config_id: str, body: ProxmoxConfigUpdate) -> Pr
 @router.delete("/{config_id}", status_code=204)
 async def delete_proxmox_config(config_id: str) -> None:
     with get_conn() as conn:
-        result = conn.execute(
-            "DELETE FROM proxmox_config WHERE config_id=?", (config_id,)
-        )
+        result = conn.execute("DELETE FROM proxmox_config WHERE config_id=?", (config_id,))
         if result.rowcount == 0:
             raise HTTPException(404, f"config_id '{config_id}' not found")
         gen = increment_gen(conn, "human")

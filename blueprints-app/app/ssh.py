@@ -18,11 +18,13 @@ Exceptions (both subclass RuntimeError):
 
 from __future__ import annotations
 
+import json
 import os
 
 from .db import get_conn
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
+
 
 class SshTargetNotFound(RuntimeError):
     """Raised when no ssh_targets entry exists for the given IP."""
@@ -32,7 +34,70 @@ class SshKeyMissing(RuntimeError):
     """Raised when the key env var is not set or the key file does not exist."""
 
 
+# ── VLAN source-IP resolution ─────────────────────────────────────────────────
+
+
+def _load_local_vlan_ips() -> dict[str, str]:
+    """Return the local node's vlan_ips dict from the nodes table.
+
+    The nodes table is local-only (NOT in _ALLOWED_TABLES), so peer sync
+    cannot overwrite it. It is populated from .nodes.json at startup and
+    via POST /api/v1/nodes/refresh.
+
+    Returns a dict of VLAN prefix → local source IP, e.g.
+        {"10.0.1": "10.0.1.5", "10.0.2": "10.0.2.5", ...}
+    Returns an empty dict if the local node has no vlan_ips data.
+    """
+    from . import config as cfg
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT vlan_ips FROM nodes WHERE node_id=?",
+            (cfg.NODE_ID,),
+        ).fetchone()
+
+    if row is None or not row["vlan_ips"]:
+        return {}
+    try:
+        data = json.loads(row["vlan_ips"])
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
+
+def _resolve_source_ip(target_ip: str) -> str | None:
+    """Resolve the local source IP for SSH -b binding to target_ip.
+
+    Primary source: the local node's vlan_ips from the nodes table
+    (populated from .nodes.json). Fallback: the VLAN_SOURCE_MAP env var
+    (kept as a defensive fallback during the transition period).
+
+    Returns the local IP on the same /24 as target_ip, or None if no
+    matching VLAN entry exists (e.g. the node has no interface on that VLAN).
+    """
+    prefix = ".".join(target_ip.split(".")[:3])
+
+    # Primary: nodes table vlan_ips
+    vlan_ips = _load_local_vlan_ips()
+    if prefix in vlan_ips:
+        return vlan_ips[prefix]
+
+    # Fallback: VLAN_SOURCE_MAP env var (defensive; remove in later cleanup)
+    raw = os.environ.get("VLAN_SOURCE_MAP", "")
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            p, src = entry.split(":", 1)
+            if p.strip() == prefix:
+                return src.strip()
+
+    return None
+
+
 # ── Core helpers ──────────────────────────────────────────────────────────────
+
 
 def get_ssh_params(ip: str) -> dict:
     """Look up ssh_targets by IP and return SSH connection parameters.
@@ -47,7 +112,7 @@ def get_ssh_params(ip: str) -> dict:
     """
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT key_env_var, source_ip FROM ssh_targets WHERE ip_address=?",
+            "SELECT key_env_var FROM ssh_targets WHERE ip_address=?",
             (ip,),
         ).fetchone()
 
@@ -60,9 +125,7 @@ def get_ssh_params(ip: str) -> dict:
     key_env = row["key_env_var"]
     key_path = os.environ.get(key_env, "").strip()
     if not key_path:
-        raise SshKeyMissing(
-            f"Env var {key_env!r} is not set (needed to SSH to {ip})"
-        )
+        raise SshKeyMissing(f"Env var {key_env!r} is not set (needed to SSH to {ip})")
     if not os.path.isfile(key_path):
         raise SshKeyMissing(
             f"Key file {key_path!r} not found "
@@ -70,10 +133,15 @@ def get_ssh_params(ip: str) -> dict:
             "this node may not be the probe node for this host"
         )
 
+    # source_ip is resolved from the local node's vlan_ips (nodes table,
+    # populated from .nodes.json) with VLAN_SOURCE_MAP env as fallback.
+    # It is no longer read from the synced ssh_targets table.
+    source_ip = _resolve_source_ip(ip)
+
     return {
-        "key_path":  key_path,
-        "source_ip": row["source_ip"],
-        "key_env":   key_env,
+        "key_path": key_path,
+        "source_ip": source_ip,
+        "key_env": key_env,
     }
 
 
@@ -94,10 +162,14 @@ def make_ssh_args(ip: str, *, connect_timeout: int = 8) -> list[str]:
     """
     p = get_ssh_params(ip)
     args: list[str] = [
-        "-i", p["key_path"],
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "BatchMode=yes",
-        "-o", f"ConnectTimeout={connect_timeout}",
+        "-i",
+        p["key_path"],
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={connect_timeout}",
     ]
     if p["source_ip"]:
         args += ["-b", p["source_ip"]]
@@ -121,7 +193,7 @@ def probe_status_for_host_type(host_type: str) -> dict:
 
     if not rows:
         return {
-            "configured":     False,
+            "configured": False,
             "ssh_key_present": False,
             "reason": (
                 f"No ssh_targets entries with host_type='{host_type}' — "
@@ -135,7 +207,7 @@ def probe_status_for_host_type(host_type: str) -> dict:
             return {"configured": True, "ssh_key_present": True, "reason": ""}
 
     # Entries exist but key not resolvable on this node
-    env_var  = rows[0]["key_env_var"]
+    env_var = rows[0]["key_env_var"]
     key_path = os.environ.get(env_var, "").strip()
     reason = (
         f"{env_var} is not set"
