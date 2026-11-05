@@ -156,6 +156,7 @@ _SYSTEM_ACTION_TYPES = {"sync_git_outer", "sync_git_inner", "sync_git_non_root"}
 _GIT_PULL_SCOPE_ORDER = ("outer", "non_root", "inner")
 _GIT_PULL_LOCK = asyncio.Lock()
 _RESTART_PENDING = False
+_PUBLIC_RECOVERY_HELD = False
 _ACTIVE_GIT_PULL_OPERATION_IDS: set[str] = set()
 _GIT_PULL_OPERATION_ID = re.compile(r"^git-pull-[0-9a-f]{32}$")
 _GIT_PULL_RECEIPT_LIMIT = 128
@@ -226,18 +227,23 @@ def _ordered_git_scopes(scopes) -> list[str]:
     return [scope for scope in _GIT_PULL_SCOPE_ORDER if scope in wanted]
 
 
-def _git_pull_request_json(scopes: list[str], expected_head: str) -> str:
+def _git_pull_request_json(scopes: list[str], expected_head: str, recovery=None) -> str:
     return json.dumps(
-        {"expected_head": expected_head, "local_only": True, "scopes": scopes},
+        {
+            "expected_head": expected_head,
+            "local_only": True,
+            "scopes": scopes,
+            **({"public_recovery": recovery} if recovery is not None else {}),
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
 
 
 def _git_pull_operation_create_sync(
-    operation_id: str, scopes: list[str], expected_head: str
+    operation_id: str, scopes: list[str], expected_head: str, recovery=None
 ) -> dict[str, Any]:
-    request_json = _git_pull_request_json(scopes, expected_head)
+    request_json = _git_pull_request_json(scopes, expected_head, recovery)
     with get_conn() as conn:
         existing = conn.execute(
             "SELECT * FROM sync_git_pull_operations WHERE operation_id=?",
@@ -830,9 +836,10 @@ async def _git_pull_scopes_and_maybe_restart(
     source: str = "",
     operation_id: str | None = None,
     expected_head: str = "",
+    recovery=None,
 ) -> dict[str, Any] | None:
     """Run a coalesced git-pull batch and restart once if runtime code changed."""
-    global _RESTART_PENDING
+    global _RESTART_PENDING, _PUBLIC_RECOVERY_HELD
     ordered_scopes = _ordered_git_scopes(scopes)
     if not ordered_scopes:
         return None
@@ -845,7 +852,9 @@ async def _git_pull_scopes_and_maybe_restart(
     operation_evidence: dict[str, Any] = {}
     restart_receipt_id = operation_id
     async with _GIT_PULL_LOCK:
-        if _RESTART_PENDING:
+        if _RESTART_PENDING and not (
+            recovery and recovery["mode"] == "rollback" and _PUBLIC_RECOVERY_HELD
+        ):
             log.info("git pull batch%s skipped: service restart already pending", source_label)
             await _update_git_pull_operation(
                 operation_id,
@@ -874,11 +883,20 @@ async def _git_pull_scopes_and_maybe_restart(
             log.info("git pull batch%s: scopes=%s", source_label, ",".join(ordered_scopes))
             for scope in ordered_scopes:
                 repo_path, restart_service = targets[scope]
-                changed = (
-                    await _git_pull_exact(repo_path, scope, expected_head)
-                    if operation_id is not None
-                    else await _git_pull(repo_path, scope)
-                )
+                if recovery is not None:
+                    from .public_checkout_recovery import execute
+
+                    proof = await timing.to_thread(
+                        "sync.public_checkout_recovery", execute, repo_path, recovery
+                    )
+                    guard_before["public_checkout_recovery"] = proof
+                    changed = True
+                else:
+                    changed = (
+                        await _git_pull_exact(repo_path, scope, expected_head)
+                        if operation_id is not None
+                        else await _git_pull(repo_path, scope)
+                    )
                 runtime_stale = restart_service and await _runtime_repo_is_stale(repo_path, scope)
                 restart_needed = restart_needed or (restart_service and (changed or runtime_stale))
             disk_heads_after = await _runtime_heads() if operation_id is not None else {}
@@ -903,6 +921,7 @@ async def _git_pull_scopes_and_maybe_restart(
                     expected_runtime_heads=restart_heads,
                     guard_before=guard_before,
                     claims_already_paused=claims_paused,
+                    hold_claims_on_failure=recovery is not None,
                 )
                 if not restarted:
                     raise RuntimeError("service_restart_command_failed")
@@ -927,8 +946,9 @@ async def _git_pull_scopes_and_maybe_restart(
             )
             return {"ok": True, "status": "completed", **result}
         except SchedulerRestartRefused as exc:
-            _RESTART_PENDING = False
-            if claims_paused:
+            _RESTART_PENDING = recovery is not None
+            _PUBLIC_RECOVERY_HELD = recovery is not None
+            if claims_paused and recovery is None:
                 await _resume_blueprints_provider_claims()
             await _update_git_pull_operation(
                 restart_receipt_id,
@@ -939,8 +959,9 @@ async def _git_pull_scopes_and_maybe_restart(
             log.warning("git pull batch%s restart refused: %s", source_label, exc.code)
             return {"ok": False, "code": exc.code, "detail": exc.detail}
         except Exception as exc:
-            _RESTART_PENDING = False
-            if claims_paused:
+            _RESTART_PENDING = recovery is not None
+            _PUBLIC_RECOVERY_HELD = recovery is not None
+            if claims_paused and recovery is None:
                 await _resume_blueprints_provider_claims()
             code = str(exc).split(":", 1)[0] if str(exc) else type(exc).__name__
             await _update_git_pull_operation(
@@ -985,6 +1006,7 @@ async def _restart_service(
     capture_runtime_heads: bool = False,
     guard_before: dict[str, Any] | None = None,
     claims_already_paused: bool = False,
+    hold_claims_on_failure: bool = False,
 ) -> bool:
     """Run SERVICE_RESTART_CMD, logging the outcome.
 
@@ -1038,7 +1060,7 @@ async def _restart_service(
         log.warning("service restart failed: %s", stderr.decode().strip())
         return False
     finally:
-        if not dispatched_successfully:
+        if not dispatched_successfully and not hold_claims_on_failure:
             await _resume_blueprints_provider_claims()
 
 
@@ -1814,6 +1836,55 @@ async def _run_guarded_restart(
             "restart_exception",
         )
         log.exception("service restart failed before command completion")
+
+
+@router.post("/public-checkout-recovery")
+async def trigger_public_checkout_recovery(payload: dict[str, Any], request: Request) -> Response:
+    if not _raw_client_is_loopback(request):
+        raise HTTPException(403, "Recovery requires a raw loopback connection")
+    from .public_checkout_recovery import validate_request
+
+    operation_id = payload.get("operation_id")
+    if not isinstance(operation_id, str) or _GIT_PULL_OPERATION_ID.fullmatch(operation_id) is None:
+        raise HTTPException(400, "Invalid recovery operation ID")
+    recovery = {key: value for key, value in payload.items() if key != "operation_id"}
+    try:
+        validate_request(recovery)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(400, str(exc)) from None
+    if recovery["node_id"] != cfg.NODE_ID:
+        raise HTTPException(409, "Recovery node identity mismatch")
+    try:
+        receipt = await timing.to_thread(
+            "sync.public_recovery_create",
+            _git_pull_operation_create_sync,
+            operation_id,
+            ["outer"],
+            recovery["expected_head"],
+            recovery,
+        )
+    except GitPullOperationConflict as exc:
+        raise HTTPException(409, str(exc)) from None
+    if (
+        receipt["status"] in {"queued", "pulling"}
+        and operation_id not in _ACTIVE_GIT_PULL_OPERATION_IDS
+    ):
+        _ACTIVE_GIT_PULL_OPERATION_IDS.add(operation_id)
+
+        async def perform():
+            try:
+                await _git_pull_scopes_and_maybe_restart(
+                    ["outer"],
+                    source="public recovery",
+                    operation_id=operation_id,
+                    expected_head=recovery["expected_head"],
+                    recovery=recovery,
+                )
+            finally:
+                _ACTIVE_GIT_PULL_OPERATION_IDS.discard(operation_id)
+
+        asyncio.create_task(perform())
+    return JSONResponse(status_code=202, content=receipt)
 
 
 @router.post("/git-pull")
