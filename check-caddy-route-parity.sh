@@ -109,4 +109,6 @@ if [[ "$fail" -ne 0 ]]; then
     exit 1
 fi
 
+python3 "$PUBLIC_REPO_ROOT/check-caddy-security.py" --setup "$SETUP_CADDY" --active "$ACTIVE_CADDY" --env "$ENV_FILE"
+
 echo "[caddy-route-parity] OK"

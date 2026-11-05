@@ -8,9 +8,9 @@
 #   2. Installs Caddy from the official apt repo (if not present).
 #   3. Creates a systemd drop-in so Caddy runs as root (required to read
 #      certs stored in the private inner repo under /root/).
-#   4. Writes a Caddyfile to $REPO_CADDY_PATH/Caddyfile.
-#   5. Symlinks /etc/caddy/Caddyfile → $REPO_CADDY_PATH/Caddyfile.
-#   6. Validates the Caddyfile, then enables and (re)starts Caddy.
+#   4. Renders a complete candidate and validates its exact bytes.
+#   5. Atomically installs it with the existing destination metadata.
+#   6. Preserves the service symlink, then enables and (re)starts Caddy.
 #   7. Runs a basic health check via HTTPS.
 #
 # After a successful run:
@@ -22,6 +22,26 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env"
+RENDER_ONLY=false
+ENV_EXPLICIT=false
+EXISTING_ONLY=false
+OUTPUT_FILE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --render-only) RENDER_ONLY=true; shift ;;
+        --existing-only) EXISTING_ONLY=true; shift ;;
+        --env-file|--output)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "Missing argument for $1" >&2; exit 2; }
+            case "$1" in --env-file) ENV_FILE="$2"; ENV_EXPLICIT=true ;; --output) OUTPUT_FILE="$2" ;; esac
+            shift 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+if $RENDER_ONLY; then
+    $ENV_EXPLICIT && [[ "$ENV_FILE" = /* && "$OUTPUT_FILE" = /* ]] || { echo "Render requires absolute --env-file and --output paths" >&2; exit 2; }
+elif [[ -n "$OUTPUT_FILE" ]]; then
+    echo "--output requires --render-only" >&2; exit 2
+fi
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -199,66 +219,8 @@ if value:
 PYEOF
 }
 
-echo "=== Caddy setup ==="
-echo ""
-
-# ── Step 1 — Certificates ───────────────────────────────────────────────────
-echo "Step 1: Checking certificates..."
-bash "$SCRIPT_DIR/setup-certificates.sh"
-# Re-source .env in case setup-certificates.sh wrote new values.
-source "$ENV_FILE"
-
-if [[ -z "${CERT_FILE:-}" || -z "${CERT_KEY:-}" ]]; then
-    echo -e "${RED}Error:${NC} CERT_FILE / CERT_KEY not set after setup-certificates.sh." >&2
-    exit 1
-fi
-echo ""
-
-# ── Step 2 — Install Caddy ───────────────────────────────────────────────────
-echo "Step 2: Installing Caddy..."
-if command -v caddy >/dev/null 2>&1; then
-    echo -e "    Caddy already installed: $(caddy version 2>/dev/null | head -1)"
-else
-    echo "    Adding Caddy apt repository..."
-    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>/dev/null | tail -1
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-        | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
-    apt-get update -qq
-    apt-get install -y caddy
-    echo -e "    ${GREEN}Caddy installed:${NC} $(caddy version 2>/dev/null | head -1)"
-fi
-echo ""
-
-# ── Step 3 — Systemd drop-in (run Caddy as root) ─────────────────────────────
-# The cert key is in /root/ — the default 'caddy' user cannot read it.
-echo "Step 3: Configuring Caddy systemd service..."
-DROPIN_DIR="/etc/systemd/system/caddy.service.d"
-DROPIN_FILE="$DROPIN_DIR/run-as-root.conf"
-mkdir -p "$DROPIN_DIR"
-if [[ ! -f "$DROPIN_FILE" ]]; then
-    cat > "$DROPIN_FILE" <<'EOF'
-[Service]
-User=root
-Group=root
-EOF
-    echo "    Created: $DROPIN_FILE"
-    systemctl daemon-reload
-else
-    echo "    Already present: $DROPIN_FILE"
-fi
-echo ""
-
-# ── Step 4 — Write Caddyfile ─────────────────────────────────────────────────
-echo "Step 4: Writing Caddyfile..."
-
-if [[ -z "${REPO_CADDY_PATH:-}" ]]; then
-    echo -e "${RED}Error:${NC} REPO_CADDY_PATH is not set in .env." >&2
-    exit 1
-fi
-
-CADDYFILE="$REPO_CADDY_PATH/Caddyfile"
+render_config() {
+    CADDYFILE="$1"
 UI_HOST=$(url_host "${BLUEPRINTS_UI_URL:-localhost}")
 if [[ -z "$UI_HOST" || "$UI_HOST" == "localhost" ]]; then
     DERIVED_PRIMARY_HOST="$(derive_nodes_json_host primary_hostname)"
@@ -303,6 +265,29 @@ if [[ -n "$MODEL_HOOK_UPSTREAM" ]]; then
     }
 "
 fi
+CADDY_MCP_ENABLED="${CADDY_MCP_ENABLED:-false}"
+case "$CADDY_MCP_ENABLED" in true|false) ;; *) echo "CADDY_MCP_ENABLED must be true or false" >&2; return 1 ;; esac
+if [[ "$CADDY_MCP_ENABLED" == true ]]; then
+    # Restrict interpolation to a literal path prefix and one upstream address.
+    [[ "${CADDY_MCP_PATH_PREFIX:-}" =~ ^/[a-zA-Z0-9_/-]+/$ && "$CADDY_MCP_PATH_PREFIX" != *'//'* ]] || { echo "Invalid MCP path prefix" >&2; return 1; }
+    [[ "${CADDY_MCP_UPSTREAM:-}" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]] || { echo "Invalid MCP upstream" >&2; return 1; }
+    MAIN_SITE_EXTRA_HANDLES="${MAIN_SITE_EXTRA_HANDLES}
+    # Prefix-preserving, authenticated optional MCP proxy.
+    handle ${CADDY_MCP_PATH_PREFIX}* {
+        @mcp_authenticated {
+            header Authorization \"Bearer {env.MCP_BEARER_TOKEN}\"
+            expression \`{env.MCP_BEARER_TOKEN} != \"\"\`
+        }
+        handle @mcp_authenticated {
+            reverse_proxy ${CADDY_MCP_UPSTREAM}
+        }
+        handle {
+            respond 401
+        }
+    }
+"
+fi
+
 if [[ "${THIS_NODE_DOCS_BACKUP:-false}" == "true" ]]; then
     MAIN_SITE_EXTRA_HANDLES="${MAIN_SITE_EXTRA_HANDLES}
     # Exact, read-only Sherlock security-report page for trusted Xarta networks.
@@ -460,7 +445,6 @@ ${HTTP_NAMES} {
 }
 CADDY
 
-chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
 
 if [[ -n "$MODEL_HOOK_UPSTREAM" && -n "$MODEL_HOOK_HTTP_HOST" ]]; then
     cat >> "$CADDYFILE" <<CADDY_MODEL_HOOK_HTTP
@@ -474,10 +458,9 @@ http://${MODEL_HOOK_HTTP_HOST} {
     handle /xarta/webhook* {
         reverse_proxy ${MODEL_HOOK_UPSTREAM}
     }
-    reverse_proxy localhost:8080
+    respond 403
 }
 CADDY_MODEL_HOOK_HTTP
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended model-hook HTTP callback block (http://${MODEL_HOOK_HTTP_HOST} -> ${MODEL_HOOK_UPSTREAM})"
 fi
 
@@ -570,7 +553,6 @@ CADDY_MATRIX_ALIAS
             echo "    Appended Matrix Synapse alias block (https://${alias} -> ${MATRIX_SYNAPSE_UPSTREAM})"
         done
     fi
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended Matrix Synapse block (https://${MATRIX_SYNAPSE_HOSTNAME} -> ${MATRIX_SYNAPSE_UPSTREAM})"
 fi
 
@@ -635,7 +617,6 @@ CADDY_NTFY_ALIAS
             echo "    Appended ntfy UnifiedPush alias block (https://${alias} -> ${NTFY_UPSTREAM})"
         done
     fi
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended ntfy UnifiedPush block (https://${NTFY_HOSTNAME} -> ${NTFY_UPSTREAM})"
 fi
 
@@ -677,7 +658,6 @@ http://${VIKUNJA_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_VIKUNJA
-chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
 echo "    Appended Vikunja block (https://${VIKUNJA_HOSTNAME} → localhost:${VIKUNJA_PORT})"
 
 # ── code-server block — appended when CODE_SERVER is set ─────────────────────
@@ -711,7 +691,6 @@ http://${CODE_SERVER_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_CODE_SERVER
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended code-server block (https://${CODE_SERVER_HOSTNAME} → localhost:${CODE_SERVER_PORT})"
 else
     echo "    Skipped code-server block (CODE_SERVER not set in .env)"
@@ -745,7 +724,6 @@ http://${PAPERCLIP_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_PAPERCLIP
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended Paperclip block (https://${PAPERCLIP_HOSTNAME} -> ${PAPERCLIP_UPSTREAM})"
 fi
 
@@ -814,7 +792,6 @@ CADDY_HERMES_ALIAS
             echo "    Appended Hermes Local dashboard alias (https://${alias} -> https://${HERMES_LOCAL_DASHBOARD_HOSTNAME})"
         done
     fi
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended Hermes Local dashboard block (https://${HERMES_LOCAL_DASHBOARD_HOSTNAME} -> ${HERMES_LOCAL_DASHBOARD_UPSTREAM})"
     fi
 else
@@ -864,7 +841,6 @@ http://${HERMES_LOCAL_SMS_WEBHOOK_HOSTNAME} {
     respond 404
 }
 CADDY_HERMES_LOCAL_SMS
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended Hermes Local SMS webhook block (http://${HERMES_LOCAL_SMS_WEBHOOK_HOSTNAME}${HERMES_LOCAL_SMS_WEBHOOK_PUBLIC_PATH} -> ${HERMES_LOCAL_SMS_WEBHOOK_UPSTREAM}${HERMES_LOCAL_SMS_WEBHOOK_BACKEND_PATH})"
     fi
 else
@@ -937,7 +913,6 @@ CADDY_HERMES_VPS_ALIAS
             echo "    Appended Hermes VPS dashboard alias (https://${alias} -> https://${HERMES_VPS_DASHBOARD_HOSTNAME})"
         done
     fi
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended Hermes VPS dashboard block (https://${HERMES_VPS_DASHBOARD_HOSTNAME} -> ${HERMES_VPS_DASHBOARD_UPSTREAM})"
     fi
 else
@@ -1037,7 +1012,6 @@ CADDY_MATRIX_SHARED_ALIAS
             echo "    Appended shared Matrix Synapse alias block (https://${alias} -> ${MATRIX_SHARED_UPSTREAM})"
         done
     fi
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended shared Matrix Synapse block (https://${MATRIX_SHARED_HOSTNAME} -> ${MATRIX_SHARED_UPSTREAM})"
 else
     echo "    Skipped shared Matrix Synapse block (MATRIX_SHARED_HOSTNAME/MATRIX_SHARED_UPSTREAM not set)"
@@ -1068,7 +1042,6 @@ http://${SEARXNG_VPS_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_SEARXNG_VPS
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended remote SearXNG block (https://${SEARXNG_VPS_HOSTNAME} -> ${SEARXNG_VPS_UPSTREAM})"
 else
     echo "    Skipped remote SearXNG block (SEARXNG_VPS_HOSTNAME/SEARXNG_VPS_UPSTREAM not set)"
@@ -1100,7 +1073,6 @@ https://:8443 {
     reverse_proxy localhost:8080
 }
 CADDY_MTLS
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended mTLS :8443 sync block (https://:8443 — SNI-free catch-all)"
 else
     echo "    Skipped mTLS :8443 block (SYNC_TLS_CA/CERT/KEY not set — plain HTTP only)"
@@ -1127,49 +1099,153 @@ http://${SYNCTHING_HOSTNAME} {
     redir https://{host}{uri} permanent
 }
 CADDY_SYNCTHING
-    chown_like "$REPO_CADDY_PATH" "$CADDYFILE"
     echo "    Appended Syncthing GUI block (https://${SYNCTHING_HOSTNAME})"
 else
     echo "    Skipped Syncthing GUI block (SYNCTHING_HOSTNAME not set in .env)"
 fi
 
-echo "    Written: $CADDYFILE"
-echo ""
 
-# ── Step 5 — Symlink /etc/caddy/Caddyfile → inner repo ──────────────────────
-echo "Step 5: Symlinking /etc/caddy/Caddyfile..."
-mkdir -p /etc/caddy
-if [[ -L /etc/caddy/Caddyfile ]]; then
-    CURRENT_TARGET=$(readlink /etc/caddy/Caddyfile)
-    if [[ "$CURRENT_TARGET" == "$CADDYFILE" ]]; then
-        echo "    Already symlinked: /etc/caddy/Caddyfile → $CADDYFILE"
-    else
-        ln -sf "$CADDYFILE" /etc/caddy/Caddyfile
-        echo "    Updated symlink: /etc/caddy/Caddyfile → $CADDYFILE (was → $CURRENT_TARGET)"
-    fi
-elif [[ -f /etc/caddy/Caddyfile ]]; then
-    echo "    Backing up existing /etc/caddy/Caddyfile → /etc/caddy/Caddyfile.bak"
-    mv /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak
-    ln -s "$CADDYFILE" /etc/caddy/Caddyfile
-    echo "    Symlinked: /etc/caddy/Caddyfile → $CADDYFILE"
-else
-    ln -s "$CADDYFILE" /etc/caddy/Caddyfile
-    echo "    Symlinked: /etc/caddy/Caddyfile → $CADDYFILE"
+}
+
+if $RENDER_ONLY; then
+    # This branch precedes every installer, live-file, service and cache write.
+    [[ ! -e "$OUTPUT_FILE" && ! -L "$OUTPUT_FILE" ]] || { echo "Output already exists" >&2; exit 1; }
+    (umask 077; render_config "$OUTPUT_FILE")
+    exit 0
 fi
+
+if $EXISTING_ONLY; then
+    command -v caddy >/dev/null
+    for cert_path in "${CERT_FILE:-}" "${CERT_KEY:-}" "${SYNC_TLS_CA:-}" "${SYNC_TLS_CERT:-}" "${SYNC_TLS_KEY:-}"; do
+        [[ -n "$cert_path" && -r "$cert_path" ]] || { echo "Missing configured certificate prerequisite" >&2; exit 1; }
+    done
+    [[ "$(systemctl show caddy --property=User --value)" == root && "$(systemctl show caddy --property=Group --value)" == root ]] || { echo "Unexpected Caddy identity" >&2; exit 1; }
+    systemctl is-active --quiet caddy
+    systemctl is-enabled --quiet caddy
+else
+echo "=== Caddy setup ==="
 echo ""
 
-# ── Step 6 — Validate and (re)start ─────────────────────────────────────────
-echo "Step 6: Validating Caddyfile..."
-if caddy validate --config "$CADDYFILE" 2>&1 | sed 's/^/    /'; then
-    echo -e "    ${GREEN}Valid.${NC}"
-else
-    echo -e "${RED}Caddyfile validation failed — not starting.${NC}" >&2
+# ── Step 1 — Certificates ───────────────────────────────────────────────────
+echo "Step 1: Checking certificates..."
+bash "$SCRIPT_DIR/setup-certificates.sh"
+# Re-source .env in case setup-certificates.sh wrote new values.
+source "$ENV_FILE"
+
+if [[ -z "${CERT_FILE:-}" || -z "${CERT_KEY:-}" ]]; then
+    echo -e "${RED}Error:${NC} CERT_FILE / CERT_KEY not set after setup-certificates.sh." >&2
     exit 1
 fi
 echo ""
 
+# ── Step 2 — Install Caddy ───────────────────────────────────────────────────
+echo "Step 2: Installing Caddy..."
+if command -v caddy >/dev/null 2>&1; then
+    echo -e "    Caddy already installed: $(caddy version 2>/dev/null | head -1)"
+else
+    echo "    Adding Caddy apt repository..."
+    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>/dev/null | tail -1
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
+    apt-get update -qq
+    apt-get install -y caddy
+    echo -e "    ${GREEN}Caddy installed:${NC} $(caddy version 2>/dev/null | head -1)"
+fi
+echo ""
+
+# ── Step 3 — Systemd drop-in (run Caddy as root) ─────────────────────────────
+# The cert key is in /root/ — the default 'caddy' user cannot read it.
+echo "Step 3: Configuring Caddy systemd service..."
+DROPIN_DIR="/etc/systemd/system/caddy.service.d"
+DROPIN_FILE="$DROPIN_DIR/run-as-root.conf"
+mkdir -p "$DROPIN_DIR"
+if [[ ! -f "$DROPIN_FILE" ]]; then
+    cat > "$DROPIN_FILE" <<'EOF'
+[Service]
+User=root
+Group=root
+EOF
+    echo "    Created: $DROPIN_FILE"
+    systemctl daemon-reload
+else
+    echo "    Already present: $DROPIN_FILE"
+fi
+echo ""
+
+fi
+
+[[ -n "${REPO_CADDY_PATH:-}" && -d "$REPO_CADDY_PATH" ]] || { echo "Missing Caddy destination directory" >&2; exit 1; }
+LIVE_CADDYFILE="$REPO_CADDY_PATH/Caddyfile"
+SYSTEM_CADDYFILE="${CADDY_SYSTEM_CONFIG:-/etc/caddy/Caddyfile}"
+if $EXISTING_ONLY; then
+    [[ -f "$LIVE_CADDYFILE" && ! -L "$LIVE_CADDYFILE" && -L "$SYSTEM_CADDYFILE" && "$(readlink -f "$SYSTEM_CADDYFILE")" == "$(readlink -f "$LIVE_CADDYFILE")" ]] || { echo "Unexpected Caddyfile/symlink state" >&2; exit 1; }
+fi
+# Confirm the existing service's credential interface without reading it into the shell.
+if [[ "${CADDY_MCP_ENABLED:-false}" == true ]]; then
+    python3 - "$(systemctl show caddy --property=MainPID --value)" <<'PYMCP'
+import pathlib, sys
+pid = int(sys.argv[1])
+if pid <= 1 or not any(v.startswith(b'MCP_BEARER_TOKEN=') and v.split(b'=', 1)[1].strip() for v in pathlib.Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')):
+    raise SystemExit('Existing Caddy service has no nonempty MCP credential')
+PYMCP
+fi
+CANDIDATE="$(mktemp --suffix=.caddy)"
+trap 'rm -f -- "$CANDIDATE"' EXIT
+render_config "$CANDIDATE"
+echo "Validating complete staged Caddyfile..."
+caddy validate --adapter caddyfile --config "$CANDIDATE"
+# Preserve destination metadata (including ACL/xattrs), and atomically promote
+# the exact validated bytes. No persistent recovery payload is created here.
+python3 - "$CANDIDATE" "$LIVE_CADDYFILE" "$REPO_CADDY_PATH" <<'PYINSTALL'
+import os, pathlib, shutil, tempfile, signal
+def interrupted(signum, frame):
+    raise SystemExit(128 + signum)
+for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    signal.signal(signum, interrupted)
+candidate, target, owner_ref = map(pathlib.Path, __import__('sys').argv[1:])
+if target.is_symlink():
+    raise SystemExit('Refusing a symlink at the configured destination')
+fd, staged = tempfile.mkstemp(prefix='.Caddyfile.install.', dir=target.parent)
+try:
+    os.close(fd)
+    if target.exists():
+        metadata = target.stat()
+        shutil.copy2(target, staged)
+    else:
+        metadata = owner_ref.stat()
+        os.chmod(staged, 0o644)
+    os.chown(staged, metadata.st_uid, metadata.st_gid)
+    with open(candidate, 'rb') as src, open(staged, 'wb') as dst:
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+        os.fsync(dst.fileno())
+    os.replace(staged, target)
+    parent_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+finally:
+    if os.path.exists(staged):
+        os.unlink(staged)
+PYINSTALL
+CADDYFILE="$LIVE_CADDYFILE"
+echo "    Written: $CADDYFILE"
+echo ""
+
+if [[ -L "$SYSTEM_CADDYFILE" ]]; then
+    [[ "$(readlink -f "$SYSTEM_CADDYFILE")" == "$(readlink -f "$CADDYFILE")" ]] || { echo "Unexpected system Caddyfile target" >&2; exit 1; }
+elif [[ -e "$SYSTEM_CADDYFILE" ]]; then
+    echo "Existing system configuration requires an owner-managed recovery provision" >&2; exit 1
+else
+    mkdir -p "$(dirname "$SYSTEM_CADDYFILE")"
+    ln -s "$CADDYFILE" "$SYSTEM_CADDYFILE"
+fi
+
 echo "Step 7: Enabling and starting Caddy..."
-systemctl enable caddy
+if ! $EXISTING_ONLY; then systemctl enable caddy; fi
 # Note: `caddy reload` uses the admin API (port 2019) which we disable in the
 # Caddyfile. Always use systemctl restart instead.
 systemctl restart caddy
