@@ -227,9 +227,12 @@ def test_real_listener_auth_and_prefix_preservation(sandbox, credential):
     assert result.returncode == 0, result.stderr
     # Use the actual generated auth block on a disposable plaintext listener.
     text = output.read_text()
-    auth = text.split("    # Prefix-preserving, authenticated optional MCP proxy.", 1)[1].split(
-        "\n\n    # Reverse proxy all traffic", 1
-    )[0]
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("caddy_scope", ROOT / "check-caddy-security.py")
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    auth = checker.block(text, "handle /service/api/*")
     output.write_text("{\n admin off\n}\nhttp://127.0.0.1:" + str(port) + " {\n" + auth + "\n}\n")
     process_env = dict(os.environ)
     process_env.pop("MCP_BEARER_TOKEN", None)
@@ -333,3 +336,122 @@ def test_render_never_calls_installers_or_services(sandbox):
     )
     assert result.returncode == 0, result.stderr
     assert not log.exists() and live.read_text() == "previous live bytes\n"
+
+
+def test_private_operator_comments_survive_regeneration(sandbox):
+    import json
+
+    directory, env, live, link, configure = sandbox
+    notes = {
+        "mcp": "    # Keep the complete transport explanation.\n    # Uses handle (NOT handle_path) to preserve the configured prefix.\n    # The service drop-in supplies the runtime bearer credential.",
+        "model_hook_http": "# PLAIN-HTTP ALLOWLIST: health and webhook only.\n# Everything else is 403; the full API remains on trusted HTTPS.",
+    }
+    file = directory / "operator-notes.json"
+    file.write_text(json.dumps(notes))
+    result, output = render(
+        sandbox,
+        CADDY_MCP_ENABLED="true",
+        CADDY_MCP_PATH_PREFIX="/service/api/",
+        CADDY_MCP_UPSTREAM="localhost:12345",
+        MODEL_HOOK_HTTP_HOST="127.0.0.1:18090",
+        MODEL_HOOK_UPSTREAM="localhost:12346",
+        CADDY_OPERATOR_NOTES_FILE=str(file),
+    )
+    assert result.returncode == 0, result.stderr
+    generated = output.read_text()
+    for section in notes.values():
+        for line in section.splitlines():
+            assert line.strip() in generated
+    assert "handle /service/api/*" in generated
+    assert "respond 403" in generated and "respond 401" in generated
+    assert (
+        run("caddy", "validate", "--adapter", "caddyfile", "--config", str(output)).returncode == 0
+    )
+
+
+def test_default_comments_explain_transport_and_allowlist(sandbox):
+    result, output = render(
+        sandbox,
+        CADDY_MCP_ENABLED="true",
+        CADDY_MCP_PATH_PREFIX="/service/api/",
+        CADDY_MCP_UPSTREAM="localhost:12345",
+        MODEL_HOOK_HTTP_HOST="127.0.0.1:18090",
+        MODEL_HOOK_UPSTREAM="localhost:12346",
+    )
+    assert result.returncode == 0, result.stderr
+    generated = output.read_text()
+    for explanation in (
+        "Uses handle (NOT handle_path)",
+        "caddy.service environment drop-in",
+        "Missing, wrong or empty credentials",
+        "PLAIN-HTTP ALLOWLIST",
+        "Everything else on this block is 403",
+        "NODE_EXTRA_CA_CERTS",
+    ):
+        assert explanation in generated
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        {"mcp": "reverse_proxy unexpected:1234"},
+        {"unknown": "# unknown section"},
+        {"mcp": ["# invalid value type"]},
+    ],
+)
+def test_operator_notes_cannot_inject_configuration(sandbox, notes):
+    import json
+
+    directory, env, live, link, configure = sandbox
+    file = directory / "operator-notes.json"
+    file.write_text(json.dumps(notes))
+    result, _ = render(
+        sandbox,
+        CADDY_MCP_ENABLED="true",
+        CADDY_MCP_PATH_PREFIX="/service/api/",
+        CADDY_MCP_UPSTREAM="localhost:12345",
+        CADDY_OPERATOR_NOTES_FILE=str(file),
+    )
+    assert result.returncode != 0
+    assert live.read_text() == "previous live bytes\n"
+
+
+def test_render_does_not_refresh_repository_index(sandbox):
+    directory, env, live, link, configure = sandbox
+    subprocess.run(["git", "init", "-b", "main", str(directory)], check=True, capture_output=True)
+    tracked = directory / "tracked.txt"
+    tracked.write_text("unchanged content")
+    subprocess.run(
+        ["git", "-C", str(directory), "add", "tracked.txt"], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(directory),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    index = directory / ".git/index"
+    tracked_stat = tracked.stat()
+    os.utime(tracked, ns=(tracked_stat.st_atime_ns, tracked_stat.st_mtime_ns + 1000000000))
+    before = index.read_bytes(), index.stat()
+    result, _ = render(sandbox)
+    assert result.returncode == 0, result.stderr
+    assert index.read_bytes() == before[0]
+    after = index.stat()
+    assert (after.st_uid, after.st_gid, after.st_mode, after.st_ino, after.st_mtime_ns) == (
+        before[1].st_uid,
+        before[1].st_gid,
+        before[1].st_mode,
+        before[1].st_ino,
+        before[1].st_mtime_ns,
+    )

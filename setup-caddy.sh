@@ -122,7 +122,7 @@ compute_fallback_asset_version() {
         local head ts dirty
         if head="$(git -C "$repo_path" rev-parse --short HEAD 2>/dev/null)" \
             && ts="$(git -C "$repo_path" log -1 --format=%ct 2>/dev/null)"; then
-            dirty="$(git -C "$repo_path" status --porcelain 2>/dev/null || true)"
+            dirty="$(GIT_OPTIONAL_LOCKS=0 git -C "$repo_path" status --porcelain 2>/dev/null || true)"
             if [[ -n "$dirty" ]]; then
                 printf 'prod-%s-%s-dirty\n' "$head" "$ts"
             else
@@ -189,6 +189,27 @@ with open(path, "w") as f:
     json.dump(data, f, indent=2, sort_keys=True)
     f.write("\n")
 PYEOF
+}
+
+# Keep deployment-specific explanations in private configuration. Every supplied
+# line must remain a comment, so notes cannot introduce operative Caddy directives.
+operator_comments() {
+    local section="$1" fallback="$2" indent="$3"
+    python3 - "$section" "$fallback" "$indent" "${CADDY_OPERATOR_NOTES_FILE:-}" <<'PYCOMMENTS'
+import json
+import pathlib
+import sys
+
+section, fallback, indent, notes_file = sys.argv[1:]
+notes = json.loads(pathlib.Path(notes_file).read_text()) if notes_file else {}
+if not isinstance(notes, dict) or set(notes) - {"mcp", "model_hook_http"}:
+    raise SystemExit("Invalid Caddy operator-notes sections")
+for value in notes.values():
+    if not isinstance(value, str) or any(line.strip() and not line.lstrip().startswith("#") for line in value.splitlines()):
+        raise SystemExit("Caddy operator notes must contain comments only")
+for line in notes.get(section, fallback).splitlines():
+    print(indent + line.lstrip() if line.strip() else "")
+PYCOMMENTS
 }
 
 # Extract hostname (no scheme, no port) from a URL.
@@ -271,8 +292,16 @@ if [[ "$CADDY_MCP_ENABLED" == true ]]; then
     # Restrict interpolation to a literal path prefix and one upstream address.
     [[ "${CADDY_MCP_PATH_PREFIX:-}" =~ ^/[a-zA-Z0-9_/-]+/$ && "$CADDY_MCP_PATH_PREFIX" != *'//'* ]] || { echo "Invalid MCP path prefix" >&2; return 1; }
     [[ "${CADDY_MCP_UPSTREAM:-}" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]] || { echo "Invalid MCP upstream" >&2; return 1; }
+    MCP_COMMENTS="$(operator_comments mcp "# MCP service at ${CADDY_MCP_UPSTREAM}, bearer-token-gated at the HTTPS edge.
+# The backend relies on Caddy for authentication; keep backend access restricted.
+# A host-networked local MCP service and its local API/search calls should use loopback.
+# Uses handle (NOT handle_path) so the ${CADDY_MCP_PATH_PREFIX} prefix is passed through
+# unstripped to the MCP server's fixed streamable-HTTP path.
+# MCP_BEARER_TOKEN is supplied by the caddy.service environment drop-in.
+# It remains a runtime placeholder; never embed its value in this file.
+# Missing, wrong or empty credentials receive 401, including an empty service token." "    ")"
     MAIN_SITE_EXTRA_HANDLES="${MAIN_SITE_EXTRA_HANDLES}
-    # Prefix-preserving, authenticated optional MCP proxy.
+${MCP_COMMENTS}
     handle ${CADDY_MCP_PATH_PREFIX}* {
         @mcp_authenticated {
             header Authorization \"Bearer {env.MCP_BEARER_TOKEN}\"
@@ -447,10 +476,20 @@ CADDY
 
 
 if [[ -n "$MODEL_HOOK_UPSTREAM" && -n "$MODEL_HOOK_HTTP_HOST" ]]; then
+    MODEL_HOOK_HTTP_COMMENTS="$(operator_comments model_hook_http "# HTTP callback route for the model-hook listener.
+# Some upstream hook callers can reach the node by direct IP even when DNS is unavailable.
+#
+# PLAIN-HTTP ALLOWLIST — deny everything except these two callback handlers:
+#   /xarta/health*  -> ${MODEL_HOOK_UPSTREAM}  (model-hook health check)
+#   /xarta/webhook* -> ${MODEL_HOOK_UPSTREAM}  (model-hook callback)
+#
+# Everything else on this block is 403. The full Blueprints API, including
+# token-exempt document search, remains on the hostname-based HTTPS entrypoint
+# (https://${UI_HOST}); clients must trust its CA, for example via NODE_EXTRA_CA_CERTS.
+# Any enabled MCP route is bearer-token-gated and lives only on the HTTPS entrypoint." "")"
     cat >> "$CADDYFILE" <<CADDY_MODEL_HOOK_HTTP
 
-# HTTP callback route for the xarta model-hook listener.
-# Some upstream hook callers can reach the node by direct IP even when DNS is unavailable.
+${MODEL_HOOK_HTTP_COMMENTS}
 http://${MODEL_HOOK_HTTP_HOST} {
     handle /xarta/health* {
         reverse_proxy ${MODEL_HOOK_UPSTREAM}
