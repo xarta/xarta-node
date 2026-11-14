@@ -1143,6 +1143,42 @@ else
     echo "    Skipped Syncthing GUI block (SYNCTHING_HOSTNAME not set in .env)"
 fi
 
+if [[ -n "${CAREER_OPS_HOSTNAME:-}" && -n "${CAREER_OPS_UPSTREAM:-}" ]]; then
+    cat >> "$CADDYFILE" <<CADDY_CAREER_OPS
+
+# career-ops GUI — reverse proxy to the local career-ops Next.js app.
+# App binds to 0.0.0.0:3000; exposed over HTTPS at ${CAREER_OPS_HOSTNAME}.
+# The app's own origin guard (CAREER_OPS_WEB_ALLOWED_HOSTS) checks the Host
+# header, so Caddy passes the client Host through (default reverse_proxy
+# behavior) — do NOT override it to localhost.
+https://${CAREER_OPS_HOSTNAME} {
+    tls ${CERT_FILE} ${CERT_KEY}
+
+    @xarta_internal {
+        remote_ip 127.0.0.1/32 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+    }
+
+    handle @xarta_internal {
+        reverse_proxy ${CAREER_OPS_UPSTREAM} {
+            transport http {
+                read_timeout 600s
+                write_timeout 600s
+            }
+        }
+    }
+
+    respond 403
+}
+
+http://${CAREER_OPS_HOSTNAME} {
+    redir https://{host}{uri} permanent
+}
+CADDY_CAREER_OPS
+    echo "    Appended career-ops GUI block (https://${CAREER_OPS_HOSTNAME} -> ${CAREER_OPS_UPSTREAM})"
+else
+    echo "    Skipped career-ops GUI block (CAREER_OPS_HOSTNAME/UPSTREAM not set in .env)"
+fi
+
 
 }
 
