@@ -108,6 +108,7 @@ from .routes_personal import (
 )
 from .routes_personal_prompts import router as personal_prompts_router
 from .routes_pfsense_dns import router as pfsense_dns_router
+from .routes_pim_attachments import router as pim_attachments_router
 from .routes_pim_email import router as pim_email_router
 from .routes_playwright import router as playwright_router
 from .routes_pockettts import router as pockettts_router
@@ -665,6 +666,7 @@ def create_app() -> FastAPI:
     application.include_router(personal_search_scheduler_router, prefix="/api/v1")
     application.include_router(kanban_automation_scheduler_router, prefix="/api/v1")
     application.include_router(pim_email_router, prefix="/api/v1")
+    application.include_router(pim_attachments_router, prefix="/api/v1")
     application.include_router(personal_prompts_router, prefix="/api/v1")
 
     @application.get("/favicon.ico", include_in_schema=False)

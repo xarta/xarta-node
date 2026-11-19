@@ -21,11 +21,12 @@ Why not allow_origins=["*"]?
 
 import json
 import logging
+import re
 import time
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from . import config as cfg
 from . import db
@@ -34,6 +35,7 @@ log = logging.getLogger(__name__)
 
 # Re-query the DB for node ui_urls this often (seconds).
 CACHE_TTL = 60
+_ATTACHMENT_PATH = re.compile(r"^/api/v1/personal/email/local/messages/[^/]+/attachments(?:/|$)")
 
 # Methods the component actually needs.
 ALLOWED_METHODS = "GET, POST, OPTIONS"
@@ -44,11 +46,13 @@ ALLOWED_HEADERS = "Content-Type, X-API-Token"
 # Paths served with Access-Control-Allow-Origin: * so that extension pages
 # (with unpredictable chrome-extension:// origins) can call them freely.
 # Only add paths that are already auth-exempt and return non-sensitive data.
-_OPEN_CORS_PATHS = frozenset({
-    "/api/v1/auth/time",
-    "/api/v1/bookmarks/health",
-    "/api/v1/bookmarks/extension-version",
-})
+_OPEN_CORS_PATHS = frozenset(
+    {
+        "/api/v1/auth/time",
+        "/api/v1/bookmarks/health",
+        "/api/v1/bookmarks/extension-version",
+    }
+)
 
 
 class DynamicCORSMiddleware(BaseHTTPMiddleware):
@@ -114,6 +118,29 @@ class DynamicCORSMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         origin = request.headers.get("origin", "")
+        if _ATTACHMENT_PATH.match(request.url.path):
+            headers = {"Cache-Control": "private, no-store"}
+            same_origin = f"{request.url.scheme}://{request.url.netloc}"
+            if (
+                request.method == "OPTIONS"
+                or (origin and (origin != same_origin or not self._is_allowed(origin)))
+                or (request.method == "POST" and not origin)
+                or request.headers.get("sec-fetch-site") in {"cross-site", "same-site"}
+            ):
+                return JSONResponse(
+                    {
+                        "detail": {
+                            "reason_code": "same_origin_required",
+                            "permitted_action": "none",
+                            "retryable": False,
+                        }
+                    },
+                    status_code=403,
+                    headers=headers,
+                )
+            response = await call_next(request)
+            response.headers.update(headers)
+            return response
 
         # No Origin header — not a cross-origin request, pass straight through.
         if not origin:
@@ -155,12 +182,13 @@ class DynamicCORSMiddleware(BaseHTTPMiddleware):
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
+
 def _cors_headers(origin: str) -> dict[str, str]:
     h = {
-        "Access-Control-Allow-Origin":  origin,
+        "Access-Control-Allow-Origin": origin,
         "Access-Control-Allow-Methods": ALLOWED_METHODS,
         "Access-Control-Allow-Headers": ALLOWED_HEADERS,
-        "Access-Control-Max-Age":       "600",
+        "Access-Control-Max-Age": "600",
     }
     # Vary: Origin must not be set when using wildcard — it would confuse caches.
     if origin != "*":
