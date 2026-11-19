@@ -5,12 +5,13 @@ from __future__ import annotations
 import hmac
 import re
 from pathlib import Path
+from typing import Literal
 
 import anyio
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from . import config as cfg
 from .auth import verify_token
@@ -18,6 +19,9 @@ from .routes_pim_email import PIM_EMAIL_STACK_API_BASE, _stack_http_client
 
 PREFIX = "/personal/email/local/messages/{email_uid}/attachments"
 router = APIRouter(prefix=PREFIX, tags=["personal-email-attachments"])
+scanner_status_router = APIRouter(
+    prefix="/personal/email/local/attachments", tags=["personal-email-attachments"]
+)
 CREDENTIAL = Path("/var/lib/xarta/pim-attachments/proxy-key")
 ID = re.compile(r"[A-Za-z0-9._-]{1,120}")
 REF = re.compile(r"[0-9a-f]{64}")
@@ -34,6 +38,19 @@ class Prepare(BaseModel):
     model_config = ConfigDict(extra="forbid")
     message_revision: str = Field(pattern=r"^[a-f0-9]{64}$")
     idempotency_key: str = Field(pattern=r"^[A-Za-z0-9._~-]{1,80}$")
+
+
+class ScannerStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    state: Literal["ready", "stale", "changing", "unavailable"]
+    reason_code: Literal["scanner_stale", "scanner_changed", "scanner_unavailable"] | None
+    observed_at: AwareDatetime
+    engine_version: str | None = Field(pattern=r"^[A-Za-z0-9._+-]{1,64}$")
+    daily_database_version: int | None = Field(ge=0)
+    daily_database_published_at: AwareDatetime | None
+    daily_database_age_seconds: int | None = Field(ge=0)
+    last_local_daily_install_at: AwareDatetime | None
+    last_successful_update_check_at: AwareDatetime | None
 
 
 def error(status: int, reason: str, action: str = "none") -> HTTPException:
@@ -162,6 +179,39 @@ async def proxy(
         if upstream is not None and not handed_off:
             with anyio.CancelScope(shield=True):
                 await upstream.aclose()
+
+
+@scanner_status_router.get("/scanner-status", response_model=ScannerStatus)
+async def scanner_status(response: Response, headers: dict = Depends(authorize)):
+    credentials = {
+        name: headers[name] for name in ("X-PIM-Attachment-Key", "X-PIM-Attachment-Scope")
+    }
+    try:
+        with anyio.fail_after(8):
+            client = await _stack_http_client("foreground")
+            async with client.stream(
+                "GET",
+                f"{PIM_EMAIL_STACK_API_BASE}/internal/attachments/scanner-status",
+                headers=credentials,
+                timeout=TIMEOUT,
+                follow_redirects=False,
+            ) as upstream:
+                if upstream.status_code != 200:
+                    raise error(503, "scanner_status_service_unavailable", "retry")
+                if upstream.headers.get("content-type", "").split(";", 1)[0] != "application/json":
+                    raise error(502, "invalid_scanner_status_response", "retry")
+                data = bytearray()
+                async for chunk in upstream.aiter_bytes(chunk_size=1024):
+                    data.extend(chunk)
+                    if len(data) > 4096:
+                        raise error(502, "invalid_scanner_status_response", "retry")
+                result = ScannerStatus.model_validate_json(data, strict=True)
+    except ValidationError:
+        raise error(502, "invalid_scanner_status_response", "retry") from None
+    except (TimeoutError, httpx.HTTPError):
+        raise error(503, "scanner_status_service_unavailable", "retry") from None
+    response.headers.update(NO_STORE)
+    return result
 
 
 @router.get("")
